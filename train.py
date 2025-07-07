@@ -267,14 +267,10 @@ if __name__ == "__main__":
     parser.add_argument('--disable_viewer', action='store_true', default=False)
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
     parser.add_argument("--start_checkpoint", type=str, default = None)
-    parser.add_argument("--scene_type", type=str, default="Colmap", 
-                       choices=["Colmap", "Blender", "SuperGlue"],
-                       help="Scene type: Colmap, Blender, or SuperGlue")
-    parser.add_argument("--superglue_config", type=str, default="outdoor",
-                       choices=["indoor", "outdoor"],
-                       help="SuperGlue configuration for feature matching")
-    parser.add_argument("--max_images", type=int, default=100,
-                       help="Maximum number of images to process with SuperGlue")
+    
+    # 중복된 argument 정의들을 제거했습니다
+    # scene_type, superglue_config, max_images는 이미 ModelParams에 정의되어 있습니다
+    
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
     

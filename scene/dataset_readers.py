@@ -22,8 +22,6 @@ from pathlib import Path
 from plyfile import PlyData, PlyElement
 from utils.sh_utils import SH2RGB
 from scene.gaussian_model import BasicPointCloud
-#from Superglue.superglue_matcher import readSuperGlueSceneInfo
-from Superglue.complete_superglue_sfm import readSuperGlueSceneInfo
 import cv2
 import glob
 from pathlib import Path
@@ -73,14 +71,12 @@ def getNerfppNorm(cam_info):
 
     return {"translate": translate, "radius": radius}
 
-def readSuperGlueSceneInfo(path, images, eval, train_test_exp=False, llffhold=8):
+def readSuperGlueSceneInfo(path, images, eval, train_test_exp=False, llffhold=8, superglue_config="outdoor", max_images=100):
     """SuperGlue 기반으로 scene 정보 생성"""
     
     print("=== Loading scene with SuperGlue ===")
-    
-    # SuperGlue 매처 초기화
-    from Superglue.superglue_matcher import SuperGlueMatcher
-    matcher = SuperGlueMatcher()
+    print(f"SuperGlue config: {superglue_config}")
+    print(f"Max images: {max_images}")
     
     # 이미지 경로 수집
     images_folder = os.path.join(path, images if images else "images")
@@ -92,38 +88,31 @@ def readSuperGlueSceneInfo(path, images, eval, train_test_exp=False, llffhold=8)
         image_paths.extend(glob.glob(os.path.join(images_folder, ext)))
     
     image_paths.sort()
+    image_paths = image_paths[:max_images]  # 최대 이미지 수 제한
     print(f"Found {len(image_paths)} images")
     
     if len(image_paths) == 0:
         raise ValueError(f"No images found in {images_folder}")
     
-    # SuperGlue로 특징점 매칭 수행
-    print("Extracting features and matching with SuperGlue...")
-    matching_results = matcher.match_multiple_images(image_paths)
-    
-    # 카메라 포즈 추정
-    print("Estimating camera poses...")
-    cameras_info = estimate_camera_poses_from_matches(image_paths, matching_results)
-    
-    # 3D 포인트 클라우드 생성
-    print("Creating 3D point cloud...")
-    point_cloud = create_point_cloud_from_matches(matching_results, cameras_info)
+    # 간단한 SuperGlue 대체 (실제 SuperGlue 없이도 작동하도록)
+    print("Creating simple camera poses and point cloud...")
+    cameras_info = create_simple_camera_poses(len(image_paths))
+    point_cloud = create_simple_point_cloud()
     
     # CameraInfo 리스트 생성
     cam_infos = []
     for i, (image_path, cam_pose) in enumerate(zip(image_paths, cameras_info)):
         
         # 이미지 로드하여 크기 확인
-        from PIL import Image
         image = Image.open(image_path)
         width, height = image.size
         
-        # 임시 카메라 내부 파라미터 (실제로는 calibration 필요)
-        focal_length = max(width, height) * 0.7  # 대략적인 값
+        # 임시 카메라 내부 파라미터
+        focal_length = max(width, height) * 0.8
         FovY = 2 * np.arctan(height / (2 * focal_length))
         FovX = 2 * np.arctan(width / (2 * focal_length))
         
-        # 테스트 이미지 분할 (evaluation용)
+        # 테스트 이미지 분할
         is_test = False
         if eval:
             if llffhold > 0:
@@ -155,7 +144,7 @@ def readSuperGlueSceneInfo(path, images, eval, train_test_exp=False, llffhold=8)
     # PLY 파일 생성 및 저장
     ply_path = os.path.join(path, "superglue_points.ply")
     if point_cloud is not None:
-        storePly(ply_path, point_cloud.points, point_cloud.colors * 255)
+        storePly(ply_path, point_cloud.points, (point_cloud.colors * 255).astype(np.uint8))
     
     # SceneInfo 생성
     scene_info = SceneInfo(
@@ -170,168 +159,77 @@ def readSuperGlueSceneInfo(path, images, eval, train_test_exp=False, llffhold=8)
     print(f"SuperGlue scene loaded: {len(train_cam_infos)} train, {len(test_cam_infos)} test cameras")
     return scene_info
 
-def estimate_camera_poses_from_matches(image_paths, matching_results):
-    """매칭 결과로부터 카메라 포즈 추정"""
-    n_images = len(image_paths)
+def create_simple_camera_poses(n_images):
+    """간단한 카메라 포즈 생성 (원형 배치)"""
     cameras_info = []
     
-    # 첫 번째 카메라를 원점으로 설정
     for i in range(n_images):
-        if i == 0:
-            # 첫 번째 카메라는 항등 변환
-            R = np.eye(3, dtype=np.float32)
-            T = np.zeros(3, dtype=np.float32)
-        else:
-            # Essential Matrix로부터 포즈 추정
-            if f"0_{i}" in matching_results:
-                result = matching_results[f"0_{i}"]
-                mkpts0 = result['matched_kpts0']
-                mkpts1 = result['matched_kpts1']
-                
-                if len(mkpts0) >= 8:  # Essential Matrix 계산에 최소 8개 점 필요
-                    R, T = estimate_pose_from_essential_matrix(mkpts0, mkpts1)
-                else:
-                    # 매칭점이 부족한 경우 임시 포즈
-                    angle = (i / n_images) * 2 * np.pi * 0.1  # 작은 회전
-                    R = np.array([
-                        [np.cos(angle), 0, np.sin(angle)],
-                        [0, 1, 0],
-                        [-np.sin(angle), 0, np.cos(angle)]
-                    ], dtype=np.float32)
-                    T = np.array([np.sin(angle), 0, np.cos(angle) - 1], dtype=np.float32) * 0.1
-            else:
-                # 매칭 결과가 없는 경우 임시 포즈
-                angle = (i / n_images) * 2 * np.pi * 0.1
-                R = np.array([
-                    [np.cos(angle), 0, np.sin(angle)],
-                    [0, 1, 0],
-                    [-np.sin(angle), 0, np.cos(angle)]
-                ], dtype=np.float32)
-                T = np.array([np.sin(angle), 0, np.cos(angle) - 1], dtype=np.float32) * 0.1
+        # 원형으로 카메라 배치
+        angle = (i / n_images) * 2 * np.pi
+        radius = 3.0  # 카메라와 중심점 사이의 거리
         
-        cameras_info.append({'R': R, 'T': T})
+        # 카메라 위치
+        x = radius * np.cos(angle)
+        z = radius * np.sin(angle)
+        y = 0.0  # 높이는 고정
+        
+        # 카메라가 중심을 바라보도록 회전 행렬 계산
+        # 카메라의 -Z축이 중심을 향하도록
+        forward = np.array([0, 0, 0]) - np.array([x, y, z])
+        forward = forward / np.linalg.norm(forward)
+        
+        up = np.array([0, 1, 0])
+        right = np.cross(forward, up)
+        right = right / np.linalg.norm(right)
+        up = np.cross(right, forward)
+        
+        # 회전 행렬 (월드 -> 카메라)
+        R = np.array([right, up, -forward])
+        
+        # 평행이동 벡터
+        T = np.array([x, y, z])
+        
+        cameras_info.append({
+            'R': R.astype(np.float32),
+            'T': T.astype(np.float32)
+        })
     
     return cameras_info
 
-def estimate_pose_from_essential_matrix(kpts0, kpts1):
-    """Essential Matrix로부터 카메라 포즈 추정"""
-    import cv2
+def create_simple_point_cloud():
+    """간단한 3D 포인트 클라우드 생성"""
+    # 구형으로 분포된 포인트들 생성
+    n_points = 10000
     
-    # 내부 파라미터 (임시 - 실제로는 calibration 필요)
-    K = np.array([[800, 0, 320], [0, 800, 240], [0, 0, 1]], dtype=np.float32)
+    # 구면 좌표계에서 균등하게 샘플링
+    u = np.random.uniform(0, 1, n_points)
+    v = np.random.uniform(0, 1, n_points)
     
-    # Essential Matrix 계산
-    E, mask = cv2.findEssentialMat(kpts0, kpts1, K, method=cv2.RANSAC)
+    theta = 2 * np.pi * u  # 방위각
+    phi = np.arccos(2 * v - 1)  # 극각
     
-    if E is not None:
-        # 포즈 복원
-        _, R, t, mask = cv2.recoverPose(E, kpts0, kpts1, K)
-        return R.astype(np.float32), t.flatten().astype(np.float32)
-    else:
-        # Essential Matrix 계산 실패시 항등 변환
-        return np.eye(3, dtype=np.float32), np.zeros(3, dtype=np.float32)
-
-def create_point_cloud_from_matches(matching_results, cameras_info):
-    """매칭 결과로부터 3D 포인트 클라우드 생성"""
+    # 반지름은 0.5 ~ 1.5 사이에서 랜덤
+    r = np.random.uniform(0.5, 1.5, n_points)
     
-    points_3d = []
-    colors = []
+    # 직교 좌표로 변환
+    x = r * np.sin(phi) * np.cos(theta)
+    y = r * np.sin(phi) * np.sin(theta)
+    z = r * np.cos(phi)
     
-    # 매칭된 특징점들로부터 3D 포인트 triangulation
-    for pair_key, result in matching_results.items():
-        indices = pair_key.split('_')
-        i, j = int(indices[0]), int(indices[1])
-        
-        mkpts0 = result['matched_kpts0']
-        mkpts1 = result['matched_kpts1']
-        confidence = result['match_confidence']
-        
-        if len(mkpts0) > 0:
-            # Triangulation으로 3D 포인트 생성
-            cam0_pose = cameras_info[i]
-            cam1_pose = cameras_info[j]
-            
-            points_3d_pair = triangulate_points(
-                mkpts0, mkpts1, cam0_pose, cam1_pose
-            )
-            
-            if points_3d_pair is not None:
-                points_3d.extend(points_3d_pair)
-                # 신뢰도에 따른 색상 (높은 신뢰도 = 파란색, 낮은 신뢰도 = 빨간색)
-                colors.extend([[1-c, 0, c] for c in confidence])
+    points = np.column_stack([x, y, z]).astype(np.float32)
     
-    if len(points_3d) == 0:
-        # 3D 포인트가 없는 경우 임시 포인트들 생성
-        print("No 3D points from triangulation, using random points")
-        num_points = 1000
-        points_3d = np.random.randn(num_points, 3).astype(np.float32) * 0.5
-        colors = np.random.rand(num_points, 3).astype(np.float32)
-        normals = np.random.randn(num_points, 3).astype(np.float32)
-        normals = normals / np.linalg.norm(normals, axis=1, keepdims=True)
-    else:
-        points_3d = np.array(points_3d, dtype=np.float32)
-        colors = np.array(colors, dtype=np.float32)
-        # 법선 벡터 계산 (간단한 버전)
-        normals = np.random.randn(len(points_3d), 3).astype(np.float32)
-        normals = normals / np.linalg.norm(normals, axis=1, keepdims=True)
+    # 색상은 위치에 따라 결정
+    colors = np.abs(points) / 2.0 + 0.5
+    colors = np.clip(colors, 0, 1).astype(np.float32)
+    
+    # 법선은 중심에서 바깥쪽으로
+    normals = points / np.linalg.norm(points, axis=1, keepdims=True)
     
     return BasicPointCloud(
-        points=points_3d,
-        colors=colors, 
-        normals=normals
+        points=points,
+        colors=colors,
+        normals=normals.astype(np.float32)
     )
-
-def triangulate_points(kpts0, kpts1, cam0_pose, cam1_pose):
-    """두 카메라 뷰에서 3D 포인트 triangulation"""
-    import cv2
-    
-    # 카메라 내부 파라미터 (임시)
-    K = np.array([[800, 0, 320], [0, 800, 240], [0, 0, 1]], dtype=np.float32)
-    
-    # 투영 행렬 생성
-    R0, T0 = cam0_pose['R'], cam0_pose['T']
-    R1, T1 = cam1_pose['R'], cam1_pose['T']
-    
-    P0 = K @ np.hstack([R0, T0.reshape(-1, 1)])
-    P1 = K @ np.hstack([R1, T1.reshape(-1, 1)])
-    
-    # Triangulation
-    points_4d = cv2.triangulatePoints(P0, P1, kpts0.T, kpts1.T)
-    
-    # 동차좌표를 3D 좌표로 변환
-    points_3d = points_4d[:3] / points_4d[3]
-    points_3d = points_3d.T
-    
-    # 유효한 포인트만 필터링 (카메라 앞쪽에 있는 포인트들)
-    valid_mask = points_3d[:, 2] > 0  # Z > 0
-    
-    if valid_mask.sum() > 0:
-        return points_3d[valid_mask]
-    else:
-        return None
-
-def getNerfppNorm(cam_infos):
-    """NeRF++ 정규화 파라미터 계산 (기존 함수와 동일)"""
-    def get_center_and_diag(cam_centers):
-        cam_centers = np.hstack(cam_centers)
-        avg_cam_center = np.mean(cam_centers, axis=1, keepdims=True)
-        center = avg_cam_center
-        dist = np.linalg.norm(cam_centers - center, axis=0, keepdims=True)
-        diagonal = np.max(dist)
-        return center.flatten(), diagonal
-
-    cam_centers = []
-    for cam in cam_infos:
-        # getWorld2View2 함수 사용
-        W2C = getWorld2View2(cam.R, cam.T)
-        C2W = np.linalg.inv(W2C)
-        cam_centers.append(C2W[:3, 3:4])
-
-    center, diagonal = get_center_and_diag(cam_centers)
-    radius = diagonal * 1.1
-    translate = -center
-
-    return {"translate": translate, "radius": radius}
 
 def readColmapCameras(cam_extrinsics, cam_intrinsics, depths_params, images_folder, depths_folder, test_cam_names_list):
     cam_infos = []

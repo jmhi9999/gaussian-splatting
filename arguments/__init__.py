@@ -56,7 +56,8 @@ class ModelParams(ParamGroup):
         self.train_test_exp = False
         self.data_device = "cuda"
         self.scene_type = "Colmap"  
-        self.superglue_config = "outdoor"  
+        self.superglue_config = "indoor"  
+        self.max_images = 100  # 추가된 파라미터
         self.eval = False
         super().__init__(parser, "Loading Parameters", sentinel)
 
