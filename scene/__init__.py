@@ -40,14 +40,16 @@ class Scene:
         self.train_cameras = {}
         self.test_cameras = {}
 
-        if os.path.exists(os.path.join(args.source_path, "sparse")):
+        if args.scene_type == "SuperGlue":
+            scene_info = sceneLoadTypeCallbacks["SuperGlue"](args.source_path, args.images, args.eval)
+        elif os.path.exists(os.path.join(args.source_path, "sparse")):
             scene_info = sceneLoadTypeCallbacks["Colmap"](args.source_path, args.images, args.depths, args.eval, args.train_test_exp)
         elif os.path.exists(os.path.join(args.source_path, "transforms_train.json")):
             print("Found transforms_train.json file, assuming Blender data set!")
             scene_info = sceneLoadTypeCallbacks["Blender"](args.source_path, args.white_background, args.depths, args.eval)
         else:
             assert False, "Could not recognize scene type!"
-
+            
         if not self.loaded_iter:
             with open(scene_info.ply_path, 'rb') as src_file, open(os.path.join(self.model_path, "input.ply") , 'wb') as dest_file:
                 dest_file.write(src_file.read())

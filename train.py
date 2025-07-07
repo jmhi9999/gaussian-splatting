@@ -267,6 +267,9 @@ if __name__ == "__main__":
     parser.add_argument('--disable_viewer', action='store_true', default=False)
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
     parser.add_argument("--start_checkpoint", type=str, default = None)
+    parser.add_argument("--scene_type", type=str, default="Colmap", 
+                       choices=["Colmap", "Blender", "SuperGlue"],
+                       help="Scene type: Colmap, Blender, or SuperGlue")  # 새로 추가
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
     
