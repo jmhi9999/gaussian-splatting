@@ -26,13 +26,8 @@ import cv2
 import glob
 from pathlib import Path
 
-# SuperGlue scene reader import 추가
-try:
-    from Superglue.superglue_scene_reader import readSuperGlueSceneInfo
-    SUPERGLUE_AVAILABLE = True
-except ImportError:
-    SUPERGLUE_AVAILABLE = False
-    print("Warning: SuperGlue not available. Install SuperGlue dependencies to use SuperGlue scene reader.")
+# SuperGlue scene reader는 이미 이 파일에 정의되어 있음
+SUPERGLUE_AVAILABLE = True
 
 class CameraInfo(NamedTuple):
     uid: int
@@ -80,11 +75,9 @@ def getNerfppNorm(cam_info):
     return {"translate": translate, "radius": radius}
 
 def readSuperGlueSceneInfo(path, images, eval, train_test_exp=False, llffhold=8, superglue_config="outdoor", max_images=100):
-    """SuperGlue 기반으로 scene 정보 생성"""
+    """SuperGlue + COLMAP 하이브리드 파이프라인으로 scene 정보 생성"""
     
-    print("=== Loading scene with SuperGlue ===")
-    print(f"SuperGlue config: {superglue_config}")
-    print(f"Max images: {max_images}")
+    print("=== Loading scene with SuperGlue + COLMAP Pipeline ===")
     
     # 이미지 경로 수집
     images_folder = os.path.join(path, images if images else "images")
@@ -102,45 +95,143 @@ def readSuperGlueSceneInfo(path, images, eval, train_test_exp=False, llffhold=8,
     if len(image_paths) == 0:
         raise ValueError(f"No images found in {images_folder}")
     
-    # 간단한 SuperGlue 대체 (실제 SuperGlue 없이도 작동하도록)
-    print("Creating simple camera poses and point cloud...")
-    cameras_info = create_simple_camera_poses(len(image_paths))
-    point_cloud = create_simple_point_cloud()
+    # SuperGlue + COLMAP 하이브리드 파이프라인 실행
+    print("Running SuperGlue + COLMAP pipeline...")
     
-    # CameraInfo 리스트 생성
-    cam_infos = []
-    for i, (image_path, cam_pose) in enumerate(zip(image_paths, cameras_info)):
+    # 임시 출력 디렉토리
+    temp_output_dir = os.path.join(path, "temp_sfm_output")
+    
+    # 파이프라인 실행
+    try:
+        # SuperGlue + COLMAP 파이프라인 import 및 실행
+        import sys
+        import os
         
-        # 이미지 로드하여 크기 확인
-        image = Image.open(image_path)
-        width, height = image.size
+        # 프로젝트 루트 경로 추가
+        current_dir = os.path.dirname(os.path.abspath(__file__))
+        project_root = os.path.dirname(current_dir)
+        superglue_path = os.path.join(project_root, 'Superglue')
         
-        # 임시 카메라 내부 파라미터
-        focal_length = max(width, height) * 0.8
-        FovY = 2 * np.arctan(height / (2 * focal_length))
-        FovX = 2 * np.arctan(width / (2 * focal_length))
+        if superglue_path not in sys.path:
+            sys.path.insert(0, superglue_path)
         
-        # 테스트 이미지 분할
-        is_test = False
-        if eval:
-            if llffhold > 0:
-                is_test = (i % llffhold == 0)
+        try:
+            from superglue_colmap_pipeline import SuperGlueColmapPipeline
+        except ImportError as e:
+            print(f"Failed to import SuperGlue pipeline: {e}")
+            print("Available paths:", sys.path)
+            raise
         
-        cam_info = CameraInfo(
-            uid=i,
-            R=cam_pose['R'],
-            T=cam_pose['T'], 
-            FovY=FovY,
-            FovX=FovX,
-            depth_params=None,
-            image_path=image_path,
-            image_name=Path(image_path).name,
-            depth_path="",
-            width=width,
-            height=height,
-            is_test=is_test
-        )
-        cam_infos.append(cam_info)
+        pipeline = SuperGlueColmapPipeline()
+        success = pipeline.run_pipeline(images_folder, temp_output_dir, max_images)
+        
+        if success:
+            # 결과 로딩
+            cameras = pipeline.load_results()
+            print(f"Successfully loaded {len(cameras)} cameras from COLMAP results")
+            
+            # CameraInfo 리스트 생성
+            cam_infos = []
+            for i, camera in enumerate(cameras):
+                # 이미지 정보 가져오기
+                image_path = image_paths[i] if i < len(image_paths) else image_paths[0]
+                image = Image.open(image_path)
+                width, height = image.size
+                
+                # 카메라 파라미터 추출
+                R = camera.rotation().toRotationMatrix().numpy()
+                T = camera.position().numpy()
+                
+                # FOV 계산
+                focal = camera.focal()
+                FovY = 2 * np.arctan(height / (2 * focal))
+                FovX = 2 * np.arctan(width / (2 * focal))
+                
+                # 테스트 이미지 분할
+                is_test = False
+                if eval:
+                    if llffhold > 0:
+                        is_test = (i % llffhold == 0)
+                
+                cam_info = CameraInfo(
+                    uid=i,
+                    R=R,
+                    T=T, 
+                    FovY=FovY,
+                    FovX=FovX,
+                    depth_params=None,
+                    image_path=image_path,
+                    image_name=Path(image_path).name,
+                    depth_path="",
+                    width=width,
+                    height=height,
+                    is_test=is_test
+                )
+                cam_infos.append(cam_info)
+            
+            # PLY 파일 경로 (COLMAP 결과에서 생성)
+            ply_path = os.path.join(temp_output_dir, "sparse", "0", "points3D.ply")
+            if not os.path.exists(ply_path):
+                ply_path = os.path.join(path, "superglue_points.ply")
+            
+            # 포인트 클라우드 로딩
+            try:
+                pcd = fetchPly(ply_path)
+            except:
+                pcd = create_simple_point_cloud()
+            
+        else:
+            raise RuntimeError("SuperGlue + COLMAP pipeline failed")
+            
+    except Exception as e:
+        print(f"Pipeline failed: {e}")
+        print("Falling back to simple pose estimation...")
+        
+        # Fallback: 간단한 포즈 추정
+        cameras_info = create_simple_camera_poses(len(image_paths))
+        point_cloud = create_simple_point_cloud()
+        
+        # CameraInfo 리스트 생성
+        cam_infos = []
+        for i, (image_path, cam_pose) in enumerate(zip(image_paths, cameras_info)):
+            
+            # 이미지 로드하여 크기 확인
+            image = Image.open(image_path)
+            width, height = image.size
+            
+            # 임시 카메라 내부 파라미터
+            focal_length = max(width, height) * 0.8
+            FovY = 2 * np.arctan(height / (2 * focal_length))
+            FovX = 2 * np.arctan(width / (2 * focal_length))
+            
+            # 테스트 이미지 분할
+            is_test = False
+            if eval:
+                if llffhold > 0:
+                    is_test = (i % llffhold == 0)
+            
+            cam_info = CameraInfo(
+                uid=i,
+                R=cam_pose['R'],
+                T=cam_pose['T'], 
+                FovY=FovY,
+                FovX=FovX,
+                depth_params=None,
+                image_path=image_path,
+                image_name=Path(image_path).name,
+                depth_path="",
+                width=width,
+                height=height,
+                is_test=is_test
+            )
+            cam_infos.append(cam_info)
+        
+        # PLY 파일 생성 및 저장
+        ply_path = os.path.join(path, "superglue_points.ply")
+        if point_cloud is not None:
+            storePly(ply_path, point_cloud.points, (point_cloud.colors * 255).astype(np.uint8))
+        
+        pcd = point_cloud
     
     # 학습/테스트 분할
     train_cam_infos = [c for c in cam_infos if train_test_exp or not c.is_test]
@@ -149,14 +240,9 @@ def readSuperGlueSceneInfo(path, images, eval, train_test_exp=False, llffhold=8,
     # NeRF 정규화 파라미터 계산
     nerf_normalization = getNerfppNorm(train_cam_infos)
     
-    # PLY 파일 생성 및 저장
-    ply_path = os.path.join(path, "superglue_points.ply")
-    if point_cloud is not None:
-        storePly(ply_path, point_cloud.points, (point_cloud.colors * 255).astype(np.uint8))
-    
     # SceneInfo 생성
     scene_info = SceneInfo(
-        point_cloud=point_cloud,
+        point_cloud=pcd,
         train_cameras=train_cam_infos,
         test_cameras=test_cam_infos,
         nerf_normalization=nerf_normalization,
@@ -164,7 +250,7 @@ def readSuperGlueSceneInfo(path, images, eval, train_test_exp=False, llffhold=8,
         is_nerf_synthetic=False
     )
     
-    print(f"SuperGlue scene loaded: {len(train_cam_infos)} train, {len(test_cam_infos)} test cameras")
+    print(f"SuperGlue + COLMAP scene loaded: {len(train_cam_infos)} train, {len(test_cam_infos)} test cameras")
     return scene_info
 
 def create_simple_camera_poses(n_images):
@@ -483,8 +569,5 @@ def readNerfSyntheticInfo(path, white_background, depths, eval, extension=".png"
 sceneLoadTypeCallbacks = {
     "Colmap": readColmapSceneInfo,
     "Blender" : readNerfSyntheticInfo,
+    "SuperGlue": readSuperGlueSceneInfo  # 이미 정의된 함수 사용
 }
-
-# SuperGlue가 사용 가능한 경우에만 추가
-if SUPERGLUE_AVAILABLE:
-    sceneLoadTypeCallbacks["SuperGlue"] = readSuperGlueSceneInfo
