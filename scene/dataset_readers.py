@@ -26,6 +26,14 @@ import cv2
 import glob
 from pathlib import Path
 
+# SuperGlue scene reader import 추가
+try:
+    from Superglue.superglue_scene_reader import readSuperGlueSceneInfo
+    SUPERGLUE_AVAILABLE = True
+except ImportError:
+    SUPERGLUE_AVAILABLE = False
+    print("Warning: SuperGlue not available. Install SuperGlue dependencies to use SuperGlue scene reader.")
+
 class CameraInfo(NamedTuple):
     uid: int
     R: np.array
@@ -475,5 +483,8 @@ def readNerfSyntheticInfo(path, white_background, depths, eval, extension=".png"
 sceneLoadTypeCallbacks = {
     "Colmap": readColmapSceneInfo,
     "Blender" : readNerfSyntheticInfo,
-    "SuperGlue": readSuperGlueSceneInfo  # 새로 추가
 }
+
+# SuperGlue가 사용 가능한 경우에만 추가
+if SUPERGLUE_AVAILABLE:
+    sceneLoadTypeCallbacks["SuperGlue"] = readSuperGlueSceneInfo

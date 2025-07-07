@@ -8,16 +8,15 @@ from pathlib import Path
 from PIL import Image
 from scene.dataset_readers import CameraInfo, SceneInfo, BasicPointCloud
 from utils.graphics_utils import BasicPointCloud
-from superglue_matcher import SuperGlueMatcher
 import cv2
 
+# 새로운 하이브리드 파이프라인 import
+from superglue_colmap_pipeline import SuperGlueColmapPipeline
+
 def readSuperGlueSceneInfo(path, images, eval, train_test_exp=False, llffhold=8):
-    """SuperGlue 기반으로 scene 정보 생성"""
+    """SuperGlue + COLMAP 하이브리드 파이프라인으로 scene 정보 생성"""
     
-    print("=== Loading scene with SuperGlue ===")
-    
-    # SuperGlue 매처 초기화
-    matcher = SuperGlueMatcher()
+    print("=== Loading scene with SuperGlue + COLMAP Pipeline ===")
     
     # 이미지 경로 수집
     images_folder = os.path.join(path, images if images else "images")
@@ -34,28 +33,44 @@ def readSuperGlueSceneInfo(path, images, eval, train_test_exp=False, llffhold=8)
     if len(image_paths) == 0:
         raise ValueError(f"No images found in {images_folder}")
     
-    # SuperGlue로 특징점 매칭 수행
-    print("Extracting features and matching with SuperGlue...")
-    matching_results = matcher.match_multiple_images(image_paths)
+    # SuperGlue + COLMAP 하이브리드 파이프라인 실행
+    print("Running SuperGlue + COLMAP pipeline...")
     
-    # 임시 카메라 포즈 추정 (간단한 버전)
-    cameras_info = estimate_camera_poses_simple(image_paths, matching_results)
+    # 임시 출력 디렉토리
+    temp_output_dir = os.path.join(path, "temp_sfm_output")
     
-    # 3D 포인트 클라우드 생성 (간단한 버전)
-    point_cloud = create_point_cloud_simple(matching_results, cameras_info)
+    # 파이프라인 실행
+    pipeline = SuperGlueColmapPipeline()
+    try:
+        success = pipeline.run_pipeline(images_folder, temp_output_dir, max_images=100)
+        if not success:
+            raise RuntimeError("SuperGlue + COLMAP pipeline failed")
+        
+        # 결과 로딩
+        cameras = pipeline.load_results()
+        print(f"Successfully loaded {len(cameras)} cameras from COLMAP results")
+        
+    except Exception as e:
+        print(f"Pipeline failed: {e}")
+        print("Falling back to simple pose estimation...")
+        cameras = _fallback_simple_poses(image_paths)
     
     # CameraInfo 리스트 생성
     cam_infos = []
-    for i, (image_path, cam_pose) in enumerate(zip(image_paths, cameras_info)):
-        
-        # 이미지 로드하여 크기 확인
+    for i, camera in enumerate(cameras):
+        # 이미지 정보 가져오기
+        image_path = image_paths[i] if i < len(image_paths) else image_paths[0]
         image = Image.open(image_path)
         width, height = image.size
         
-        # 임시 카메라 내부 파라미터 (실제로는 calibration 필요)
-        focal_length = max(width, height) * 0.7  # 대략적인 값
-        FovY = 2 * np.arctan(height / (2 * focal_length))
-        FovX = 2 * np.arctan(width / (2 * focal_length))
+        # 카메라 파라미터 추출
+        R = camera.rotation().toRotationMatrix().numpy()
+        T = camera.position().numpy()
+        
+        # FOV 계산
+        focal = camera.focal()
+        FovY = 2 * np.arctan(height / (2 * focal))
+        FovX = 2 * np.arctan(width / (2 * focal))
         
         # 테스트 이미지 분할 (evaluation용)
         is_test = False
@@ -65,8 +80,8 @@ def readSuperGlueSceneInfo(path, images, eval, train_test_exp=False, llffhold=8)
         
         cam_info = CameraInfo(
             uid=i,
-            R=cam_pose['R'],
-            T=cam_pose['T'], 
+            R=R,
+            T=T, 
             FovY=FovY,
             FovX=FovX,
             image_path=image_path,
@@ -86,12 +101,14 @@ def readSuperGlueSceneInfo(path, images, eval, train_test_exp=False, llffhold=8)
     # NeRF 정규화 파라미터 계산
     nerf_normalization = getNerfppNorm(train_cam_infos)
     
-    # PLY 파일 경로 (임시)
-    ply_path = os.path.join(path, "superglue_points.ply")
+    # PLY 파일 경로 (COLMAP 결과에서 생성)
+    ply_path = os.path.join(temp_output_dir, "sparse", "0", "points3D.ply")
+    if not os.path.exists(ply_path):
+        ply_path = os.path.join(path, "superglue_points.ply")
     
     # SceneInfo 생성
     scene_info = SceneInfo(
-        point_cloud=point_cloud,
+        point_cloud=_load_point_cloud(ply_path),
         train_cameras=train_cam_infos,
         test_cameras=test_cam_infos,
         nerf_normalization=nerf_normalization,
@@ -99,51 +116,95 @@ def readSuperGlueSceneInfo(path, images, eval, train_test_exp=False, llffhold=8)
         is_nerf_synthetic=False
     )
     
-    print(f"SuperGlue scene loaded: {len(train_cam_infos)} train, {len(test_cam_infos)} test cameras")
+    print(f"SuperGlue + COLMAP scene loaded: {len(train_cam_infos)} train, {len(test_cam_infos)} test cameras")
     return scene_info
 
-def estimate_camera_poses_simple(image_paths, matching_results):
-    """간단한 카메라 포즈 추정 (PnP 기반)"""
-    n_images = len(image_paths)
-    cameras_info = []
+def _fallback_simple_poses(image_paths):
+    """파이프라인 실패 시 간단한 포즈 추정"""
+    print("Using fallback simple pose estimation...")
     
-    # 첫 번째 카메라를 원점으로 설정
-    for i in range(n_images):
-        if i == 0:
-            # 첫 번째 카메라는 항등 변환
-            R = np.eye(3, dtype=np.float32)
-            T = np.zeros(3, dtype=np.float32)
-        else:
-            # 간단한 포즈 추정 (실제로는 더 정교한 방법 필요)
-            # 여기서는 임시로 랜덤한 작은 변환 적용
-            angle = (i / n_images) * 2 * np.pi
-            R = np.array([
-                [np.cos(angle), 0, np.sin(angle)],
-                [0, 1, 0],
-                [-np.sin(angle), 0, np.cos(angle)]
-            ], dtype=np.float32)
-            T = np.array([np.sin(angle), 0, np.cos(angle) - 1], dtype=np.float32) * 0.5
+    cameras = []
+    for i, image_path in enumerate(image_paths):
+        # 간단한 포즈 생성
+        angle = (i / len(image_paths)) * 2 * np.pi
+        R = np.array([
+            [np.cos(angle), 0, np.sin(angle)],
+            [0, 1, 0],
+            [-np.sin(angle), 0, np.cos(angle)]
+        ], dtype=np.float32)
+        T = np.array([np.sin(angle), 0, np.cos(angle) - 1], dtype=np.float32) * 0.5
         
-        cameras_info.append({'R': R, 'T': T})
+        # 임시 카메라 객체 생성 (실제로는 더 복잡한 구현 필요)
+        cameras.append({
+            'R': R,
+            'T': T,
+            'focal': 1000.0,  # 임시 focal length
+            'width': 1920,
+            'height': 1080
+        })
     
-    return cameras_info
+    return cameras
 
-def create_point_cloud_simple(matching_results, cameras_info):
-    """간단한 3D 포인트 클라우드 생성"""
+def _load_point_cloud(ply_path):
+    """PLY 파일에서 포인트 클라우드 로딩"""
+    if not os.path.exists(ply_path):
+        # 기본 포인트 클라우드 생성
+        return _create_default_point_cloud()
     
-    # 매칭된 특징점들로부터 3D 포인트 생성 (간단한 버전)
-    points_3d = []
-    colors = []
+    try:
+        # PLY 파일 파싱 (간단한 버전)
+        points = []
+        colors = []
+        
+        with open(ply_path, 'r') as f:
+            lines = f.readlines()
+        
+        # 헤더 건너뛰기
+        start_idx = 0
+        for i, line in enumerate(lines):
+            if line.strip() == "end_header":
+                start_idx = i + 1
+                break
+        
+        # 포인트 데이터 파싱
+        for line in lines[start_idx:]:
+            if line.strip():
+                parts = line.strip().split()
+                if len(parts) >= 6:  # x, y, z, r, g, b
+                    x, y, z = float(parts[0]), float(parts[1]), float(parts[2])
+                    r, g, b = float(parts[3]), float(parts[4]), float(parts[5])
+                    
+                    points.append([x, y, z])
+                    colors.append([r/255, g/255, b/255])
+        
+        if len(points) > 0:
+            points = np.array(points, dtype=np.float32)
+            colors = np.array(colors, dtype=np.float32)
+            
+            # 법선 벡터 (임시)
+            normals = np.random.randn(len(points), 3).astype(np.float32)
+            normals = normals / np.linalg.norm(normals, axis=1, keepdims=True)
+            
+            return BasicPointCloud(
+                points=points,
+                colors=colors,
+                normals=normals
+            )
     
-    # 임시로 랜덤한 3D 포인트들 생성
-    # 실제로는 triangulation 필요
+    except Exception as e:
+        print(f"Failed to load PLY file: {e}")
+    
+    return _create_default_point_cloud()
+
+def _create_default_point_cloud():
+    """기본 포인트 클라우드 생성"""
     num_points = 10000
     
     # 랜덤 3D 포인트들
     points = np.random.randn(num_points, 3).astype(np.float32) * 2
     
     # 랜덤 컬러
-    point_colors = np.random.rand(num_points, 3).astype(np.float32)
+    colors = np.random.rand(num_points, 3).astype(np.float32)
     
     # 법선 벡터 (임시)
     normals = np.random.randn(num_points, 3).astype(np.float32)
@@ -151,7 +212,7 @@ def create_point_cloud_simple(matching_results, cameras_info):
     
     return BasicPointCloud(
         points=points,
-        colors=point_colors, 
+        colors=colors,
         normals=normals
     )
 
