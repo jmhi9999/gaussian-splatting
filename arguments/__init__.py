@@ -55,7 +55,8 @@ class ModelParams(ParamGroup):
         self._white_background = False
         self.train_test_exp = False
         self.data_device = "cuda"
-        self.scene_type = "Colmap"  # 새로 추가
+        self.scene_type = "Colmap"  
+        self.superglue_config = "outdoor"  
         self.eval = False
         super().__init__(parser, "Loading Parameters", sentinel)
 

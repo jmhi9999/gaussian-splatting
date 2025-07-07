@@ -269,11 +269,20 @@ if __name__ == "__main__":
     parser.add_argument("--start_checkpoint", type=str, default = None)
     parser.add_argument("--scene_type", type=str, default="Colmap", 
                        choices=["Colmap", "Blender", "SuperGlue"],
-                       help="Scene type: Colmap, Blender, or SuperGlue")  # 새로 추가
+                       help="Scene type: Colmap, Blender, or SuperGlue")
+    parser.add_argument("--superglue_config", type=str, default="outdoor",
+                       choices=["indoor", "outdoor"],
+                       help="SuperGlue configuration for feature matching")
+    parser.add_argument("--max_images", type=int, default=100,
+                       help="Maximum number of images to process with SuperGlue")
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
     
     print("Optimizing " + args.model_path)
+    
+    if args.scene_type == "SuperGlue":
+        print(f"Using SuperGlue SfM with {args.superglue_config} configuration")
+        print(f"Processing max {args.max_images} images")
 
     # Initialize system state (RNG)
     safe_state(args.quiet)

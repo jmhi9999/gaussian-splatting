@@ -22,7 +22,8 @@ from pathlib import Path
 from plyfile import PlyData, PlyElement
 from utils.sh_utils import SH2RGB
 from scene.gaussian_model import BasicPointCloud
-from Superglue.superglue_matcher import readSuperGlueSceneInfo
+#from Superglue.superglue_matcher import readSuperGlueSceneInfo
+from Superglue.complete_superglue_sfm import readSuperGlueSceneInfo
 import cv2
 import glob
 from pathlib import Path
@@ -78,7 +79,7 @@ def readSuperGlueSceneInfo(path, images, eval, train_test_exp=False, llffhold=8)
     print("=== Loading scene with SuperGlue ===")
     
     # SuperGlue 매처 초기화
-    from superglue_matcher import SuperGlueMatcher
+    from Superglue.superglue_matcher import SuperGlueMatcher
     matcher = SuperGlueMatcher()
     
     # 이미지 경로 수집

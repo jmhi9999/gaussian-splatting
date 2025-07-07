@@ -41,7 +41,12 @@ class Scene:
         self.test_cameras = {}
 
         if args.scene_type == "SuperGlue":
-            scene_info = sceneLoadTypeCallbacks["SuperGlue"](args.source_path, args.images, args.eval)
+            print("Loading scene with SuperGlue SfM pipeline...")
+            scene_info = sceneLoadTypeCallbacks["SuperGlue"](
+                args.source_path, args.images, args.eval, 
+                args.train_test_exp, superglue_config=args.superglue_config,
+                max_images=args.max_images
+            )
         elif os.path.exists(os.path.join(args.source_path, "sparse")):
             scene_info = sceneLoadTypeCallbacks["Colmap"](args.source_path, args.images, args.depths, args.eval, args.train_test_exp)
         elif os.path.exists(os.path.join(args.source_path, "transforms_train.json")):
