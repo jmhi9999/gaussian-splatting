@@ -154,47 +154,149 @@ class SuperGlue3DGSPipeline:
         
         print(f"  Created {len(self.matches)} image pairs with good matches")
     
-    def _match_pair_superglue(self, idx0, idx1):
-        """더 안전한 매칭 함수"""
+    def _match_pair_superglue(self, cam_i, cam_j):
+        """수정된 SuperGlue 매칭"""
+    
+        if cam_i not in self.image_features or cam_j not in self.image_features:
+            return []
+    
         try:
-            feat0 = self.image_features[idx0]
-            feat1 = self.image_features[idx1]
+            feat_i = self.image_features[cam_i]
+            feat_j = self.image_features[cam_j]
         
-            # 입력 데이터 확인
-            if 'keypoints' not in feat0 or 'keypoints' not in feat1:
+            if feat_i['keypoints'].shape[0] == 0 or feat_j['keypoints'].shape[0] == 0:
                 return []
         
-            # 매칭 수행
-            pred = self.matching({
-                'keypoints0': torch.from_numpy(feat0['keypoints']).float().to(self.device),
-                'keypoints1': torch.from_numpy(feat1['keypoints']).float().to(self.device),
-                'descriptors0': torch.from_numpy(feat0['descriptors']).float().to(self.device),
-                'descriptors1': torch.from_numpy(feat1['descriptors']).float().to(self.device),
-                'scores0': torch.from_numpy(feat0['scores']).float().to(self.device),
-                'scores1': torch.from_numpy(feat1['scores']).float().to(self.device),
-                'image0': torch.zeros(1, 1, *feat0['image_size']).to(self.device),
-                'image1': torch.zeros(1, 1, *feat1['image_size']).to(self.device),
-            })
+        # SuperGlue 입력 데이터 구성
+            data = {
+                'keypoints0': torch.from_numpy(feat_i['keypoints']).unsqueeze(0).to(self.device),
+                'keypoints1': torch.from_numpy(feat_j['keypoints']).unsqueeze(0).to(self.device),
+                'descriptors0': torch.from_numpy(feat_i['descriptors']).unsqueeze(0).to(self.device),
+                'descriptors1': torch.from_numpy(feat_j['descriptors']).unsqueeze(0).to(self.device),
+                'scores0': torch.from_numpy(feat_i['scores']).unsqueeze(0).to(self.device),
+                'scores1': torch.from_numpy(feat_j['scores']).unsqueeze(0).to(self.device),
+                'image0': torch.zeros((1, 1, 480, 640)).to(self.device),
+                'image1': torch.zeros((1, 1, 480, 640)).to(self.device),
+            }
         
-            # 매칭 결과 처리
-            matches = pred['matches0'][0].cpu().numpy()
-            confidence = pred['matching_scores0'][0].cpu().numpy()
+        # SuperGlue 매칭 수행
+            with torch.no_grad():
+                result = self.matching.superglue(data)
         
-            # 유효한 매칭만 선택
-            valid = matches > -1
-            matches = matches[valid]
-            confidence = confidence[valid]
+            # **핵심 수정: indices0/indices1 사용 (matches0/matches1 아님)**
+            indices0 = result['indices0'][0].cpu().numpy()
+            indices1 = result['indices1'][0].cpu().numpy()
+            mscores0 = result['matching_scores0'][0].cpu().numpy()
         
-            # 신뢰도 기준 필터링
-            conf_mask = confidence > 0.2
-            matches = matches[conf_mask]
-            confidence = confidence[conf_mask]
+        # 유효한 매칭 추출
+            valid_matches = []
+            threshold = self.matching.superglue.config['match_threshold']
         
-            return matches
+            for i, j in enumerate(indices0):
+                if j >= 0 and mscores0[i] > threshold:
+                # 상호 매칭 확인
+                    if j < len(indices1) and indices1[j] == i:
+                        valid_matches.append((i, j, mscores0[i]))
+        
+            print(f"  Pair {cam_i}-{cam_j}: {len(valid_matches)} mutual matches")
+            return valid_matches
         
         except Exception as e:
-            print(f"  Matching failed for pair {idx0}-{idx1}: {e}")
+            print(f"SuperGlue matching failed for pair {cam_i}-{cam_j}: {e}")
             return []
+        
+        
+    def _extract_all_features(self, image_paths):
+        """모든 이미지에서 SuperPoint 특징점 추출 (수정된 버전)"""
+        for i, image_path in enumerate(image_paths):
+            print(f"  {i+1:3d}/{len(image_paths)}: {image_path.name}")
+        
+        # 이미지 로드
+            image = self._load_image(image_path)
+            if image is None:
+                continue
+        
+            # SuperPoint 특징점 추출
+            inp = frame2tensor(image, self.device)
+            with torch.no_grad():
+                pred = self.matching.superpoint({'image': inp})
+        
+            # *** 디버깅: SuperPoint 출력 확인 ***
+            if i == 0:  # 첫 번째 이미지에서만 출력
+                print(f"  SuperPoint output keys: {list(pred.keys())}")
+                for k, v in pred.items():
+                    if isinstance(v, torch.Tensor):
+                        print(f"    {k}: {v.shape}")
+        
+        # 결과 저장 - 모든 필요한 키 포함
+            self.image_features[i] = {
+                'keypoints': pred['keypoints'][0].cpu().numpy(),
+                'descriptors': pred['descriptors'][0].cpu().numpy(), 
+                'scores': pred['scores'][0].cpu().numpy(),
+                'image_path': str(image_path),
+                'image_size': image.shape[:2]  # (H, W)
+            }
+        
+        print(f"  Extracted features from {len(self.image_features)} images")
+
+
+# 추가: SuperGlue 매칭 디버깅 함수
+    def debug_superglue_matching(self, i, j):
+        """SuperGlue 매칭 과정 디버깅"""
+    
+        print(f"\n=== Debugging SuperGlue matching for pair {i}-{j} ===")
+    
+    # 특징점 확인
+        feat0 = self.image_features[i] 
+        feat1 = self.image_features[j]
+    
+        print(f"Image {i}: {feat0['keypoints'].shape[0]} keypoints")
+        print(f"Image {j}: {feat1['keypoints'].shape[0]} keypoints")
+    
+    # 이미지 로드
+        img0 = self._load_image(feat0['image_path'])
+        img1 = self._load_image(feat1['image_path'])
+    
+    # 텐서 변환
+        inp0 = frame2tensor(img0, self.device)
+        inp1 = frame2tensor(img1, self.device)
+    
+    # SuperPoint 재추출
+        with torch.no_grad():
+            pred0 = self.matching.superpoint({'image': inp0})
+            pred1 = self.matching.superpoint({'image': inp1})
+    
+        print(f"SuperPoint pred0 keys: {list(pred0.keys())}")
+        print(f"SuperPoint pred1 keys: {list(pred1.keys())}")
+    
+        # 데이터 준비
+        data = {
+            'image0': inp0,
+            'image1': inp1,
+            'keypoints0': pred0['keypoints'],
+            'keypoints1': pred1['keypoints'],
+            'descriptors0': pred0['descriptors'], 
+            'descriptors1': pred1['descriptors'],
+            'scores0': pred0['scores'],
+            'scores1': pred1['scores']
+        }
+    
+        print(f"Input data keys: {list(data.keys())}")
+    
+    # SuperGlue 매칭
+        try:
+            with torch.no_grad():
+                result = self.matching(data)
+            print(f"SuperGlue result keys: {list(result.keys())}")
+            print(f"Matches found: {(result['matches0'][0] > -1).sum().item()}")
+            return True
+        
+        except Exception as e:
+            print(f"SuperGlue matching failed: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
+
     
     def _estimate_camera_poses(self):
         """순차적 카메라 포즈 추정"""
@@ -764,8 +866,6 @@ class SuperGlue3DGSPipeline:
             print(f"    Error loading {image_path}: {e}")
             return None
 
-
-# scene/dataset_readers.py에 추가할 함수
 def readSuperGlueSceneInfo(path, images, eval, train_test_exp=False, llffhold=8, 
                           superglue_config="outdoor", max_images=100):
     """SuperGlue 기반 완전한 SfM으로 SceneInfo 생성"""

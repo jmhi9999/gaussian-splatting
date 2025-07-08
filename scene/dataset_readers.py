@@ -1,5 +1,3 @@
-# scene/dataset_readers.py에 추가할 완전한 SuperGlue 통합 코드
-
 import os
 import sys
 import numpy as np
@@ -19,49 +17,282 @@ from utils.graphics_utils import getWorld2View2, focal2fov, fov2focal, BasicPoin
 from plyfile import PlyData, PlyElement
 from utils.sh_utils import SH2RGB
 
+# 기존 타입들
+class CameraInfo(NamedTuple):
+    uid: int
+    R: np.array
+    T: np.array
+    FovY: np.array
+    FovX: np.array
+    depth_params: dict
+    image_path: str
+    image_name: str
+    depth_path: str
+    width: int
+    height: int
+    is_test: bool
+
+class SceneInfo(NamedTuple):
+    point_cloud: BasicPointCloud
+    train_cameras: list
+    test_cameras: list
+    nerf_normalization: dict
+    ply_path: str
+    is_nerf_synthetic: bool
+
+
 # SuperGlue 모듈 경로 수정
-def import_superglue_modules():
-    """SuperGlue 모듈들을 동적으로 import"""
+def import_superglue_pipeline():
+    """SuperGlue 파이프라인 동적 import"""
     try:
-        # 현재 디렉토리에서 SuperGlue 찾기
+        # 현재 디렉토리에서 SuperGlue 경로 찾기
         current_dir = Path(__file__).parent.parent  # gaussian-splatting 루트
         
-        # 가능한 SuperGlue 경로들
-        possible_paths = [
-            current_dir / "models",
-            current_dir / "Superglue" / "models", 
-            current_dir / "SuperGlue" / "models",
-            current_dir,
+        # SuperGlue 경로들
+        superglue_paths = [
             current_dir / "Superglue",
-            current_dir / "SuperGlue"
+            current_dir / "SuperGlue", 
+            current_dir
         ]
         
-        for path in possible_paths:
-            if path.exists() and (path / "matching.py").exists():
-                sys.path.insert(0, str(path.parent))
+        for path in superglue_paths:
+            complete_sfm_file = path / "complete_superglue_sfm.py"
+            if complete_sfm_file.exists():
+                # 해당 경로를 sys.path에 추가
                 sys.path.insert(0, str(path))
-                break
+                
+                # 모듈 import
+                from complete_superglue_sfm import SuperGlue3DGSPipeline
+                print(f"✓ SuperGlue pipeline imported from {path}")
+                return SuperGlue3DGSPipeline
         
-        # SuperGlue 모듈 import
-        from models.matching import Matching
-        from models.utils import frame2tensor
-        
-        return Matching, frame2tensor
+        print("✗ SuperGlue pipeline not found")
+        return None
         
     except ImportError as e:
-        print(f"SuperGlue modules not found: {e}")
-        print("Falling back to simple pose estimation...")
-        return None, None
+        print(f"✗ SuperGlue import failed: {e}")
+        return None
 
-# SuperGlue 사용 가능 여부 확인
-try:
-    Matching, frame2tensor = import_superglue_modules()
-    SUPERGLUE_AVAILABLE = (Matching is not None)
-except:
-    SUPERGLUE_AVAILABLE = False
-    Matching, frame2tensor = None, None
+# SuperGlue 파이프라인 import 시도
+SuperGlue3DGSPipeline = import_superglue_pipeline()
+SUPERGLUE_PIPELINE_AVAILABLE = (SuperGlue3DGSPipeline is not None)
 
-print(f"SuperGlue available: {SUPERGLUE_AVAILABLE}")
+def readSuperGlueSceneInfo(path, images="images", eval=False, train_test_exp=False, 
+                          llffhold=8, superglue_config="outdoor", max_images=100):
+    """SuperGlue 완전 파이프라인으로 SceneInfo 생성"""
+    
+    print("\n" + "="*60)
+    print("           SUPERGLUE + 3DGS PIPELINE")
+    print("="*60)
+    
+    print(f"📁 Source path: {path}")
+    print(f"🖼️  Images folder: {images}")
+    print(f"🔧 SuperGlue config: {superglue_config}")
+    print(f"📊 Max images: {max_images}")
+    print(f"🚀 Pipeline available: {SUPERGLUE_PIPELINE_AVAILABLE}")
+    
+    # 이미지 디렉토리 경로
+    images_folder = Path(path) / images
+    if not images_folder.exists():
+        # fallback 경로들 시도
+        fallback_paths = [Path(path), Path(path) / "input"]
+        for fallback in fallback_paths:
+            if fallback.exists():
+                images_folder = fallback
+                break
+    
+    print(f"📂 Using images folder: {images_folder}")
+    
+    if SUPERGLUE_PIPELINE_AVAILABLE:
+        try:
+            print("\n🔥 STARTING SUPERGLUE PIPELINE...")
+            
+            # SuperGlue 설정
+            config = {
+                'superpoint': {
+                    'nms_radius': 4,
+                    'keypoint_threshold': 0.005,
+                    'max_keypoints': 2048
+                },
+                'superglue': {
+                    'weights': superglue_config,
+                    'sinkhorn_iterations': 20,
+                    'match_threshold': 0.2,
+                }
+            }
+            
+            # 출력 디렉토리
+            output_folder = Path(path) / "superglue_sfm_output"
+            
+            # 파이프라인 실행
+            pipeline = SuperGlue3DGSPipeline(config)
+            
+            print(f"🎯 Calling process_images_to_3dgs...")
+            print(f"   - Input: {images_folder}")
+            print(f"   - Output: {output_folder}")
+            print(f"   - Max images: {max_images}")
+            
+            scene_info = pipeline.process_images_to_3dgs(
+                image_dir=str(images_folder),
+                output_dir=str(output_folder),
+                max_images=max_images
+            )
+            
+            print("\n🎉 SUPERGLUE PIPELINE SUCCESS!")
+            print(f"✓ Training cameras: {len(scene_info.train_cameras)}")
+            print(f"✓ Test cameras: {len(scene_info.test_cameras)}")
+            print(f"✓ Point cloud: {len(scene_info.point_cloud.points)} points")
+            print(f"✓ Scene radius: {scene_info.nerf_normalization['radius']:.3f}")
+            
+            return scene_info
+            
+        except Exception as e:
+            print(f"\n❌ SUPERGLUE PIPELINE FAILED: {e}")
+            import traceback
+            traceback.print_exc()
+            print("\n⚠️  Falling back to simple camera arrangement...")
+            
+    else:
+        print("\n⚠️  SuperGlue pipeline not available, using fallback...")
+    
+    # Fallback: 간단한 카메라 배치
+    return _create_fallback_scene_info(images_folder, max_images)
+
+def _create_fallback_scene_info(images_folder, max_images):
+    """SuperGlue 실패시 fallback scene 생성"""
+    
+    print(f"\n📋 Creating fallback scene from {images_folder}")
+    
+    # 이미지 수집
+    image_paths = []
+    extensions = ['*.jpg', '*.jpeg', '*.png', '*.JPG', '*.JPEG', '*.PNG']
+    
+    for ext in extensions:
+        image_paths.extend(list(Path(images_folder).glob(ext)))
+    
+    image_paths.sort()
+    image_paths = image_paths[:max_images]
+    
+    if len(image_paths) == 0:
+        raise ValueError(f"No images found in {images_folder}")
+    
+    print(f"📸 Found {len(image_paths)} images")
+    
+    # CameraInfo 생성
+    cam_infos = []
+    for i, image_path in enumerate(image_paths):
+        # 이미지 크기 확인
+        try:
+            with Image.open(image_path) as img:
+                width, height = img.size
+        except:
+            width, height = 640, 480
+        
+        # 원형 배치 (더 realistic한 카메라 배치)
+        angle = i * (2 * np.pi / len(image_paths))
+        radius = 3.0
+        
+        # 카메라가 원점을 바라보도록 설정
+        cam_pos = np.array([
+            radius * np.cos(angle),
+            0.0,  # Y는 고정
+            radius * np.sin(angle)
+        ], dtype=np.float32)
+        
+        # 원점을 바라보는 회전 행렬
+        forward = -cam_pos / np.linalg.norm(cam_pos)  # 원점을 향함
+        right = np.cross(forward, np.array([0, 1, 0]))
+        right = right / np.linalg.norm(right)
+        up = np.cross(right, forward)
+        
+        R = np.column_stack([right, up, forward]).astype(np.float32)
+        T = cam_pos
+        
+        # FOV 설정
+        focal_length = max(width, height) * 0.8
+        FovX = focal2fov(focal_length, width)
+        FovY = focal2fov(focal_length, height)
+        
+        cam_info = CameraInfo(
+            uid=i,
+            R=R,
+            T=T,
+            FovY=float(FovY),
+            FovX=float(FovX),
+            image_path=str(image_path),
+            image_name=image_path.name,
+            width=width,
+            height=height,
+            depth_params=None,
+            depth_path="",
+            is_test=(i % 8 == 0)  # 8장마다 테스트용
+        )
+        cam_infos.append(cam_info)
+    
+    # 포인트 클라우드 생성 (원점 주변에 구형 분포)
+    n_points = 5000
+    
+    # 구형 분포
+    phi = np.random.uniform(0, 2*np.pi, n_points)
+    costheta = np.random.uniform(-1, 1, n_points)
+    u = np.random.uniform(0, 1, n_points)
+    
+    theta = np.arccos(costheta)
+    r = 1.5 * np.cbrt(u)  # 구형 분포를 위한 반지름
+    
+    x = r * np.sin(theta) * np.cos(phi)
+    y = r * np.sin(theta) * np.sin(phi) 
+    z = r * np.cos(theta)
+    
+    points = np.column_stack([x, y, z]).astype(np.float32)
+    
+    # 컬러는 위치 기반으로 생성
+    colors = np.abs(points).astype(np.float32)
+    colors = colors / np.max(colors)  # 정규화
+    
+    # 법선벡터 (외향)
+    normals = points / np.linalg.norm(points, axis=1, keepdims=True)
+    
+    pcd = BasicPointCloud(points=points, colors=colors, normals=normals)
+    
+    # 학습/테스트 분할
+    train_cams = [c for c in cam_infos if not c.is_test]
+    test_cams = [c for c in cam_infos if c.is_test]
+    
+    # NeRF 정규화
+    cam_centers = []
+    for cam in cam_infos:
+        W2C = getWorld2View2(cam.R, cam.T)
+        C2W = np.linalg.inv(W2C)
+        cam_centers.append(C2W[:3, 3])
+    
+    if cam_centers:
+        cam_centers = np.array(cam_centers)
+        center = np.mean(cam_centers, axis=0)
+        distances = np.linalg.norm(cam_centers - center, axis=1)
+        radius = np.max(distances) * 1.1
+    else:
+        center = np.zeros(3)
+        radius = 3.0
+    
+    nerf_norm = {"translate": -center, "radius": radius}
+    
+    scene_info = SceneInfo(
+        point_cloud=pcd,
+        train_cameras=train_cams,
+        test_cameras=test_cams,
+        nerf_normalization=nerf_norm,
+        ply_path="",
+        is_nerf_synthetic=False
+    )
+    
+    print(f"✓ Fallback scene created:")
+    print(f"  - {len(train_cams)} training cameras")
+    print(f"  - {len(test_cams)} test cameras") 
+    print(f"  - {len(points)} 3D points")
+    print(f"  - Scene radius: {radius:.2f}")
+    
+    return scene_info
 
 
 class SimpleSuperGluePipeline:
@@ -528,557 +759,6 @@ class SimpleSuperGluePipeline:
             return None
 
 
-# dataset_readers.py의 기존 클래스들 (CameraInfo, SceneInfo 등)은 그대로 유지
-
-class CameraInfo(NamedTuple):
-    uid: int
-    R: np.array
-    T: np.array
-    FovY: np.array
-    FovX: np.array
-    depth_params: dict
-    image_path: str
-    image_name: str
-    depth_path: str
-    width: int
-    height: int
-    is_test: bool
-
-class SceneInfo(NamedTuple):
-    point_cloud: BasicPointCloud
-    train_cameras: list
-    test_cameras: list
-    nerf_normalization: dict
-    ply_path: str
-    is_nerf_synthetic: bool
-
-
-def _emergency_fallback(images_folder, max_images):
-    """완전 실패시 비상 fallback"""
-    
-    # 이미지 수집
-    image_paths = []
-    for ext in ['*.jpg', '*.jpeg', '*.png', '*.JPG', '*.JPEG', '*.PNG']:
-        image_paths.extend(list(Path(images_folder).glob(ext)))
-    
-    image_paths.sort()
-    image_paths = image_paths[:max_images]
-    
-    if len(image_paths) == 0:
-        raise ValueError(f"No images found in {images_folder}")
-    
-    print(f"Emergency fallback: {len(image_paths)} images")
-    
-    # 매우 간단한 카메라 배치
-    cam_infos = []
-    for i, image_path in enumerate(image_paths):
-        # 이미지 크기
-        try:
-            with Image.open(image_path) as img:
-                width, height = img.size
-        except:
-            width, height = 1920, 1080
-        
-        # 일직선 배치
-        R = np.eye(3, dtype=np.float32)
-        T = np.array([0, 0, -i * 0.5], dtype=np.float32)
-        
-        # 기본 FOV
-        FovX = FovY = np.pi / 3  # 60도
-        
-        cam_info = CameraInfo(
-            uid=i,
-            R=R,
-            T=T,
-            FovY=float(FovY),
-            FovX=float(FovX),
-            image_path=str(image_path),
-            image_name=image_path.name,
-            width=width,
-            height=height,
-            depth_params=None,
-            depth_path="",
-            is_test=(i % 10 == 0)
-        )
-        cam_infos.append(cam_info)
-    
-    # 기본 포인트 클라우드
-    n_points = 1000
-    points = np.random.randn(n_points, 3).astype(np.float32)
-    colors = np.random.rand(n_points, 3).astype(np.float32)
-    normals = np.random.randn(n_points, 3).astype(np.float32)
-    normals = normals / np.linalg.norm(normals, axis=1, keepdims=True)
-    
-    pcd = BasicPointCloud(points=points, colors=colors, normals=normals)
-    
-    # 분할
-    train_cams = [c for c in cam_infos if not c.is_test]
-    test_cams = [c for c in cam_infos if c.is_test]
-    
-    return SceneInfo(
-        point_cloud=pcd,
-        train_cameras=train_cams,
-        test_cameras=test_cams,
-        nerf_normalization={"translate": np.zeros(3), "radius": 3.0},
-        ply_path="",
-        is_nerf_synthetic=False
-    )
-    
-def readSuperGlueSceneInfo(path, images, eval, train_test_exp=False, llffhold=8, 
-                          superglue_config="outdoor", max_images=100):
-    """SuperGlue 기반 SceneInfo 생성 (완전 안전 버전)"""
-    
-    print("=== SuperGlue Scene Loader ===")
-    print(f"SuperGlue config: {superglue_config}")
-    print(f"Max images: {max_images}")
-    
-    # 이미지 디렉토리 확인
-    images_folder = Path(path) / (images if images else "images")
-    if not images_folder.exists():
-        images_folder = Path(path)
-    
-    print(f"Image folder: {images_folder}")
-    
-    # 이미지 수집
-    image_paths = []
-    extensions = ['*.jpg', '*.jpeg', '*.png', '*.JPG', '*.JPEG', '*.PNG']
-    for ext in extensions:
-        image_paths.extend(list(images_folder.glob(ext)))
-    
-    image_paths.sort()
-    image_paths = image_paths[:max_images]
-    
-    print(f"Found {len(image_paths)} images")
-    
-    if len(image_paths) == 0:
-        raise ValueError(f"No images found in {images_folder}")
-    
-    # SuperGlue 시도
-    try:
-        # 동적 import 시도
-        import sys
-        import os
-        
-        # 가능한 경로들 시도
-        possible_paths = [
-            Path(__file__).parent.parent / "models",
-            Path(__file__).parent.parent / "Superglue" / "models",
-            Path(__file__).parent.parent / "SuperGlue" / "models",
-        ]
-        
-        for p in possible_paths:
-            if p.exists() and (p / "matching.py").exists():
-                sys.path.insert(0, str(p.parent))
-                break
-        
-        from models.matching import Matching
-        from models.utils import frame2tensor
-        
-        print("✅ SuperGlue modules loaded successfully")
-        
-        # SuperGlue 설정
-        config = {
-            'superpoint': {
-                'nms_radius': 4,
-                'keypoint_threshold': 0.001,
-                'max_keypoints': 1024
-            },
-            'superglue': {
-                'weights': superglue_config,
-                'sinkhorn_iterations': 20,
-                'match_threshold': 0.1,
-            }
-        }
-        
-        # SuperGlue 초기화
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        matching = Matching(config).eval().to(device)
-        
-        print(f"SuperGlue initialized on {device}")
-        
-        # 간단한 SuperGlue 파이프라인
-        return _run_simple_superglue_pipeline(image_paths, matching, device, frame2tensor)
-        
-    except Exception as e:
-        print(f"❌ SuperGlue failed: {e}")
-        print("Using simple circular camera arrangement...")
-        
-        # Fallback: 간단한 원형 배치
-        return _create_simple_camera_arrangement(image_paths)
-
-
-def _run_simple_superglue_pipeline(image_paths, matching, device, frame2tensor):
-    """간소화된 SuperGlue 파이프라인"""
-    
-    print("Running SuperGlue pipeline...")
-    
-    # 최대 20장만 처리 (시간 절약)
-    process_paths = image_paths[:min(20, len(image_paths))]
-    
-    # 1. 특징점 추출
-    features = {}
-    print("Extracting features...")
-    
-    for i, image_path in enumerate(process_paths):
-        try:
-            # 이미지 로드
-            image = cv2.imread(str(image_path), cv2.IMREAD_GRAYSCALE)
-            if image is None:
-                continue
-                
-            image = cv2.resize(image, (640, 480))
-            inp = frame2tensor(image.astype(np.float32), device)
-            
-            # SuperPoint 특징점 추출
-            with torch.no_grad():
-                pred = matching.superpoint({'image': inp})
-            
-            features[i] = {
-                'keypoints': pred['keypoints'][0].cpu().numpy(),
-                'descriptors': pred['descriptors'][0].cpu().numpy(),
-                'image_path': str(image_path),
-                'image_size': (480, 640)  # H, W
-            }
-                        
-        except Exception as e:
-            print(f"  Failed to process {image_path.name}: {e}")
-            continue
-    
-    print(f"Extracted features from {len(features)} images")
-    
-    # 2. 간단한 매칭 (순차적)
-    matches = {}
-    for i in range(len(features) - 1):
-        if i not in features or (i+1) not in features:
-            continue
-            
-        try:
-            # SuperGlue 매칭
-            feat_i = features[i]
-            feat_j = features[i+1]
-            
-            data = {
-                'keypoints0': torch.from_numpy(feat_i['keypoints']).unsqueeze(0).to(device),
-                'keypoints1': torch.from_numpy(feat_j['keypoints']).unsqueeze(0).to(device),
-                'descriptors0': torch.from_numpy(feat_i['descriptors']).unsqueeze(0).to(device),
-                'descriptors1': torch.from_numpy(feat_j['descriptors']).unsqueeze(0).to(device),
-                'image0': torch.zeros(1, 1, 480, 640).to(device),
-                'image1': torch.zeros(1, 1, 480, 640).to(device),
-            }
-            
-            with torch.no_grad():
-                pred = matching.superglue(data)
-                
-                
-            
-            # 매칭 결과
-            match_indices = pred['matches0'][0].cpu().numpy()
-            confidence = pred['matching_scores0'][0].cpu().numpy()
-            
-            print(f"Image {i} keypoints: {len(data['keypoints0'])}")
-            print(f"Image {i+1} keypoints: {len(data['keypoints1'])}")
-            print(f"Raw matches: {len(match_indices)}")
-            print(f"Valid matches (>-1): {np.sum(match_indices > -1)}")
-            print(f"Confidence stats: min={confidence.min():.3f}, max={confidence.max():.3f}, mean={confidence.mean():.3f}")
-            
-            valid = match_indices > -1
-            good_matches = []
-            
-            for idx in np.where(valid)[0]:
-                match_idx = match_indices[idx]
-                conf = confidence[idx]
-                if conf > 0.3:
-                    good_matches.append((idx, match_idx, conf))
-            
-            if len(good_matches) > 10:
-                matches[(i, i+1)] = good_matches
-                
-        except Exception as e:
-            print(f"  Matching failed for pair {i}-{i+1}: {e}")
-            continue
-    
-    print(f"Found {len(matches)} good image pairs")
-    
-    # 3. 간단한 포즈 추정
-    cameras = {}
-    
-    # 첫 번째 카메라를 원점으로
-    cameras[0] = {
-        'R': np.eye(3, dtype=np.float32),
-        'T': np.zeros(3, dtype=np.float32),
-        'K': _estimate_camera_intrinsics(640, 480)
-    }
-    
-    # 순차적 포즈 추정
-    for i in range(1, len(features)):
-        if (i-1, i) in matches:
-            # Essential Matrix로 포즈 추정 시도
-            R, T = _estimate_pose_from_matches(
-                features[i-1], features[i], matches[(i-1, i)], 
-                cameras[i-1]['K'], _estimate_camera_intrinsics(640, 480)
-            )
-            
-            if R is not None:
-                cameras[i] = {
-                    'R': R,
-                    'T': T,
-                    'K': _estimate_camera_intrinsics(640, 480)
-                }
-                continue
-        
-        # 실패시 기본 배치
-        angle = i * 0.3
-        cameras[i] = {
-            'R': np.array([[np.cos(angle), 0, np.sin(angle)],
-                           [0, 1, 0],
-                           [-np.sin(angle), 0, np.cos(angle)]], dtype=np.float32),
-            'T': np.array([4*np.sin(angle), 0, 4*(1-np.cos(angle))], dtype=np.float32),
-            'K': _estimate_camera_intrinsics(640, 480)
-        }
-    
-    print(f"Estimated poses for {len(cameras)} cameras")
-    
-    # 4. CameraInfo 생성
-    cam_infos = []
-    
-    for cam_id in sorted(cameras.keys()):
-        if cam_id >= len(image_paths):
-            break
-            
-        cam = cameras[cam_id]
-        image_path = image_paths[cam_id]
-        
-        # 실제 이미지 크기 확인
-        try:
-            with Image.open(image_path) as img:
-                width, height = img.size
-        except:
-            width, height = 640, 480
-        
-        # FoV 계산
-        K = cam['K']
-        focal_x, focal_y = K[0, 0], K[1, 1]
-        FovX = 2 * np.arctan(width / (2 * focal_x))
-        FovY = 2 * np.arctan(height / (2 * focal_y))
-        
-        cam_info = CameraInfo(
-            uid=cam_id,
-            R=cam['R'],
-            T=cam['T'],
-            FovY=float(FovY),
-            FovX=float(FovX),
-            image_path=str(image_path),
-            image_name=image_path.name,
-            width=width,
-            height=height,
-            depth_params=None,
-            depth_path="",
-            is_test=(cam_id % 8 == 0)
-        )
-        cam_infos.append(cam_info)
-    
-    # 나머지 이미지들은 간단한 배치로
-    for i in range(len(cameras), len(image_paths)):
-        image_path = image_paths[i]
-        
-        try:
-            with Image.open(image_path) as img:
-                width, height = img.size
-        except:
-            width, height = 640, 480
-        
-        # 간단한 배치
-        angle = i * 0.2
-        R = np.array([[np.cos(angle), 0, np.sin(angle)],
-                      [0, 1, 0],
-                      [-np.sin(angle), 0, np.cos(angle)]], dtype=np.float32)
-        T = np.array([3*np.sin(angle), 0, 3*(1-np.cos(angle))], dtype=np.float32)
-        
-        focal = max(width, height) * 0.8
-        FovX = 2 * np.arctan(width / (2 * focal))
-        FovY = 2 * np.arctan(height / (2 * focal))
-        
-        cam_info = CameraInfo(
-            uid=i,
-            R=R,
-            T=T,
-            FovY=float(FovY),
-            FovX=float(FovX),
-            image_path=str(image_path),
-            image_name=image_path.name,
-            width=width,
-            height=height,
-            depth_params=None,
-            depth_path="",
-            is_test=(i % 8 == 0)
-        )
-        cam_infos.append(cam_info)
-    
-    # 포인트 클라우드 생성
-    n_points = 8000
-    points = np.random.randn(n_points, 3).astype(np.float32) * 1.5
-    colors = np.random.rand(n_points, 3).astype(np.float32)
-    normals = np.random.randn(n_points, 3).astype(np.float32)
-    normals = normals / np.linalg.norm(normals, axis=1, keepdims=True)
-    
-    pcd = BasicPointCloud(points=points, colors=colors, normals=normals)
-    
-    # 학습/테스트 분할
-    train_cams = [c for c in cam_infos if not c.is_test]
-    test_cams = [c for c in cam_infos if c.is_test]
-    
-    # NeRF 정규화
-    nerf_norm = _compute_scene_normalization(train_cams)
-    
-    return SceneInfo(
-        point_cloud=pcd,
-        train_cameras=train_cams,
-        test_cameras=test_cams,
-        nerf_normalization=nerf_norm,
-        ply_path="",
-        is_nerf_synthetic=False
-    )
-
-
-def _estimate_camera_intrinsics(width, height):
-    """카메라 내부 파라미터 추정"""
-    focal = max(width, height) * 0.8
-    return np.array([
-        [focal, 0, width/2],
-        [0, focal, height/2],
-        [0, 0, 1]
-    ], dtype=np.float32)
-
-
-def _estimate_pose_from_matches(feat_i, feat_j, matches, K_i, K_j):
-    """매칭에서 상대 포즈 추정"""
-    try:
-        if len(matches) < 8:
-            return None, None
-        
-        kpts_i = feat_i['keypoints']
-        kpts_j = feat_j['keypoints']
-        
-        pts_i = np.array([kpts_i[idx_i] for idx_i, _, conf in matches if conf > 0.4])
-        pts_j = np.array([kpts_j[idx_j] for _, idx_j, conf in matches if conf > 0.4])
-        
-        if len(pts_i) < 8:
-            return None, None
-        
-        # Essential Matrix 추정
-        E, mask = cv2.findEssentialMat(pts_i, pts_j, K_i, 
-                                       method=cv2.RANSAC, 
-                                       prob=0.999, threshold=1.0)
-        
-        if E is not None:
-            _, R, T, _ = cv2.recoverPose(E, pts_i, pts_j, K_i)
-            return R, T.flatten()
-            
-    except Exception as e:
-        print(f"    Pose estimation failed: {e}")
-    
-    return None, None
-
-
-def _create_simple_camera_arrangement(image_paths):
-    """완전 fallback: 간단한 원형 카메라 배치"""
-    
-    print("Creating simple circular camera arrangement...")
-    
-    cam_infos = []
-    for i, image_path in enumerate(image_paths):
-        # 이미지 크기 확인
-        try:
-            with Image.open(image_path) as img:
-                width, height = img.size
-        except:
-            width, height = 1920, 1080
-        
-        # 원형 배치
-        angle = (i / len(image_paths)) * 2 * np.pi
-        radius = 5.0
-        
-        R = np.array([
-            [np.cos(angle), 0, np.sin(angle)],
-            [0, 1, 0],
-            [-np.sin(angle), 0, np.cos(angle)]
-        ], dtype=np.float32)
-        
-        T = np.array([
-            radius * np.sin(angle),
-            0,
-            radius * (1 - np.cos(angle))
-        ], dtype=np.float32)
-        
-        # FOV 계산
-        focal = max(width, height) * 0.8
-        FovX = 2 * np.arctan(width / (2 * focal))
-        FovY = 2 * np.arctan(height / (2 * focal))
-        
-        cam_info = CameraInfo(
-            uid=i,
-            R=R,
-            T=T,
-            FovY=float(FovY),
-            FovX=float(FovX),
-            image_path=str(image_path),
-            image_name=image_path.name,
-            width=width,
-            height=height,
-            depth_params=None,
-            depth_path="",
-            is_test=(i % 8 == 0)
-        )
-        cam_infos.append(cam_info)
-    
-    # 기본 포인트 클라우드
-    n_points = 10000
-    points = np.random.randn(n_points, 3).astype(np.float32) * 2
-    colors = np.random.rand(n_points, 3).astype(np.float32)
-    normals = np.random.randn(n_points, 3).astype(np.float32)
-    normals = normals / np.linalg.norm(normals, axis=1, keepdims=True)
-    
-    pcd = BasicPointCloud(points=points, colors=colors, normals=normals)
-    
-    # 학습/테스트 분할
-    train_cams = [c for c in cam_infos if not c.is_test]
-    test_cams = [c for c in cam_infos if c.is_test]
-    
-    # NeRF 정규화
-    nerf_norm = _compute_scene_normalization(train_cams)
-    
-    return SceneInfo(
-        point_cloud=pcd,
-        train_cameras=train_cams,
-        test_cameras=test_cams,
-        nerf_normalization=nerf_norm,
-        ply_path="",
-        is_nerf_synthetic=False
-    )
-
-
-def _compute_scene_normalization(cam_infos):
-    """장면 정규화 파라미터 계산"""
-    try:
-        cam_centers = []
-        for cam in cam_infos:
-            W2C = getWorld2View2(cam.R, cam.T)
-            C2W = np.linalg.inv(W2C)
-            cam_centers.append(C2W[:3, 3:4])
-        
-        if cam_centers:
-            cam_centers = np.hstack(cam_centers)
-            center = np.mean(cam_centers, axis=1, keepdims=True).flatten()
-            distances = np.linalg.norm(cam_centers - center.reshape(-1, 1), axis=0)
-            radius = np.max(distances) * 1.1
-        else:
-            center = np.zeros(3)
-            radius = 5.0
-        
-        return {"translate": -center, "radius": radius}
-        
-    except:
-        return {"translate": np.zeros(3), "radius": 5.0}
 
 
 sceneLoadTypeCallbacks = {
@@ -1087,3 +767,27 @@ sceneLoadTypeCallbacks = {
 
 # sceneLoadTypeCallbacks에 추가
 sceneLoadTypeCallbacks["SuperGlue"] = readSuperGlueSceneInfo
+
+def test_superglue_connection():
+    """SuperGlue 연결 테스트"""
+    print("Testing SuperGlue connection...")
+    print(f"SuperGlue3DGSPipeline available: {SUPERGLUE_PIPELINE_AVAILABLE}")
+    
+    if SUPERGLUE_PIPELINE_AVAILABLE:
+        try:
+            config = {
+                'superpoint': {'nms_radius': 4, 'keypoint_threshold': 0.005, 'max_keypoints': 1024},
+                'superglue': {'weights': 'outdoor', 'sinkhorn_iterations': 20, 'match_threshold': 0.2}
+            }
+            pipeline = SuperGlue3DGSPipeline(config)
+            print("✓ SuperGlue pipeline instantiated successfully!")
+            return True
+        except Exception as e:
+            print(f"✗ SuperGlue pipeline test failed: {e}")
+            return False
+    else:
+        print("✗ SuperGlue pipeline not available")
+        return False
+
+if __name__ == "__main__":
+    test_superglue_connection()
