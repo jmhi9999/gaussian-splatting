@@ -175,6 +175,34 @@ class SimpleSuperGluePipeline:
         print("4. Creating scene info...")
         return self._create_scene_info(image_paths[:len(self.cameras)])
     
+    def visualize_matches(self, i, j, save_path=None):
+        """매칭 결과 시각화"""
+        if (i, j) not in self.matches:
+            print(f"No matches found between images {i} and {j}")
+            return
+    
+        # 이미지 로드
+        img0 = cv2.imread(self.image_features[i]['image_path'])
+        img1 = cv2.imread(self.image_features[j]['image_path'])
+    
+        # 매칭 포인트 추출
+        matches = self.matches[(i, j)]
+        kpts0 = self.image_features[i]['keypoints']
+        kpts1 = self.image_features[j]['keypoints']
+    
+        # 매칭 시각화
+        matched_img = cv2.drawMatches(
+            img0, [cv2.KeyPoint(kpts0[m[0]][0], kpts0[m[0]][1], 1) for m in matches],
+            img1, [cv2.KeyPoint(kpts1[m[1]][0], kpts1[m[1]][1], 1) for m in matches],
+            [cv2.DMatch(idx, idx, 0) for idx in range(len(matches))],
+            None, flags=cv2.DrawMatchesFlags_NOT_DRAW_SINGLE_POINTS
+        )
+    
+        if save_path:
+            cv2.imwrite(save_path, matched_img)
+    
+        return matched_img
+    
     def _extract_features(self, image_paths):
         """SuperPoint로 특징점 추출"""
         for i, image_path in enumerate(image_paths):
@@ -198,6 +226,12 @@ class SimpleSuperGluePipeline:
                 'image_path': str(image_path),
                 'image_size': image.shape[:2]
             }
+            
+            if i > 1:
+                # visualize image match
+                self.visualize_matches(i-1, i, save_path="output/match_viz/")
+        
+    
     
     def _match_sequential(self):
         """순차적 매칭"""
@@ -233,9 +267,11 @@ class SimpleSuperGluePipeline:
                 'scores1': torch.from_numpy(feat1['scores']).float().to(self.device),
                 'image0': torch.zeros(1, 1, *feat0['image_size']).to(self.device),
                 'image1': torch.zeros(1, 1, *feat1['image_size']).to(self.device),
-        })
+            })
+            
+            self.visualize_matches(i, j, save_path="output/match_viz/")
         
-        # 매칭 결과 처리
+            # 매칭 결과 처리
             matches = pred['matches0'][0].cpu().numpy()
             confidence = pred['matching_scores0'][0].cpu().numpy()
         
@@ -703,7 +739,7 @@ def _run_simple_superglue_pipeline(image_paths, matching, device, frame2tensor):
                 'image_path': str(image_path),
                 'image_size': (480, 640)  # H, W
             }
-            
+                        
         except Exception as e:
             print(f"  Failed to process {image_path.name}: {e}")
             continue
@@ -732,10 +768,18 @@ def _run_simple_superglue_pipeline(image_paths, matching, device, frame2tensor):
             
             with torch.no_grad():
                 pred = matching.superglue(data)
+                
+                
             
             # 매칭 결과
             match_indices = pred['matches0'][0].cpu().numpy()
             confidence = pred['matching_scores0'][0].cpu().numpy()
+            
+            print(f"Image {i} keypoints: {len(data['keypoints0'])}")
+            print(f"Image {i+1} keypoints: {len(data['keypoints1'])}")
+            print(f"Raw matches: {len(match_indices)}")
+            print(f"Valid matches (>-1): {np.sum(match_indices > -1)}")
+            print(f"Confidence stats: min={confidence.min():.3f}, max={confidence.max():.3f}, mean={confidence.mean():.3f}")
             
             valid = match_indices > -1
             good_matches = []
