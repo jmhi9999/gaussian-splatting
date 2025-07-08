@@ -138,6 +138,22 @@ class SimpleSuperGluePipeline:
         image_paths.sort()
         return image_paths[:max_images]
     
+    def debug_superpoint_output(self, image_path):
+        image = self._load_image(image_path)
+        inp = frame2tensor(image, self.device)
+    
+        with torch.no_grad():
+            pred = self.matching.superpoint({'image': inp})
+    
+        print(f"SuperPoint output keys: {pred.keys()}")
+        for key, value in pred.items():
+            if isinstance(value, torch.Tensor):
+                print(f"  {key}: shape={value.shape}, dtype={value.dtype}")
+            else:
+                print(f"  {key}: {type(value)}")
+    
+        return pred
+    
     def _superglue_pipeline(self, image_paths):
         """SuperGlue 기반 SfM 파이프라인"""
         
@@ -163,6 +179,8 @@ class SimpleSuperGluePipeline:
         """SuperPoint로 특징점 추출"""
         for i, image_path in enumerate(image_paths):
             print(f"  {i+1}/{len(image_paths)}: {image_path.name}")
+            
+            self.debug_superpoint_output(image_path)
             
             image = self._load_image(image_path)
             if image is None:
@@ -196,39 +214,46 @@ class SimpleSuperGluePipeline:
         return matches
     
     def _match_pair(self, i, j):
-        """SuperGlue로 두 이미지 매칭"""
-        feat_i = self.image_features[i]
-        feat_j = self.image_features[j]
+        """더 안전한 매칭 함수"""
+        try:
+            feat0 = self.image_features[i]
+            feat1 = self.image_features[j]
         
-        # SuperGlue 데이터 준비
-        data = {
-            'keypoints0': torch.from_numpy(feat_i['keypoints']).unsqueeze(0).to(self.device),
-            'keypoints1': torch.from_numpy(feat_j['keypoints']).unsqueeze(0).to(self.device),
-            'descriptors0': torch.from_numpy(feat_i['descriptors']).unsqueeze(0).to(self.device),
-            'descriptors1': torch.from_numpy(feat_j['descriptors']).unsqueeze(0).to(self.device),
-            'scores0': torch.from_numpy(feat_i['scores']).unsqueeze(0).to(self.device),
-            'scores1': torch.from_numpy(feat_j['scores']).unsqueeze(0).to(self.device),
-            'image0': torch.zeros(1, 1, feat_i['image_size'][0], feat_i['image_size'][1]).to(self.device),
-            'image1': torch.zeros(1, 1, feat_j['image_size'][0], feat_j['image_size'][1]).to(self.device),
-        }
+            # 입력 데이터 확인
+            if 'keypoints' not in feat0 or 'keypoints' not in feat1:
+                return []
         
-        with torch.no_grad():
-            pred = self.matching.superglue(data)
+            # 매칭 수행
+            pred = self.matching({
+                'keypoints0': torch.from_numpy(feat0['keypoints']).float().to(self.device),
+                'keypoints1': torch.from_numpy(feat1['keypoints']).float().to(self.device),
+                'descriptors0': torch.from_numpy(feat0['descriptors']).float().to(self.device),
+                'descriptors1': torch.from_numpy(feat1['descriptors']).float().to(self.device),
+                'scores0': torch.from_numpy(feat0['scores']).float().to(self.device),
+                'scores1': torch.from_numpy(feat1['scores']).float().to(self.device),
+                'image0': torch.zeros(1, 1, *feat0['image_size']).to(self.device),
+                'image1': torch.zeros(1, 1, *feat1['image_size']).to(self.device),
+        })
         
-        # 매칭 결과 추출
-        matches = pred['matches0'][0].cpu().numpy()
-        confidence = pred['matching_scores0'][0].cpu().numpy()
+        # 매칭 결과 처리
+            matches = pred['matches0'][0].cpu().numpy()
+            confidence = pred['matching_scores0'][0].cpu().numpy()
         
-        valid = matches > -1
-        matches_list = []
+            # 유효한 매칭만 선택
+            valid = matches > -1
+            matches = matches[valid]
+            confidence = confidence[valid]
         
-        for idx in np.where(valid)[0]:
-            match_idx = matches[idx]
-            conf = confidence[idx]
-            if conf > 0.3:
-                matches_list.append((idx, match_idx, conf))
+            # 신뢰도 기준 필터링
+            conf_mask = confidence > 0.2
+            matches = matches[conf_mask]
+            confidence = confidence[conf_mask]
         
-        return matches_list
+            return matches
+        
+        except Exception as e:
+            print(f"  Matching failed for pair {i}-{j}: {e}")
+            return []
     
     def _estimate_poses_simple(self, matches):
         """간단한 포즈 추정"""
@@ -619,13 +644,13 @@ def readSuperGlueSceneInfo(path, images, eval, train_test_exp=False, llffhold=8,
         config = {
             'superpoint': {
                 'nms_radius': 4,
-                'keypoint_threshold': 0.005,
+                'keypoint_threshold': 0.001,
                 'max_keypoints': 1024
             },
             'superglue': {
                 'weights': superglue_config,
                 'sinkhorn_iterations': 20,
-                'match_threshold': 0.2,
+                'match_threshold': 0.1,
             }
         }
         
