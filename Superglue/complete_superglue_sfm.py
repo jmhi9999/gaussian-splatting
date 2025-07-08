@@ -1,5 +1,3 @@
-# complete_superglue_sfm.py
-# SuperGlue 기반 완전한 SfM 파이프라인 구현
 
 import numpy as np
 import cv2
@@ -11,8 +9,8 @@ from scipy.sparse import lil_matrix
 import matplotlib.pyplot as plt
 from collections import defaultdict
 
-from models.matching import Matching
-from models.utils import frame2tensor
+from matching import Matching
+from utils import frame2tensor
 from scene.dataset_readers import CameraInfo, SceneInfo
 from utils.graphics_utils import BasicPointCloud
 
