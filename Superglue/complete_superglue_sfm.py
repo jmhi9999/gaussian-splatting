@@ -154,41 +154,47 @@ class SuperGlue3DGSPipeline:
         
         print(f"  Created {len(self.matches)} image pairs with good matches")
     
-    def _match_pair_superglue(self, i, j):
-        """SuperGlue로 두 이미지 매칭"""
-        feat_i = self.image_features[i]
-        feat_j = self.image_features[j]
+    def _match_pair_superglue(self, idx0, idx1):
+        """더 안전한 매칭 함수"""
+        try:
+            feat0 = self.image_features[idx0]
+            feat1 = self.image_features[idx1]
         
-        # SuperGlue 입력 데이터 준비
-        data = {
-            'keypoints0': torch.from_numpy(feat_i['keypoints']).unsqueeze(0).to(self.device),
-            'keypoints1': torch.from_numpy(feat_j['keypoints']).unsqueeze(0).to(self.device),
-            'descriptors0': torch.from_numpy(feat_i['descriptors']).unsqueeze(0).to(self.device),
-            'descriptors1': torch.from_numpy(feat_j['descriptors']).unsqueeze(0).to(self.device),
-            'scores0': torch.from_numpy(feat_i['scores']).unsqueeze(0).to(self.device),
-            'scores1': torch.from_numpy(feat_j['scores']).unsqueeze(0).to(self.device),
-            'image0': torch.zeros(1, 1, feat_i['image_size'][0], feat_i['image_size'][1]).to(self.device),
-            'image1': torch.zeros(1, 1, feat_j['image_size'][0], feat_j['image_size'][1]).to(self.device),
-        }
+            # 입력 데이터 확인
+            if 'keypoints' not in feat0 or 'keypoints' not in feat1:
+                return []
         
-        with torch.no_grad():
-            pred = self.matching.superglue(data)
+            # 매칭 수행
+            pred = self.matching({
+                'keypoints0': torch.from_numpy(feat0['keypoints']).float().to(self.device),
+                'keypoints1': torch.from_numpy(feat1['keypoints']).float().to(self.device),
+                'descriptors0': torch.from_numpy(feat0['descriptors']).float().to(self.device),
+                'descriptors1': torch.from_numpy(feat1['descriptors']).float().to(self.device),
+                'scores0': torch.from_numpy(feat0['scores']).float().to(self.device),
+                'scores1': torch.from_numpy(feat1['scores']).float().to(self.device),
+                'image0': torch.zeros(1, 1, *feat0['image_size']).to(self.device),
+                'image1': torch.zeros(1, 1, *feat1['image_size']).to(self.device),
+            })
         
-        # 매칭 결과 추출
-        matches = pred['matches0'][0].cpu().numpy()
-        confidence = pred['matching_scores0'][0].cpu().numpy()
+            # 매칭 결과 처리
+            matches = pred['matches0'][0].cpu().numpy()
+            confidence = pred['matching_scores0'][0].cpu().numpy()
         
-        # 유효한 매칭만 선별
-        valid = matches > -1
-        matches_list = []
+            # 유효한 매칭만 선택
+            valid = matches > -1
+            matches = matches[valid]
+            confidence = confidence[valid]
         
-        for idx in np.where(valid)[0]:
-            match_idx = matches[idx]
-            conf = confidence[idx]
-            if conf > 0.3:  # 신뢰도 임계값
-                matches_list.append((idx, match_idx, conf))
+            # 신뢰도 기준 필터링
+            conf_mask = confidence > 0.2
+            matches = matches[conf_mask]
+            confidence = confidence[conf_mask]
         
-        return matches_list
+            return matches
+        
+        except Exception as e:
+            print(f"  Matching failed for pair {idx0}-{idx1}: {e}")
+            return []
     
     def _estimate_camera_poses(self):
         """순차적 카메라 포즈 추정"""
