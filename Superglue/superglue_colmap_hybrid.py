@@ -198,7 +198,7 @@ class SuperGlueCOLMAPHybrid:
         return cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
     
     def _initialize_colmap_database(self, database_path):
-        """COLMAP 데이터베이스 초기화 - 수정된 버전"""
+        """COLMAP 데이터베이스 초기화 - COLMAP 3.7 호환"""
         # 기존 데이터베이스 삭제
         if database_path.exists():
             database_path.unlink()
@@ -208,11 +208,13 @@ class SuperGlueCOLMAPHybrid:
         
         # 외래키 제약 조건 비활성화 (COLMAP 호환성)
         cursor.execute("PRAGMA foreign_keys = OFF")
+        cursor.execute("PRAGMA journal_mode = WAL")
+        cursor.execute("PRAGMA synchronous = NORMAL")
         
         try:
-            # 카메라 테이블
+            # 카메라 테이블 (COLMAP 3.7 스키마)
             cursor.execute('''
-                CREATE TABLE IF NOT EXISTS cameras (
+                CREATE TABLE cameras (
                     camera_id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
                     model INTEGER NOT NULL,
                     width INTEGER NOT NULL,
@@ -221,9 +223,9 @@ class SuperGlueCOLMAPHybrid:
                 )
             ''')
             
-            # 이미지 테이블
+            # 이미지 테이블 (COLMAP 3.7 스키마)
             cursor.execute('''
-                CREATE TABLE IF NOT EXISTS images (
+                CREATE TABLE images (
                     image_id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
                     name TEXT NOT NULL UNIQUE,
                     camera_id INTEGER NOT NULL,
@@ -237,9 +239,9 @@ class SuperGlueCOLMAPHybrid:
                 )
             ''')
             
-            # 키포인트 테이블
+            # 키포인트 테이블 (COLMAP 3.7 스키마)
             cursor.execute('''
-                CREATE TABLE IF NOT EXISTS keypoints (
+                CREATE TABLE keypoints (
                     image_id INTEGER PRIMARY KEY NOT NULL,
                     rows INTEGER NOT NULL,
                     cols INTEGER NOT NULL,
@@ -247,9 +249,9 @@ class SuperGlueCOLMAPHybrid:
                 )
             ''')
             
-            # 디스크립터 테이블
+            # 디스크립터 테이블 (COLMAP 3.7 스키마)
             cursor.execute('''
-                CREATE TABLE IF NOT EXISTS descriptors (
+                CREATE TABLE descriptors (
                     image_id INTEGER PRIMARY KEY NOT NULL,
                     rows INTEGER NOT NULL,
                     cols INTEGER NOT NULL,
@@ -257,9 +259,9 @@ class SuperGlueCOLMAPHybrid:
                 )
             ''')
             
-            # 매칭 테이블
+            # 매칭 테이블 (COLMAP 3.7 스키마)
             cursor.execute('''
-                CREATE TABLE IF NOT EXISTS matches (
+                CREATE TABLE matches (
                     pair_id INTEGER PRIMARY KEY NOT NULL,
                     rows INTEGER NOT NULL,
                     cols INTEGER NOT NULL,
@@ -268,10 +270,10 @@ class SuperGlueCOLMAPHybrid:
             ''')
             
             # 인덱스 생성
-            cursor.execute('CREATE UNIQUE INDEX IF NOT EXISTS index_name ON images(name)')
+            cursor.execute('CREATE UNIQUE INDEX index_name ON images(name)')
             
             conn.commit()
-            print("  ✓ COLMAP 데이터베이스 초기화 완료")
+            print("  ✓ COLMAP 3.7 데이터베이스 초기화 완료")
             
         except Exception as e:
             print(f"  ✗ 데이터베이스 초기화 실패: {e}")
@@ -495,13 +497,13 @@ class SuperGlueCOLMAPHybrid:
             
             # 카메라 테이블에 5개 값 INSERT (COLMAP 3.7 호환)
             cursor.execute(
-                "INSERT OR REPLACE INTO cameras VALUES (?, ?, ?, ?, ?)",
+                "INSERT INTO cameras VALUES (?, ?, ?, ?, ?)",
                 (image_id, 0, w, h, camera_params.tobytes())
             )
             
             # 이미지 정보 추가 - prior 값들을 NULL로 설정
             cursor.execute(
-                "INSERT OR REPLACE INTO images VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO images VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (image_id, f"image_{image_id:04d}.jpg", image_id, None, None, None, None, None, None, None)
             )
             
@@ -512,7 +514,7 @@ class SuperGlueCOLMAPHybrid:
                 kpts = np.array([[w/2, h/2]], dtype=np.float32)
             
             cursor.execute(
-                "INSERT OR REPLACE INTO keypoints VALUES (?, ?, ?, ?)",
+                "INSERT INTO keypoints VALUES (?, ?, ?, ?)",
                 (image_id, len(kpts), 2, kpts.tobytes())
             )
             
@@ -528,7 +530,7 @@ class SuperGlueCOLMAPHybrid:
                     desc = np.vstack([desc, padding])
             
             cursor.execute(
-                "INSERT OR REPLACE INTO descriptors VALUES (?, ?, ?, ?)",
+                "INSERT INTO descriptors VALUES (?, ?, ?, ?)",
                 (image_id, len(desc), 256, desc.tobytes())
             )
             
@@ -671,7 +673,7 @@ class SuperGlueCOLMAPHybrid:
                 return
             
             cursor.execute(
-                "INSERT OR REPLACE INTO matches VALUES (?, ?, ?, ?)",
+                "INSERT INTO matches VALUES (?, ?, ?, ?)",
                 (pair_id, len(matches_data), 2, matches_data.tobytes())
             )
             
@@ -723,13 +725,29 @@ class SuperGlueCOLMAPHybrid:
                         "--Mapper.init_min_num_inliers", "15",
                         "--Mapper.abs_pose_min_num_inliers", "8",
                     ]
-                    print("  COLMAP 3.7 호환 옵션 사용 (filter_max_reproj_error 제외)")
+                    print("  COLMAP 3.7 호환 옵션 사용")
                 else:
                     print("  경고: 알 수 없는 COLMAP 버전, 기본 옵션만 사용")
             else:
                 print("  경고: COLMAP 버전 확인 실패, 기본 옵션만 사용")
         except Exception as e:
             print(f"  경고: COLMAP 버전 확인 실패: {e}, 기본 옵션만 사용")
+            
+        # 버전 확인이 실패해도 기본 COLMAP 3.7 호환 옵션 사용
+        if "3.7" not in locals().get('version_output', ''):
+            cmd = [
+                self.colmap_exe, "mapper",
+                "--database_path", str(database_path),
+                "--image_path", str(image_path),
+                "--output_path", str(output_path),
+                "--Mapper.ba_global_function_tolerance", "0.000001",
+                "--Mapper.ba_global_max_num_iterations", "100",
+                "--Mapper.ba_local_max_num_iterations", "50",
+                "--Mapper.min_num_matches", "8",
+                "--Mapper.init_min_num_inliers", "15",
+                "--Mapper.abs_pose_min_num_inliers", "8",
+            ]
+            print("  기본 COLMAP 3.7 호환 옵션 사용")
         
         print(f"  COLMAP Mapper 실행...")
         print(f"  명령: {' '.join(cmd)}")
@@ -812,7 +830,7 @@ class SuperGlueCOLMAPHybrid:
                 ], dtype=np.uint32)
                 
                 cursor.execute(
-                    "INSERT OR REPLACE INTO matches VALUES (?, ?, ?, ?)",
+                    "INSERT INTO matches VALUES (?, ?, ?, ?)",
                     (pair_id, len(matches_data), 2, matches_data.tobytes())
                 )
                 matches_created += 1
