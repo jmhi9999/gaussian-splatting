@@ -206,6 +206,9 @@ class SuperGlueCOLMAPHybrid:
         conn = sqlite3.connect(str(database_path))
         cursor = conn.cursor()
         
+        # 외래키 제약 조건 비활성화 (COLMAP 호환성)
+        cursor.execute("PRAGMA foreign_keys = OFF")
+        
         try:
             # 카메라 테이블
             cursor.execute('''
@@ -381,13 +384,33 @@ class SuperGlueCOLMAPHybrid:
                 else:
                     cam_infos.append(cam_info)
             
+            # 카메라 중심점 계산
+            all_cameras = cam_infos + test_cam_infos
+            if all_cameras:
+                camera_centers = np.array([cam.T for cam in all_cameras])
+                center = np.mean(camera_centers, axis=0)
+                radius = np.max(np.linalg.norm(camera_centers - center, axis=1)) * 1.1
+            else:
+                center = np.array([0.0, 0.0, 0.0])
+                radius = 6.0
+            
             nerf_normalization = {
-                "translate": np.array([0.0, 0.0, 0.0]),
-                "radius": 6.0
+                "translate": center,
+                "radius": radius
             }
             
+            # 기본 포인트 클라우드 생성
+            from utils.graphics_utils import BasicPointCloud
+            n_points = 5000
+            points = np.random.randn(n_points, 3).astype(np.float32) * 2.0
+            colors = np.random.rand(n_points, 3).astype(np.float32)
+            normals = np.random.randn(n_points, 3).astype(np.float32)
+            normals = normals / np.linalg.norm(normals, axis=1, keepdims=True)
+            
+            point_cloud = BasicPointCloud(points=points, colors=colors, normals=normals)
+            
             scene_info = SceneInfo(
-                point_cloud=None,
+                point_cloud=point_cloud,
                 train_cameras=cam_infos,
                 test_cameras=test_cam_infos,
                 nerf_normalization=nerf_normalization,
@@ -456,10 +479,10 @@ class SuperGlueCOLMAPHybrid:
                 (image_id, 0, w, h, camera_params.tobytes())
             )
             
-            # 이미지 정보 추가 (10개 값)
+            # 이미지 정보 추가 (10개 값) - prior 값들을 NULL로 설정
             cursor.execute(
                 "INSERT OR REPLACE INTO images VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (image_id, f"image_{image_id:04d}.jpg", image_id, 1, 0, 0, 0, 0, 0, 0)
+                (image_id, f"image_{image_id:04d}.jpg", image_id, None, None, None, None, None, None, None)
             )
             
             # 키포인트 추가
@@ -802,21 +825,39 @@ class SuperGlueCOLMAPHybrid:
                 else:
                     cam_infos.append(cam_info)
             
+            # 카메라 중심점 계산
+            all_cameras = cam_infos + test_cam_infos
+            if all_cameras:
+                camera_centers = np.array([cam.T for cam in all_cameras])
+                center = np.mean(camera_centers, axis=0)
+                radius = np.max(np.linalg.norm(camera_centers - center, axis=1)) * 1.1
+            else:
+                center = np.array([0.0, 0.0, 0.0])
+                radius = 6.0
+            
             # NeRF 정규화 정보
             nerf_normalization = {
-                "translate": np.array([0.0, 0.0, 0.0]),
-                "radius": 6.0
+                "translate": center,
+                "radius": radius
             }
             
-            # 포인트 클라우드 (빈 것으로 시작)
-            ply_path = None
+            # 기본 포인트 클라우드 생성
+            from utils.graphics_utils import BasicPointCloud
+            n_points = 5000
+            points = np.random.randn(n_points, 3).astype(np.float32) * 2.0
+            colors = np.random.rand(n_points, 3).astype(np.float32)
+            normals = np.random.randn(n_points, 3).astype(np.float32)
+            normals = normals / np.linalg.norm(normals, axis=1, keepdims=True)
+            
+            point_cloud = BasicPointCloud(points=points, colors=colors, normals=normals)
             
             scene_info = SceneInfo(
-                point_cloud=None,
+                point_cloud=point_cloud,
                 train_cameras=cam_infos,
                 test_cameras=test_cam_infos,
                 nerf_normalization=nerf_normalization,
-                ply_path=ply_path
+                ply_path="",
+                is_nerf_synthetic=False
             )
             
             return scene_info
