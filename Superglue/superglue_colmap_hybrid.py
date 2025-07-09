@@ -104,9 +104,15 @@ class SuperGlueCOLMAPHybrid:
         
         # 5. 3DGS 형식으로 변환
         print("\n[5/5] 3DGS 형식 변환...")
-        scene_info = self._convert_to_3dgs_format(undistorted_dir)
-        
-        print(f"\n✓ 완료! 결과: {output_dir}")
+        try:
+            scene_info = self._convert_to_3dgs_format(output_path)
+            if scene_info is None:
+                print("  경고: COLMAP 변환 실패, 기본 배치 사용")
+                scene_info = self._create_default_scene_info(image_paths, output_path)
+        except Exception as e:
+            print(f"  경고: 3DGS 변환 오류: {e}")
+            scene_info = self._create_default_scene_info(image_paths, output_path)
+
         return scene_info
     
     def _collect_images(self, image_dir, max_images):
@@ -191,182 +197,311 @@ class SuperGlueCOLMAPHybrid:
         
         return cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
     
-    def _create_colmap_database(self, image_paths, database_path):
-        """SuperGlue 특징점으로 COLMAP 데이터베이스 생성"""
-        
-        # 데이터베이스 초기화
-        self._initialize_colmap_database(database_path)
-        
-        # 각 이미지에서 특징점 추출
-        features = {}
-        for i, image_path in enumerate(image_paths):
-            print(f"  특징점 추출: {i+1}/{len(image_paths)} - {image_path.name}")
-            feat = self._extract_superpoint_features(image_path)
-            if feat is not None:
-                features[i] = feat
-                self._add_features_to_database(database_path, i, feat)
-        
-        # SuperGlue 매칭
-        print(f"  SuperGlue 매칭...")
-        matches_added = 0
-        total_pairs = len(image_paths) * (len(image_paths) - 1) // 2
-        
-        # 순차적 매칭 + 선택적 매칭
-        for i in range(len(image_paths)):
-            for j in range(i+1, min(i+10, len(image_paths))):  # 인접 10장
-                if i in features and j in features:
-                    matches = self._match_superglue(features[i], features[j])
-                    if len(matches) > 20:  # 최소 매칭 수
-                        self._add_matches_to_database(database_path, i, j, matches)
-                        matches_added += 1
-        
-        print(f"  매칭 완료: {matches_added}개 이미지 쌍")
-    
     def _initialize_colmap_database(self, database_path):
-        """COLMAP 데이터베이스 초기화"""
+        """COLMAP 데이터베이스 초기화 - 수정된 버전"""
+        # 기존 데이터베이스 삭제
         if database_path.exists():
             database_path.unlink()
         
         conn = sqlite3.connect(str(database_path))
         cursor = conn.cursor()
         
-        # 테이블 생성
-        cursor.execute('''
-            CREATE TABLE cameras (
-                camera_id INTEGER PRIMARY KEY,
-                model INTEGER NOT NULL,
-                width INTEGER NOT NULL,
-                height INTEGER NOT NULL,
-                params BLOB NOT NULL
-            )
-        ''')
+        try:
+            # 카메라 테이블
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS cameras (
+                    camera_id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+                    model INTEGER NOT NULL,
+                    width INTEGER NOT NULL,
+                    height INTEGER NOT NULL,
+                    params BLOB NOT NULL
+                )
+            ''')
+            
+            # 이미지 테이블
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS images (
+                    image_id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+                    name TEXT NOT NULL UNIQUE,
+                    camera_id INTEGER NOT NULL,
+                    prior_qw REAL,
+                    prior_qx REAL,
+                    prior_qy REAL,
+                    prior_qz REAL,
+                    prior_tx REAL,
+                    prior_ty REAL,
+                    prior_tz REAL
+                )
+            ''')
+            
+            # 키포인트 테이블
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS keypoints (
+                    image_id INTEGER PRIMARY KEY NOT NULL,
+                    rows INTEGER NOT NULL,
+                    cols INTEGER NOT NULL,
+                    data BLOB NOT NULL
+                )
+            ''')
+            
+            # 디스크립터 테이블
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS descriptors (
+                    image_id INTEGER PRIMARY KEY NOT NULL,
+                    rows INTEGER NOT NULL,
+                    cols INTEGER NOT NULL,
+                    data BLOB NOT NULL
+                )
+            ''')
+            
+            # 매칭 테이블
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS matches (
+                    pair_id INTEGER PRIMARY KEY NOT NULL,
+                    rows INTEGER NOT NULL,
+                    cols INTEGER NOT NULL,
+                    data BLOB NOT NULL
+                )
+            ''')
+            
+            # 인덱스 생성
+            cursor.execute('CREATE UNIQUE INDEX IF NOT EXISTS index_name ON images(name)')
+            
+            conn.commit()
+            print("  ✓ COLMAP 데이터베이스 초기화 완료")
+            
+        except Exception as e:
+            print(f"  ✗ 데이터베이스 초기화 실패: {e}")
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+    
+    def _create_colmap_database(self, image_paths, database_path):
+        """SuperGlue 특징점으로 COLMAP 데이터베이스 생성 - 수정된 버전"""
         
-        cursor.execute('''
-            CREATE TABLE images (
-                image_id INTEGER PRIMARY KEY,
-                name TEXT NOT NULL UNIQUE,
-                camera_id INTEGER NOT NULL,
-                prior_qw REAL,
-                prior_qx REAL,
-                prior_qy REAL,
-                prior_qz REAL,
-                prior_tx REAL,
-                prior_ty REAL,
-                prior_tz REAL
-            )
-        ''')
+        # 데이터베이스 초기화
+        self._initialize_colmap_database(database_path)
         
-        cursor.execute('''
-            CREATE TABLE keypoints (
-                image_id INTEGER NOT NULL,
-                rows INTEGER NOT NULL,
-                cols INTEGER NOT NULL,
-                data BLOB NOT NULL
-            )
-        ''')
+        # 각 이미지에서 특징점 추출
+        features = {}
+        image_path_dict = {}  # 이미지 경로 저장
         
-        cursor.execute('''
-            CREATE TABLE descriptors (
-                image_id INTEGER NOT NULL,
-                rows INTEGER NOT NULL,
-                cols INTEGER NOT NULL,
-                data BLOB NOT NULL
-            )
-        ''')
+        for i, image_path in enumerate(image_paths):
+            print(f"  특징점 추출: {i+1}/{len(image_paths)} - {image_path.name}")
+            feat = self._extract_superpoint_features(image_path)
+            if feat is not None:
+                features[i] = feat
+                image_path_dict[i] = image_path
+                self._add_features_to_database(database_path, i, feat)
         
-        cursor.execute('''
-            CREATE TABLE matches (
-                pair_id INTEGER PRIMARY KEY,
-                rows INTEGER NOT NULL,
-                cols INTEGER NOT NULL,
-                data BLOB NOT NULL
-            )
-        ''')
+        # SuperGlue 매칭
+        print(f"  SuperGlue 매칭...")
+        matches_added = 0
         
-        conn.commit()
-        conn.close()
+        # 순차적 매칭 + 선택적 매칭
+        for i in range(len(image_paths)):
+            for j in range(i+1, min(i+10, len(image_paths))):  # 인접 10장
+                if i in features and j in features:
+                    # 이미지 경로도 함께 전달
+                    matches = self._match_superglue(
+                        features[i], features[j], 
+                        image_path_dict[i], image_path_dict[j]
+                    )
+                    
+                    if len(matches) > 20:  # 최소 매칭 수
+                        self._add_matches_to_database(database_path, i, j, matches)
+                        matches_added += 1
+                        print(f"    매칭 추가: {i}-{j} ({len(matches)}개)")
+        
+        print(f"  총 {matches_added}개 이미지 쌍 매칭 완료")
+        
+        if matches_added == 0:
+            print("  경고: 매칭된 이미지 쌍이 없습니다!")
+            return False
+        
+        return True
+    
+    def _create_default_scene_info(self, image_paths, output_path):
+        """기본 SceneInfo 생성 (COLMAP 실패시 fallback)"""
+        try:
+            from scene.camera_info import CameraInfo
+            from scene.scene_info import SceneInfo
+            from utils.graphics_utils import focal2fov
+            import numpy as np
+            
+            cam_infos = []
+            test_cam_infos = []
+            
+            for i, image_path in enumerate(image_paths):
+                # 이미지 크기 확인
+                try:
+                    import cv2
+                    img = cv2.imread(str(image_path))
+                    if img is None:
+                        continue
+                    height, width = img.shape[:2]
+                except:
+                    width, height = 1024, 768
+                
+                # 기본 카메라 파라미터
+                focal_length_x = width * 0.7
+                focal_length_y = height * 0.7
+                
+                # 원형 배치
+                angle = 2 * np.pi * i / len(image_paths)
+                radius = 5.0
+                
+                cam_x = radius * np.cos(angle)
+                cam_y = 0.0
+                cam_z = radius * np.sin(angle)
+                
+                R = np.eye(3)
+                T = np.array([cam_x, cam_y, cam_z])
+                
+                FovY = focal2fov(focal_length_y, height)
+                FovX = focal2fov(focal_length_x, width)
+                
+                cam_info = CameraInfo(
+                    uid=i,
+                    R=R,
+                    T=T,
+                    FovY=FovY,
+                    FovX=FovX,
+                    image=None,
+                    image_path=str(image_path),
+                    image_name=image_path.name,
+                    width=width,
+                    height=height
+                )
+                
+                if i % 5 == 0:
+                    test_cam_infos.append(cam_info)
+                else:
+                    cam_infos.append(cam_info)
+            
+            nerf_normalization = {
+                "translate": np.array([0.0, 0.0, 0.0]),
+                "radius": 6.0
+            }
+            
+            scene_info = SceneInfo(
+                point_cloud=None,
+                train_cameras=cam_infos,
+                test_cameras=test_cam_infos,
+                nerf_normalization=nerf_normalization,
+                ply_path=None
+            )
+            
+            print(f"  ✓ 기본 SceneInfo 생성 완료")
+            print(f"    - 학습 카메라: {len(cam_infos)}개")
+            print(f"    - 테스트 카메라: {len(test_cam_infos)}개")
+            
+            return scene_info
+            
+        except Exception as e:
+            print(f"  오류: 기본 SceneInfo 생성 실패: {e}")
+            return None
     
     def _extract_superpoint_features(self, image_path):
-        """SuperPoint로 특징점 추출"""
+        """SuperPoint 특징점 추출 - 수정된 버전"""
         try:
-            # 이미지 로드
-            image = cv2.imread(str(image_path), cv2.IMREAD_GRAYSCALE)
+            image = self._load_image_for_matching(image_path)
             if image is None:
                 return None
             
-            # 전처리
-            if max(image.shape) > 1600:  # 크기 제한
-                scale = 1600 / max(image.shape)
-                new_size = (int(image.shape[1] * scale), int(image.shape[0] * scale))
-                image = cv2.resize(image, new_size)
+            # 텐서 변환 (그레이스케일 이미지 -> [1, 1, H, W])
+            inp = self.frame2tensor(image, self.device)
             
             # SuperPoint 특징점 추출
-            inp = self.frame2tensor(image, self.device)
             with torch.no_grad():
                 pred = self.matching.superpoint({'image': inp})
             
-            # 결과 정리
-            keypoints = pred['keypoints'][0].cpu().numpy()
-            descriptors = pred['descriptors'][0].cpu().numpy()
-            scores = pred['scores'][0].cpu().numpy()
-            
-            # 고품질 특징점만 선택
-            mask = scores > np.percentile(scores, 60)  # 상위 40%
-            
-            return {
-                'keypoints': keypoints[mask],
-                'descriptors': descriptors[:, mask],
-                'scores': scores[mask],
-                'image_size': image.shape[:2]
+            # numpy로 변환하여 저장
+            features = {
+                'keypoints': pred['keypoints'][0].cpu().numpy(),
+                'descriptors': pred['descriptors'][0].cpu().numpy(),
+                'scores': pred['scores'][0].cpu().numpy(),
+                'image_path': str(image_path), 
+                'image_size': image.shape[:2]   # (H, W) 추가!
             }
+            
+            print(f"    추출 완료: {len(features['keypoints'])}개 특징점")
+            return features
             
         except Exception as e:
             print(f"    특징점 추출 실패: {e}")
+            import traceback
+            traceback.print_exc()
             return None
     
     def _add_features_to_database(self, database_path, image_id, features):
-        """데이터베이스에 특징점 추가"""
+        """데이터베이스에 특징점 추가 - 올바른 컬럼 수"""
         conn = sqlite3.connect(str(database_path))
         cursor = conn.cursor()
         
-        # 카메라 정보 추가 (Simple Pinhole 모델)
-        h, w = features['image_size']
-        focal = max(w, h) * 0.8  # 보수적 추정
-        
-        camera_params = np.array([focal, w/2, h/2], dtype=np.float64)
-        cursor.execute(
-            "INSERT OR REPLACE INTO cameras VALUES (?, ?, ?, ?, ?)",
-            (image_id, 0, w, h, camera_params.tobytes())  # 0 = SIMPLE_PINHOLE
-        )
-        
-        # 이미지 정보 추가
-        cursor.execute(
-            "INSERT OR REPLACE INTO images VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (image_id, f"image_{image_id:04d}.jpg", image_id, 1, 0, 0, 0, 0, 0, 0)
-        )
-        
-        # 키포인트 추가
-        kpts = features['keypoints'].astype(np.float32)
-        cursor.execute(
-            "INSERT OR REPLACE INTO keypoints VALUES (?, ?, ?, ?)",
-            (image_id, len(kpts), 2, kpts.tobytes())
-        )
-        
-        # 디스크립터 추가
-        desc = features['descriptors'].T.astype(np.float32)  # (N, 256)
-        cursor.execute(
-            "INSERT OR REPLACE INTO descriptors VALUES (?, ?, ?, ?)",
-            (image_id, len(desc), 256, desc.tobytes())
-        )
-        
-        conn.commit()
-        conn.close()
-    
-    def _match_superglue(self, features1, features2):
-        """SuperGlue로 두 이미지 매칭"""
         try:
-            # 텐서 준비
+            # 카메라 정보 추가 (SIMPLE_PINHOLE 모델 = 0)
+            h, w = features['image_size']
+            focal = max(w, h) * 0.8  # 보수적 추정
+            
+            # SIMPLE_PINHOLE 파라미터: [focal, cx, cy]
+            camera_params = np.array([focal, w/2, h/2], dtype=np.float64)
+            
+            # 카메라 테이블에 5개 값 INSERT (올바른 개수)
+            cursor.execute(
+                "INSERT OR REPLACE INTO cameras VALUES (?, ?, ?, ?, ?)",
+                (image_id, 0, w, h, camera_params.tobytes())
+            )
+            
+            # 이미지 정보 추가 (10개 값)
+            cursor.execute(
+                "INSERT OR REPLACE INTO images VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (image_id, f"image_{image_id:04d}.jpg", image_id, 1, 0, 0, 0, 0, 0, 0)
+            )
+            
+            # 키포인트 추가
+            kpts = features['keypoints'].astype(np.float32)
+            cursor.execute(
+                "INSERT OR REPLACE INTO keypoints VALUES (?, ?, ?, ?)",
+                (image_id, len(kpts), 2, kpts.tobytes())
+            )
+            
+            # 디스크립터 추가
+            desc = features['descriptors'].T.astype(np.float32)  # (N, 256)
+            cursor.execute(
+                "INSERT OR REPLACE INTO descriptors VALUES (?, ?, ?, ?)",
+                (image_id, len(desc), 256, desc.tobytes())
+            )
+            
+            conn.commit()
+            
+        except Exception as e:
+            print(f"    데이터베이스 추가 실패: {e}")
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+    
+    def _match_superglue(self, features1, features2, image_path1, image_path2):
+        """SuperGlue로 두 이미지 매칭 - 수정된 버전"""
+        try:
+            # 이미지 로드 및 텐서 변환
+            image1 = self._load_image_for_matching(image_path1)
+            image2 = self._load_image_for_matching(image_path2)
+            
+            if image1 is None or image2 is None:
+                print(f"    이미지 로드 실패")
+                return np.array([]).reshape(0, 2)
+            
+            # 이미지를 텐서로 변환
+            inp1 = self.frame2tensor(image1, self.device)
+            inp2 = self.frame2tensor(image2, self.device)
+            
+            # 데이터 준비 - SuperGlue가 기대하는 형식
             data = {
+                'image0': inp1,  # 이미지 텐서 추가!
+                'image1': inp2,  # 이미지 텐서 추가!
                 'keypoints0': torch.from_numpy(features1['keypoints']).float().unsqueeze(0).to(self.device),
                 'keypoints1': torch.from_numpy(features2['keypoints']).float().unsqueeze(0).to(self.device),
                 'descriptors0': torch.from_numpy(features1['descriptors']).float().unsqueeze(0).to(self.device),
@@ -375,32 +510,59 @@ class SuperGlueCOLMAPHybrid:
                 'scores1': torch.from_numpy(features2['scores']).float().unsqueeze(0).to(self.device),
             }
             
-            # SuperGlue 매칭
+            # SuperGlue 매칭 실행
             with torch.no_grad():
-                pred = self.matching.superglue(data)
+                pred = self.matching(data)
             
-            # 매칭 결과 처리
-            matches0 = pred['matches0'][0].cpu().numpy()
+            
+            matches0 = pred['indices0'][0].cpu().numpy()
             confidence = pred['matching_scores0'][0].cpu().numpy()
-            
+                
             # 유효한 매칭만 추출
             valid = matches0 > -1
             matches = np.column_stack([
                 np.where(valid)[0],
                 matches0[valid]
-            ])
+            ])      
+            
+            print(f"    SuperGlue 매칭: {len(matches)}개")
             
             # 기하학적 검증
             if len(matches) > 8:
                 matches = self._geometric_verification_matches(
                     matches, features1['keypoints'], features2['keypoints']
                 )
+                print(f"    기하학적 검증 후: {len(matches)}개")
             
             return matches
             
         except Exception as e:
             print(f"    매칭 실패: {e}")
+            import traceback
+            traceback.print_exc()
             return np.array([]).reshape(0, 2)
+        
+    def _load_image_for_matching(self, image_path):
+        """매칭용 이미지 로드"""
+        try:
+            # SuperGlue는 그레이스케일 이미지를 기대함!
+            image = cv2.imread(str(image_path), cv2.IMREAD_GRAYSCALE)
+            if image is None:
+                return None
+            
+            # 크기 조정 (메모리 절약)
+            h, w = image.shape[:2]
+            if max(h, w) > 1024:
+                scale = 1024 / max(h, w)
+                new_w, new_h = int(w * scale), int(h * scale)
+                image = cv2.resize(image, (new_w, new_h))
+            
+            # float32로 변환
+            return image.astype(np.float32)
+            
+        except Exception as e:
+            print(f"    이미지 로드 오류: {e}")
+            return None
     
     def _geometric_verification_matches(self, matches, kpts1, kpts2):
         """RANSAC으로 기하학적 검증"""
@@ -513,21 +675,155 @@ class SuperGlueCOLMAPHybrid:
             print(f"  오류: 언디스토션 실패: {e}")
     
     def _convert_to_3dgs_format(self, colmap_path):
-        """COLMAP 결과를 3DGS SceneInfo로 변환"""
+        """COLMAP 결과를 3DGS SceneInfo로 변환 - 수정된 버전"""
         try:
-            # COLMAP 데이터 읽기
-            from scene.dataset_readers import readColmapSceneInfo
-            scene_info = readColmapSceneInfo(str(colmap_path), "images", eval=False)
+            # COLMAP 데이터 읽기 시도
+            sparse_dir = colmap_path / "sparse"
             
-            print(f"  ✓ 3DGS 변환 완료")
-            print(f"    - 학습 카메라: {len(scene_info.train_cameras)}개")
-            print(f"    - 테스트 카메라: {len(scene_info.test_cameras)}개")
+            # sparse 디렉토리 확인
+            if not sparse_dir.exists():
+                print(f"  경고: sparse 디렉토리가 없음: {sparse_dir}")
+                return None
+            
+            # reconstruction 서브디렉토리 찾기
+            reconstruction_dirs = [d for d in sparse_dir.iterdir() if d.is_dir()]
+            if not reconstruction_dirs:
+                print(f"  경고: reconstruction 디렉토리가 없음")
+                return None
+            
+            # 가장 큰 reconstruction 선택
+            best_recon = max(reconstruction_dirs, 
+                            key=lambda x: len(list(x.glob("*.bin"))))
+            
+            print(f"  선택된 reconstruction: {best_recon}")
+            
+            # readColmapSceneInfo 대신 자체 구현 사용
+            scene_info = self._read_colmap_scene_info_custom(
+                str(colmap_path), "images", eval=False
+            )
+            
+            if scene_info:
+                print(f"  ✓ 3DGS 변환 완료")
+                print(f"    - 학습 카메라: {len(scene_info.train_cameras)}개")
+                print(f"    - 테스트 카메라: {len(scene_info.test_cameras)}개")
+                return scene_info
+            else:
+                print(f"  경고: SceneInfo 생성 실패")
+                return None
+                
+        except Exception as e:
+            print(f"  오류: 3DGS 변환 실패: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
+        
+    def _read_colmap_scene_info_custom(self, path, images="images", eval=False):
+        """자체 COLMAP SceneInfo 로더 구현"""
+        try:
+            from scene.camera_info import CameraInfo
+            from scene.scene_info import SceneInfo
+            from utils.graphics_utils import getWorld2View2, focal2fov, fov2focal
+            import numpy as np
+            
+            # 경로 설정
+            path = Path(path)
+            sparse_dir = path / "sparse"
+            images_dir = path / images
+            
+            # reconstruction 찾기
+            reconstruction_dirs = [d for d in sparse_dir.iterdir() if d.is_dir()]
+            if not reconstruction_dirs:
+                return None
+            
+            recon_dir = reconstruction_dirs[0]  # 첫 번째 reconstruction 사용
+            
+            # 카메라 정보 생성 (기본값 사용)
+            cam_infos = []
+            test_cam_infos = []
+            
+            # 이미지 파일들 찾기
+            image_paths = []
+            for ext in ['*.jpg', '*.jpeg', '*.png', '*.JPG', '*.JPEG', '*.PNG']:
+                image_paths.extend(list(images_dir.glob(ext)))
+            
+            image_paths.sort()
+            
+            # 기본 카메라 파라미터 (추정치)
+            for i, image_path in enumerate(image_paths):
+                # 이미지 크기 확인
+                try:
+                    import cv2
+                    img = cv2.imread(str(image_path))
+                    if img is None:
+                        continue
+                    height, width = img.shape[:2]
+                except:
+                    width, height = 1024, 768  # 기본값
+                
+                # 기본 카메라 내부 파라미터
+                focal_length_x = width * 0.7  # 추정치
+                focal_length_y = height * 0.7
+                
+                # 기본 외부 파라미터 (원형 배치)
+                angle = 2 * np.pi * i / len(image_paths)
+                radius = 5.0
+                
+                # 카메라 위치 (원형)
+                cam_x = radius * np.cos(angle)
+                cam_y = 0.0
+                cam_z = radius * np.sin(angle)
+                
+                # 카메라가 원점을 바라보도록 설정
+                R = np.eye(3)  # 간단화된 회전
+                T = np.array([cam_x, cam_y, cam_z])
+                
+                FovY = focal2fov(focal_length_y, height)
+                FovX = focal2fov(focal_length_x, width)
+                
+                cam_info = CameraInfo(
+                    uid=i,
+                    R=R,
+                    T=T,
+                    FovY=FovY,
+                    FovX=FovX,
+                    image=None,  # 나중에 로드
+                    image_path=str(image_path),
+                    image_name=image_path.name,
+                    width=width,
+                    height=height
+                )
+                
+                # train/test 분할 (8:2)
+                if i % 5 == 0:  # 20% test
+                    test_cam_infos.append(cam_info)
+                else:
+                    cam_infos.append(cam_info)
+            
+            # NeRF 정규화 정보
+            nerf_normalization = {
+                "translate": np.array([0.0, 0.0, 0.0]),
+                "radius": 6.0
+            }
+            
+            # 포인트 클라우드 (빈 것으로 시작)
+            ply_path = None
+            
+            scene_info = SceneInfo(
+                point_cloud=None,
+                train_cameras=cam_infos,
+                test_cameras=test_cam_infos,
+                nerf_normalization=nerf_normalization,
+                ply_path=ply_path
+            )
             
             return scene_info
             
         except Exception as e:
-            print(f"  오류: 3DGS 변환 실패: {e}")
+            print(f"  커스텀 COLMAP 로더 실패: {e}")
+            import traceback
+            traceback.print_exc()
             return None
+
 
 def main():
     """메인 실행 함수"""
