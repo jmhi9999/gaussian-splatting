@@ -23,14 +23,14 @@ class SuperGlueMatcher:
         if config is None:
             config = {
                 'superpoint': {
-                    'nms_radius': 4,  # 증가
-                    'keypoint_threshold': 0.005,
-                    'max_keypoints': 4096  # 증가
+                    'nms_radius': 3,  # 증가
+                    'keypoint_threshold': 0.001,
+                    'max_keypoints': 4096  # 더 많은 특징점
                 },
                 'superglue': {
-                    'weights': 'indoor',  # 'indoor' 또는 'outdoor'
-                    'sinkhorn_iterations': 50,  # 증가
-                    'match_threshold': 0.15,  # 증가
+                    'weights': 'outdoor',  # indoor 가중치 사용
+                    'sinkhorn_iterations': 100,  # 증가
+                    'match_threshold': 0.1,  # 증가
                 }
             }
         

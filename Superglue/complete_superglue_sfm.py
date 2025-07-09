@@ -31,14 +31,14 @@ class SuperGlue3DGSPipeline:
         if config is None:
             config = {
                 'superpoint': {
-                    'nms_radius': 4,  # 증가
-                    'keypoint_threshold': 0.005,
+                    'nms_radius': 3,  # 증가
+                    'keypoint_threshold': 0.001,
                     'max_keypoints': 4096  # 더 많은 특징점
                 },
                 'superglue': {
-                    'weights': 'indoor',  # indoor 가중치 사용
-                    'sinkhorn_iterations': 50,  # 증가
-                    'match_threshold': 0.15,  # 증가
+                    'weights': 'outdoor',  # indoor 가중치 사용
+                    'sinkhorn_iterations': 100,  # 증가
+                    'match_threshold': 0.1,  # 증가
                 }
             }
         
@@ -516,6 +516,16 @@ class SuperGlue3DGSPipeline:
             return
         
         print(f"  Optimizing {n_cameras} cameras and {n_points} points...")
+        
+        total_observations = sum(len(point['observations']) for point in self.points_3d.values())
+    
+        # 변수 수 계산
+        n_variables = 6 * (n_cameras - 1) + 3 * n_points
+        n_residuals = total_observations * 2  
+    
+        if n_residuals <= n_variables:
+            print(f"  Insufficient observations: {n_residuals} residuals < {n_variables} variables")
+            return
         
         # 파라미터 벡터 구성
         camera_params = []
