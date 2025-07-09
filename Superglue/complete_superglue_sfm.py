@@ -31,14 +31,14 @@ class SuperGlue3DGSPipeline:
         if config is None:
             config = {
                 'superpoint': {
-                    'nms_radius': 4,
+                    'nms_radius': 3,
                     'keypoint_threshold': 0.005,
                     'max_keypoints': 2048  # 더 많은 특징점
                 },
                 'superglue': {
-                    'weights': 'outdoor',  # outdoor 가중치 사용
-                    'sinkhorn_iterations': 20,
-                    'match_threshold': 0.2,
+                    'weights': 'indoor',  # outdoor 가중치 사용
+                    'sinkhorn_iterations': 30,
+                    'match_threshold': 0.1,
                 }
             }
         
@@ -53,7 +53,7 @@ class SuperGlue3DGSPipeline:
         
         print(f'SuperGlue 3DGS Pipeline initialized on {self.device}')
     
-    def process_images_to_3dgs(self, image_dir, output_dir, max_images=100):
+    def process_images_to_3dgs(self, image_dir, output_dir, max_images=120):
         """이미지 디렉토리에서 3DGS 학습 가능한 상태까지 완전 처리"""
         
         print(f"\n=== SuperGlue + 3DGS Pipeline: Processing up to {max_images} images ===")
@@ -128,6 +128,8 @@ class SuperGlue3DGSPipeline:
                 'image_path': str(image_path),
                 'image_size': image.shape[:2]  # (H, W)
             }
+            
+            print(f"{i+1}th image's keypoints extracted: {self.image_features[i]['keypoints']}")
             
         print(f"  Extracted features from {len(self.image_features)} images")
     
@@ -848,7 +850,7 @@ class SuperGlue3DGSPipeline:
                     # 실패시 복사
                     shutil.copy2(src_path, dst_path)
     
-    def _load_image(self, image_path, resize=(640, 480)):
+    def _load_image(self, image_path, resize=None):
         """이미지 로드 및 전처리"""
         try:
             image = cv2.imread(str(image_path), cv2.IMREAD_GRAYSCALE)
@@ -857,7 +859,9 @@ class SuperGlue3DGSPipeline:
                 return None
             
             # 크기 조정 (SuperGlue 처리용)
-            if resize:
+            if resize is None:
+                pass
+            else:
                 image = cv2.resize(image, resize)
             
             return image.astype(np.float32)

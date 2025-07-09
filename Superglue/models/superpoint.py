@@ -194,6 +194,7 @@ class SuperPoint(nn.Module):
         # Extract descriptors
         descriptors = [sample_descriptors(k[None], d[None], 8)[0]
                        for k, d in zip(keypoints, descriptors)]
+        
 
         return {
             'keypoints': keypoints,

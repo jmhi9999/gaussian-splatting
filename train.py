@@ -268,8 +268,6 @@ if __name__ == "__main__":
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
     parser.add_argument("--start_checkpoint", type=str, default = None)
     
-    # 중복된 argument 정의들을 제거했습니다
-    # scene_type, superglue_config, max_images는 이미 ModelParams에 정의되어 있습니다
     
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)

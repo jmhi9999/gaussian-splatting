@@ -23,14 +23,14 @@ class SuperGlueMatcher:
         if config is None:
             config = {
                 'superpoint': {
-                    'nms_radius': 4,
+                    'nms_radius': 3,
                     'keypoint_threshold': 0.005,
-                    'max_keypoints': 1024
+                    'max_keypoints': 2048
                 },
                 'superglue': {
-                    'weights': 'outdoor',  # 'indoor' 또는 'outdoor'
-                    'sinkhorn_iterations': 20,
-                    'match_threshold': 0.2,
+                    'weights': 'indoor',  # 'indoor' 또는 'outdoor'
+                    'sinkhorn_iterations': 30,
+                    'match_threshold': 0.1,
                 }
             }
         
@@ -40,7 +40,7 @@ class SuperGlueMatcher:
         
         print(f'SuperGlue loaded on {self.device}')
     
-    def match_image_pair(self, image_path0, image_path1, resize=[640, 480]):
+    def match_image_pair(self, image_path0, image_path1, resize=[-1]):
         """두 이미지 간 매칭 수행"""
         
         # 이미지 로드 및 전처리
@@ -89,7 +89,7 @@ class SuperGlueMatcher:
             'match_confidence': mconf
         }
     
-    def match_multiple_images(self, image_paths, resize=[640, 480]):
+    def match_multiple_images(self, image_paths, resize=[-1]):
         """여러 이미지 간 전체 매칭"""
         results = {}
         n_images = len(image_paths)
