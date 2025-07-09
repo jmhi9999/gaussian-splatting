@@ -27,18 +27,18 @@ class SuperGlue3DGSPipeline:
     def __init__(self, config=None, device='cuda'):
         self.device = torch.device(device if torch.cuda.is_available() else 'cpu')
         
-        # SuperGlue 설정 (100장 이미지 처리에 최적화)
+        # SuperGlue 설정 (고해상도 이미지 처리에 최적화)
         if config is None:
             config = {
                 'superpoint': {
-                    'nms_radius': 3,
+                    'nms_radius': 4,  # 증가
                     'keypoint_threshold': 0.005,
-                    'max_keypoints': 2048  # 더 많은 특징점
+                    'max_keypoints': 4096  # 더 많은 특징점
                 },
                 'superglue': {
-                    'weights': 'indoor',  # outdoor 가중치 사용
-                    'sinkhorn_iterations': 30,
-                    'match_threshold': 0.1,
+                    'weights': 'indoor',  # indoor 가중치 사용
+                    'sinkhorn_iterations': 50,  # 증가
+                    'match_threshold': 0.15,  # 증가
                 }
             }
         
@@ -851,24 +851,58 @@ class SuperGlue3DGSPipeline:
                     shutil.copy2(src_path, dst_path)
     
     def _load_image(self, image_path, resize=None):
-        """이미지 로드 및 전처리"""
+        """이미지 로드 및 전처리 - 적응형 resize 적용"""
         try:
             image = cv2.imread(str(image_path), cv2.IMREAD_GRAYSCALE)
             if image is None:
                 print(f"    Warning: Failed to load {image_path}")
                 return None
             
+            # 적응형 resize 계산
+            if resize is None:
+                resize = self._calculate_adaptive_resize(image_path)
+            
             # 크기 조정 (SuperGlue 처리용)
             if resize is None:
-                pass
-            else:
+                pass  # 원본 크기 유지
+            elif len(resize) == 2:
                 image = cv2.resize(image, resize)
+            elif len(resize) == 1 and resize[0] > 0:
+                h, w = image.shape
+                scale = resize[0] / max(h, w)
+                new_h, new_w = int(h * scale), int(w * scale)
+                image = cv2.resize(image, (new_w, new_h))
             
             return image.astype(np.float32)
         
         except Exception as e:
             print(f"    Error loading {image_path}: {e}")
             return None
+    
+    def _calculate_adaptive_resize(self, image_path):
+        """이미지 해상도에 따른 적응형 resize 계산"""
+        try:
+            img = cv2.imread(str(image_path))
+            if img is None:
+                return [1024, 768]  # 기본값
+            
+            h, w = img.shape[:2]
+            max_dim = max(h, w)
+            
+            # 적응형 resize 규칙
+            if max_dim <= 1024:
+                # 작은 이미지는 원본 크기 유지
+                return None
+            elif max_dim <= 2048:
+                # 중간 크기는 1024로 resize
+                scale = 1024 / max_dim
+                return [int(w * scale), int(h * scale)]
+            else:
+                # 큰 이미지는 1536로 resize
+                scale = 1536 / max_dim
+                return [int(w * scale), int(h * scale)]
+        except:
+            return [1024, 768]  # 기본값
 
 def readSuperGlueSceneInfo(path, images, eval, train_test_exp=False, llffhold=8, 
                           superglue_config="outdoor", max_images=100):

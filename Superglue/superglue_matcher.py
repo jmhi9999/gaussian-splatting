@@ -19,18 +19,18 @@ class SuperGlueMatcher:
     def __init__(self, config=None, device='cuda'):
         self.device = torch.device(device if torch.cuda.is_available() else 'cpu')
         
-        # 기본 설정
+        # 기본 설정 - 고해상도 이미지에 최적화
         if config is None:
             config = {
                 'superpoint': {
-                    'nms_radius': 3,
+                    'nms_radius': 4,  # 증가
                     'keypoint_threshold': 0.005,
-                    'max_keypoints': 2048
+                    'max_keypoints': 4096  # 증가
                 },
                 'superglue': {
                     'weights': 'indoor',  # 'indoor' 또는 'outdoor'
-                    'sinkhorn_iterations': 30,
-                    'match_threshold': 0.1,
+                    'sinkhorn_iterations': 50,  # 증가
+                    'match_threshold': 0.15,  # 증가
                 }
             }
         
@@ -40,8 +40,12 @@ class SuperGlueMatcher:
         
         print(f'SuperGlue loaded on {self.device}')
     
-    def match_image_pair(self, image_path0, image_path1, resize=[-1]):
-        """두 이미지 간 매칭 수행"""
+    def match_image_pair(self, image_path0, image_path1, resize=None):
+        """두 이미지 간 매칭 수행 - 적응형 resize 적용"""
+        
+        # 적응형 resize 계산
+        if resize is None:
+            resize = self._calculate_adaptive_resize(image_path0, image_path1)
         
         # 이미지 로드 및 전처리
         image0 = self._load_image(image_path0, resize)
@@ -79,6 +83,15 @@ class SuperGlueMatcher:
         mkpts1 = kpts1[matches[valid]]
         mconf = confidence[valid]
         
+        # 원본 해상도로 좌표 변환
+        if resize is not None and len(resize) == 2:
+            scale_x = resize[0] / image0.shape[1]
+            scale_y = resize[1] / image0.shape[0]
+            mkpts0[:, 0] *= scale_x
+            mkpts0[:, 1] *= scale_y
+            mkpts1[:, 0] *= scale_x
+            mkpts1[:, 1] *= scale_y
+        
         return {
             'keypoints0': kpts0,
             'keypoints1': kpts1,
@@ -86,10 +99,143 @@ class SuperGlueMatcher:
             'confidence': confidence,
             'matched_kpts0': mkpts0,
             'matched_kpts1': mkpts1,
-            'match_confidence': mconf
+            'match_confidence': mconf,
+            'resize_used': resize
         }
     
-    def match_multiple_images(self, image_paths, resize=[-1]):
+    def match_with_quality_check(self, image_path0, image_path1, min_matches=10, max_retries=3):
+        """품질 체크가 포함된 매칭 - 매칭 개수가 부족하면 설정을 조정하여 재시도"""
+        
+        for attempt in range(max_retries):
+            # 시도별 설정 조정
+            if attempt == 0:
+                # 첫 번째 시도: 기본 설정
+                config = self._get_config_for_attempt(0)
+            elif attempt == 1:
+                # 두 번째 시도: 더 관대한 설정
+                config = self._get_config_for_attempt(1)
+            else:
+                # 세 번째 시도: 가장 관대한 설정
+                config = self._get_config_for_attempt(2)
+            
+            # 임시 매처 생성
+            temp_matcher = SuperGlueMatcher(config, device=str(self.device))
+            
+            # 매칭 시도
+            result = temp_matcher.match_image_pair(image_path0, image_path1)
+            
+            if result is not None and len(result['matched_kpts0']) >= min_matches:
+                print(f"  Successful matching with {len(result['matched_kpts0'])} matches (attempt {attempt + 1})")
+                return result
+        
+        print(f"  Failed to get sufficient matches after {max_retries} attempts")
+        return None
+    
+    def _get_config_for_attempt(self, attempt):
+        """시도별 설정 반환"""
+        if attempt == 0:
+            # 기본 설정
+            return {
+                'superpoint': {
+                    'nms_radius': 4,
+                    'keypoint_threshold': 0.005,
+                    'max_keypoints': 4096
+                },
+                'superglue': {
+                    'weights': 'indoor',
+                    'sinkhorn_iterations': 50,
+                    'match_threshold': 0.15,
+                }
+            }
+        elif attempt == 1:
+            # 더 관대한 설정
+            return {
+                'superpoint': {
+                    'nms_radius': 3,  # 감소
+                    'keypoint_threshold': 0.003,  # 감소
+                    'max_keypoints': 6144  # 증가
+                },
+                'superglue': {
+                    'weights': 'indoor',
+                    'sinkhorn_iterations': 30,  # 감소
+                    'match_threshold': 0.1,  # 감소
+                }
+            }
+        else:
+            # 가장 관대한 설정
+            return {
+                'superpoint': {
+                    'nms_radius': 2,  # 더 감소
+                    'keypoint_threshold': 0.001,  # 더 감소
+                    'max_keypoints': 8192  # 더 증가
+                },
+                'superglue': {
+                    'weights': 'indoor',
+                    'sinkhorn_iterations': 20,  # 더 감소
+                    'match_threshold': 0.05,  # 더 감소
+                }
+            }
+    
+    def match_multiple_images_with_quality(self, image_paths, min_matches=10):
+        """품질 체크가 포함된 다중 이미지 매칭"""
+        results = {}
+        n_images = len(image_paths)
+        
+        print(f"Matching {n_images} images with quality check...")
+        
+        for i in range(n_images):
+            for j in range(i+1, n_images):
+                pair_key = f"{i}_{j}"
+                print(f"Matching pair {i}-{j}")
+                
+                result = self.match_with_quality_check(
+                    image_paths[i], 
+                    image_paths[j], 
+                    min_matches
+                )
+                
+                if result is not None:
+                    results[pair_key] = result
+        
+        return results
+    
+    def _calculate_adaptive_resize(self, image_path0, image_path1):
+        """이미지 해상도에 따른 적응형 resize 계산 - 더 높은 해상도 지원"""
+        # 이미지 크기 확인
+        img0 = cv2.imread(str(image_path0))
+        img1 = cv2.imread(str(image_path1))
+        
+        if img0 is None or img1 is None:
+            return [1024, 768]  # 기본값
+        
+        h0, w0 = img0.shape[:2]
+        h1, w1 = img1.shape[:2]
+        
+        # 최대 해상도 계산
+        max_dim = max(h0, w0, h1, w1)
+        
+        # 적응형 resize 규칙 - 더 높은 해상도 지원
+        if max_dim <= 1024:
+            # 작은 이미지는 원본 크기 유지
+            return None
+        elif max_dim <= 2048:
+            # 중간 크기는 1024로 resize
+            scale = 1024 / max_dim
+            return [int(w0 * scale), int(h0 * scale)]
+        elif max_dim <= 4096:
+            # 큰 이미지는 2048로 resize (증가)
+            scale = 2048 / max_dim
+            return [int(w0 * scale), int(h0 * scale)]
+        elif max_dim <= 8192:
+            # 매우 큰 이미지는 3072로 resize (증가)
+            scale = 3072 / max_dim
+            return [int(w0 * scale), int(h0 * scale)]
+        else:
+            # 극도로 큰 이미지는 4096으로 제한
+            scale = 4096 / max_dim
+            return [int(w0 * scale), int(h0 * scale)]
+    
+    def match_multiple_images(self, image_paths, resize=None):
         """여러 이미지 간 전체 매칭"""
         results = {}
         n_images = len(image_paths)
@@ -120,7 +266,9 @@ class SuperGlueMatcher:
             return None
         
         # 리사이즈
-        if len(resize) == 2:
+        if resize is None:
+            pass  # 원본 크기 유지
+        elif len(resize) == 2:
             image = cv2.resize(image, tuple(resize))
         elif len(resize) == 1 and resize[0] > 0:
             h, w = image.shape
@@ -159,9 +307,9 @@ def readSuperGlueSceneInfo(path, images, eval=False):
     
     image_paths.sort()
     
-    # SuperGlue 매칭 수행
+    # SuperGlue 매칭 수행 (적응형 resize 사용)
     print(f"Processing {len(image_paths)} images with SuperGlue...")
-    matching_results = matcher.match_multiple_images(image_paths)
+    matching_results = matcher.match_multiple_images(image_paths, resize=None)  # 적응형 resize
     
     # 3DGS 형식으로 변환
     cameras, images_info, points3d = matcher.extract_features_for_3dgs(image_paths)
