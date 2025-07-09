@@ -461,7 +461,7 @@ class SuperGlueCOLMAPHybrid:
             return None
     
     def _add_features_to_database(self, database_path, image_id, features):
-        """데이터베이스에 특징점 추가 - 올바른 컬럼 수"""
+        """데이터베이스에 특징점 추가 - 수정된 버전"""
         conn = sqlite3.connect(str(database_path))
         cursor = conn.cursor()
         
@@ -470,30 +470,43 @@ class SuperGlueCOLMAPHybrid:
             h, w = features['image_size']
             focal = max(w, h) * 0.8  # 보수적 추정
             
-            # SIMPLE_PINHOLE 파라미터: [focal, cx, cy]
+            # SIMPLE_PINHOLE 파라미터: [focal, cx, cy] - float64로 정확히 인코딩
             camera_params = np.array([focal, w/2, h/2], dtype=np.float64)
             
-            # 카메라 테이블에 5개 값 INSERT (올바른 개수)
+            # 카메라 테이블에 5개 값 INSERT
             cursor.execute(
                 "INSERT OR REPLACE INTO cameras VALUES (?, ?, ?, ?, ?)",
                 (image_id, 0, w, h, camera_params.tobytes())
             )
             
-            # 이미지 정보 추가 (10개 값) - prior 값들을 NULL로 설정
+            # 이미지 정보 추가 - prior 값들을 NULL로 설정
             cursor.execute(
                 "INSERT OR REPLACE INTO images VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (image_id, f"image_{image_id:04d}.jpg", image_id, None, None, None, None, None, None, None)
             )
             
-            # 키포인트 추가
+            # 키포인트 추가 - 최소 1개 이상 필요
             kpts = features['keypoints'].astype(np.float32)
+            if len(kpts) == 0:
+                # 최소 1개 키포인트 생성
+                kpts = np.array([[w/2, h/2]], dtype=np.float32)
+            
             cursor.execute(
                 "INSERT OR REPLACE INTO keypoints VALUES (?, ?, ?, ?)",
                 (image_id, len(kpts), 2, kpts.tobytes())
             )
             
-            # 디스크립터 추가
+            # 디스크립터 추가 - 키포인트와 개수 맞춤
             desc = features['descriptors'].T.astype(np.float32)  # (N, 256)
+            if len(desc) != len(kpts):
+                # 디스크립터 개수를 키포인트와 맞춤
+                if len(desc) > len(kpts):
+                    desc = desc[:len(kpts)]
+                else:
+                    # 부족한 디스크립터는 0으로 채움
+                    padding = np.zeros((len(kpts) - len(desc), 256), dtype=np.float32)
+                    desc = np.vstack([desc, padding])
+            
             cursor.execute(
                 "INSERT OR REPLACE INTO descriptors VALUES (?, ?, ?, ?)",
                 (image_id, len(desc), 256, desc.tobytes())
@@ -614,33 +627,44 @@ class SuperGlueCOLMAPHybrid:
         return matches
     
     def _add_matches_to_database(self, database_path, img1_id, img2_id, matches):
-        """데이터베이스에 매칭 결과 추가"""
+        """데이터베이스에 매칭 결과 추가 - 수정된 버전"""
         if len(matches) == 0:
             return
         
         conn = sqlite3.connect(str(database_path))
         cursor = conn.cursor()
         
-        # COLMAP pair_id 계산
-        if img1_id > img2_id:
-            img1_id, img2_id = img2_id, img1_id
-            matches = matches[:, [1, 0]]  # 순서 바꿈
-        
-        pair_id = img1_id * 2147483647 + img2_id  # COLMAP 공식
-        
-        # 매칭 데이터 변환
-        matches_data = matches.astype(np.uint32)
-        
-        cursor.execute(
-            "INSERT OR REPLACE INTO matches VALUES (?, ?, ?, ?)",
-            (pair_id, len(matches), 2, matches_data.tobytes())
-        )
-        
-        conn.commit()
-        conn.close()
+        try:
+            # COLMAP pair_id 계산
+            if img1_id > img2_id:
+                img1_id, img2_id = img2_id, img1_id
+                matches = matches[:, [1, 0]]  # 순서 바꿈
+            
+            pair_id = img1_id * 2147483647 + img2_id  # COLMAP 공식
+            
+            # 매칭 데이터 변환 - uint32로 정확히 변환
+            matches_data = matches.astype(np.uint32)
+            
+            # 최소 8개 매칭 필요 (COLMAP 요구사항)
+            if len(matches_data) < 8:
+                print(f"    경고: 매칭 수가 부족 ({len(matches_data)}개)")
+                return
+            
+            cursor.execute(
+                "INSERT OR REPLACE INTO matches VALUES (?, ?, ?, ?)",
+                (pair_id, len(matches_data), 2, matches_data.tobytes())
+            )
+            
+            conn.commit()
+            
+        except Exception as e:
+            print(f"    매칭 저장 실패: {e}")
+            conn.rollback()
+        finally:
+            conn.close()
     
     def _run_colmap_mapper(self, database_path, image_path, output_path):
-        """COLMAP으로 SfM 수행"""
+        """COLMAP으로 SfM 수행 - 수정된 버전"""
         cmd = [
             self.colmap_exe, "mapper",
             "--database_path", str(database_path),
@@ -649,25 +673,56 @@ class SuperGlueCOLMAPHybrid:
             "--Mapper.ba_global_function_tolerance", "0.000001",
             "--Mapper.ba_global_max_num_iterations", "100",
             "--Mapper.ba_local_max_num_iterations", "50",
-            "--Mapper.min_num_matches", "15",  # 낮춤
-            "--Mapper.init_min_num_inliers", "30",  # 낮춤
-            "--Mapper.abs_pose_min_num_inliers", "15",  # 낮춤
-            "--Mapper.filter_max_reproj_error", "8.0",  # 높임 (블러 고려)
+            "--Mapper.min_num_matches", "8",  # 더 낮춤
+            "--Mapper.init_min_num_inliers", "15",  # 더 낮춤
+            "--Mapper.abs_pose_min_num_inliers", "8",  # 더 낮춤
+            "--Mapper.filter_max_reproj_error", "12.0",  # 더 높임 (블러 고려)
+            "--Mapper.min_track_length", "3",  # 트랙 길이 최소화
+            "--Mapper.max_track_length", "20",  # 트랙 길이 제한
         ]
         
         print(f"  COLMAP Mapper 실행...")
+        print(f"  명령: {' '.join(cmd)}")
+        
         try:
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
             if result.returncode != 0:
                 print(f"  경고: COLMAP Mapper 오류")
                 print(f"  stdout: {result.stdout}")
                 print(f"  stderr: {result.stderr}")
+                
+                # DB 상태 확인
+                print(f"  DB 상태 확인 중...")
+                self._check_database_status(database_path)
             else:
                 print(f"  ✓ COLMAP SfM 완료")
         except subprocess.TimeoutExpired:
             print(f"  경고: COLMAP Mapper 타임아웃")
         except Exception as e:
             print(f"  오류: COLMAP Mapper 실패: {e}")
+    
+    def _check_database_status(self, database_path):
+        """데이터베이스 상태 확인"""
+        try:
+            conn = sqlite3.connect(str(database_path))
+            cursor = conn.cursor()
+            
+            # 테이블별 레코드 수 확인
+            tables = ['cameras', 'images', 'keypoints', 'descriptors', 'matches']
+            for table in tables:
+                cursor.execute(f"SELECT COUNT(*) FROM {table}")
+                count = cursor.fetchone()[0]
+                print(f"    {table}: {count}개 레코드")
+            
+            # 이미지별 키포인트 수 확인
+            cursor.execute("SELECT image_id, rows FROM keypoints ORDER BY image_id LIMIT 5")
+            keypoint_counts = cursor.fetchall()
+            print(f"    키포인트 샘플: {keypoint_counts}")
+            
+            conn.close()
+            
+        except Exception as e:
+            print(f"    DB 상태 확인 실패: {e}")
     
     def _run_colmap_undistortion(self, image_path, sparse_path, output_path):
         """COLMAP 언디스토션"""
