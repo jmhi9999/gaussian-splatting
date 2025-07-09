@@ -22,7 +22,8 @@ except ImportError as e:
     print(f"경고: 3DGS 모듈 import 실패: {e}")
     # 기본 클래스 정의
     class CameraInfo:
-        def __init__(self, uid, R, T, FovY, FovX, image, image_path, image_name, width, height):
+        def __init__(self, uid, R, T, FovY, FovX, image, image_path, image_name, width, height, 
+                     depth_params=None, depth_path="", is_test=False):
             self.uid = uid
             self.R = R
             self.T = T
@@ -33,14 +34,18 @@ except ImportError as e:
             self.image_name = image_name
             self.width = width
             self.height = height
+            self.depth_params = depth_params
+            self.depth_path = depth_path
+            self.is_test = is_test
     
     class SceneInfo:
-        def __init__(self, point_cloud, train_cameras, test_cameras, nerf_normalization, ply_path):
+        def __init__(self, point_cloud, train_cameras, test_cameras, nerf_normalization, ply_path, is_nerf_synthetic=False):
             self.point_cloud = point_cloud
             self.train_cameras = train_cameras
             self.test_cameras = test_cameras
             self.nerf_normalization = nerf_normalization
             self.ply_path = ply_path
+            self.is_nerf_synthetic = is_nerf_synthetic
 
 class SuperGlueCOLMAPHybrid:
     def __init__(self, 
@@ -93,12 +98,12 @@ class SuperGlueCOLMAPHybrid:
             self.superpoint = None
             self.superglue = None
     
-    def process(self, image_dir: str, max_images: int = 100) -> SceneInfo:
-        """전체 하이브리드 파이프라인 실행"""
+    def process_images(self, image_dir: str, output_dir: str, max_images: int = 100) -> SceneInfo:
+        """dataset_readers.py에서 호출되는 메서드"""
         print("🚀 SuperGlue + COLMAP 하이브리드 파이프라인 시작")
         
         # 출력 디렉토리 설정
-        output_path = Path("ImageInputs/superglue_colmap_hybrid_output")
+        output_path = Path(output_dir)
         output_path.mkdir(parents=True, exist_ok=True)
         
         try:
@@ -115,19 +120,27 @@ class SuperGlueCOLMAPHybrid:
             database_path = output_path / "database.db"
             self._create_fixed_colmap_database(image_paths, database_path, input_dir)
             
-            # 3. COLMAP으로 포즈 추정 (수정된 설정)
-            print("\n[3/5] COLMAP 포즈 추정...")
+            # 3. COLMAP 특징점 추출
+            print("\n[3/6] COLMAP 특징점 추출...")
+            self._run_colmap_feature_extraction(database_path, input_dir)
+            
+            # 4. COLMAP 매칭
+            print("\n[4/6] COLMAP 매칭...")
+            self._run_colmap_matching(database_path)
+            
+            # 5. COLMAP으로 포즈 추정 (수정된 설정)
+            print("\n[5/6] COLMAP 포즈 추정...")
             sparse_dir = output_path / "sparse"
             sparse_dir.mkdir(exist_ok=True)
             self._run_colmap_mapper_fixed(database_path, input_dir, sparse_dir)
             
-            # 4. 이미지 언디스토션
-            print("\n[4/5] 이미지 언디스토션...")
+            # 6. 이미지 언디스토션
+            print("\n[6/6] 이미지 언디스토션...")
             undistorted_dir = output_path / "undistorted"
             self._run_colmap_undistortion(input_dir, sparse_dir, undistorted_dir)
             
-            # 5. 3DGS 형식으로 변환
-            print("\n[5/5] 3DGS 형식 변환...")
+            # 7. 3DGS 형식으로 변환
+            print("\n[7/6] 3DGS 형식 변환...")
             scene_info = self._convert_to_3dgs_format_fixed(output_path, image_paths)
             
             print("✅ 하이브리드 파이프라인 완료!")
@@ -137,6 +150,10 @@ class SuperGlueCOLMAPHybrid:
             print(f"❌ 실패: {e}")
             # 기본 SceneInfo 생성 시도
             return self._create_default_scene_info(image_paths, output_path)
+    
+    def process(self, image_dir: str, max_images: int = 100) -> SceneInfo:
+        """전체 하이브리드 파이프라인 실행 (기존 메서드)"""
+        return self.process_images(image_dir, "ImageInputs/superglue_colmap_hybrid_output", max_images)
     
     def _collect_images(self, image_dir, max_images):
         """이미지 수집 및 품질 필터링"""
@@ -326,6 +343,55 @@ class SuperGlueCOLMAPHybrid:
             (image_id, 4, 128, descriptors.tobytes())
         )
     
+    def _run_colmap_feature_extraction(self, database_path, image_path):
+        """COLMAP 특징점 추출"""
+        cmd = [
+            self.colmap_exe, "feature_extractor",
+            "--database_path", str(database_path),
+            "--image_path", str(image_path),
+            "--ImageReader.single_camera", "1",
+            "--SiftExtraction.max_num_features", "1000"
+        ]
+        
+        print("  COLMAP 특징점 추출 실행...")
+        
+        # Qt GUI 문제 해결을 위한 환경 변수 설정
+        env = os.environ.copy()
+        env["QT_QPA_PLATFORM"] = "offscreen"
+        env["DISPLAY"] = ":0"
+        
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=1800, env=env)
+            if result.returncode == 0:
+                print("  ✓ 특징점 추출 완료")
+            else:
+                print(f"  ✗ 특징점 추출 실패: {result.stderr}")
+        except Exception as e:
+            print(f"  오류: 특징점 추출 실패: {e}")
+    
+    def _run_colmap_matching(self, database_path):
+        """COLMAP 매칭"""
+        cmd = [
+            self.colmap_exe, "exhaustive_matcher",
+            "--database_path", str(database_path)
+        ]
+        
+        print("  COLMAP 매칭 실행...")
+        
+        # Qt GUI 문제 해결을 위한 환경 변수 설정
+        env = os.environ.copy()
+        env["QT_QPA_PLATFORM"] = "offscreen"
+        env["DISPLAY"] = ":0"
+        
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=1800, env=env)
+            if result.returncode == 0:
+                print("  ✓ 매칭 완료")
+            else:
+                print(f"  ✗ 매칭 실패: {result.stderr}")
+        except Exception as e:
+            print(f"  오류: 매칭 실패: {e}")
+    
     def _run_colmap_mapper_fixed(self, database_path, image_path, output_path):
         """수정된 COLMAP Mapper 실행"""
         
@@ -345,8 +411,13 @@ class SuperGlueCOLMAPHybrid:
         print("  COLMAP Mapper 실행...")
         print(f"  명령: {' '.join(cmd)}")
         
+        # Qt GUI 문제 해결을 위한 환경 변수 설정
+        env = os.environ.copy()
+        env["QT_QPA_PLATFORM"] = "offscreen"
+        env["DISPLAY"] = ":0"
+        
         try:
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=1800, env=env)
             
             if result.returncode == 0:
                 print("  ✓ COLMAP SfM 완료")
@@ -408,8 +479,14 @@ class SuperGlueCOLMAPHybrid:
         ]
         
         print("  COLMAP 언디스토션 실행...")
+        
+        # Qt GUI 문제 해결을 위한 환경 변수 설정
+        env = os.environ.copy()
+        env["QT_QPA_PLATFORM"] = "offscreen"
+        env["DISPLAY"] = ":0"
+        
         try:
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=1800, env=env)
             if result.returncode == 0:
                 print("  ✓ 언디스토션 완료")
             else:
@@ -489,7 +566,8 @@ class SuperGlueCOLMAPHybrid:
                 cam_info = CameraInfo(
                     uid=i, R=R, T=T, FovY=fov_y, FovX=fov_x,
                     image=image, image_path=str(img_path), 
-                    image_name=img_path.name, width=width, height=height
+                    image_name=img_path.name, width=width, height=height,
+                    depth_params=None, depth_path="", is_test=(i % 8 == 0)
                 )
                 train_cameras.append(cam_info)
             
@@ -504,12 +582,35 @@ class SuperGlueCOLMAPHybrid:
             ply_path = output_path / "points3D.ply"
             self._save_ply(ply_path, xyz, rgb)
             
+            # 학습/테스트 분할
+            train_cams = [c for c in train_cameras if not c.is_test]
+            test_cams = [c for c in train_cameras if c.is_test]
+            
+            # NeRF 정규화 계산
+            cam_centers = []
+            for cam in train_cameras:
+                # 카메라 중심 계산
+                cam_pos = -np.dot(cam.R.T, cam.T)
+                cam_centers.append(cam_pos)
+            
+            if cam_centers:
+                cam_centers = np.array(cam_centers)
+                center = np.mean(cam_centers, axis=0)
+                distances = np.linalg.norm(cam_centers - center, axis=1)
+                radius = np.max(distances) * 1.1
+            else:
+                center = np.zeros(3)
+                radius = 3.0
+            
+            nerf_norm = {"translate": -center, "radius": radius}
+            
             scene_info = SceneInfo(
                 point_cloud=point_cloud,
-                train_cameras=train_cameras,
-                test_cameras=[],
-                nerf_normalization={"translate": np.array([0, 0, 0]), "radius": 1.0},
-                ply_path=str(ply_path)
+                train_cameras=train_cams,
+                test_cameras=test_cams,
+                nerf_normalization=nerf_norm,
+                ply_path=str(ply_path),
+                is_nerf_synthetic=False
             )
             
             print(f"  ✓ 기본 SceneInfo 생성 완료 ({len(train_cameras)}개 카메라)")
