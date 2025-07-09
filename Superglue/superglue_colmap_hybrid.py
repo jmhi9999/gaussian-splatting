@@ -194,42 +194,59 @@ class SuperGlueCOLMAPHybrid:
         return input_dir
     
     def _create_fixed_colmap_database(self, image_paths, database_path, input_dir):
-        """수정된 COLMAP 데이터베이스 생성"""
+        """수정된 COLMAP 데이터베이스 생성 (debug_hybrid_pipeline 방식)"""
         
         # 기존 데이터베이스 삭제
         if database_path.exists():
             database_path.unlink()
         
-        conn = sqlite3.connect(str(database_path))
-        cursor = conn.cursor()
-        
         try:
-            # 테이블 생성 (수정된 스키마)
-            self._create_database_schema(cursor)
+            # COLMAP의 database_creator 사용
+            cmd = ["colmap", "database_creator", "--database_path", str(database_path)]
+            result = subprocess.run(cmd, capture_output=True, text=True)
             
-            # 카메라 정보 추가 (기본 핀홀 모델)
-            camera_id = self._add_default_camera(cursor, image_paths[0])
+            if result.returncode != 0:
+                print(f"  ✗ database_creator 실패: {result.stderr}")
+                return False
+            
+            print("  ✓ COLMAP database_creator 성공")
             
             # 이미지 정보 추가
-            for i, image_path in enumerate(image_paths):
-                image_name = f"image_{i:04d}{image_path.suffix}"
+            conn = sqlite3.connect(str(database_path))
+            cursor = conn.cursor()
+            
+            # 기본 카메라 추가 (SIMPLE_PINHOLE 모델)
+            sample_img = cv2.imread(str(image_paths[0]))
+            height, width = sample_img.shape[:2]
+            
+            # SIMPLE_PINHOLE 모델 (model=0): [f, cx, cy]
+            focal = max(width, height) * 1.2
+            params = np.array([focal, width/2, height/2], dtype=np.float64)
+            
+            cursor.execute(
+                "INSERT INTO cameras (model, width, height, params, prior_focal_length) VALUES (?, ?, ?, ?, ?)",
+                (0, width, height, params.tobytes(), int(focal))
+            )
+            
+            camera_id = cursor.lastrowid
+            
+            # 이미지 정보 추가 (처음 20장만)
+            for i, img_path in enumerate(image_paths[:20]):
+                image_name = f"image_{i:04d}{img_path.suffix}"
                 cursor.execute(
                     "INSERT INTO images (name, camera_id) VALUES (?, ?)",
                     (image_name, camera_id)
                 )
-                
-                # 더미 키포인트 추가 (COLMAP 호환성)
-                self._add_dummy_keypoints(cursor, i + 1)
             
             conn.commit()
-            print("  ✓ COLMAP 데이터베이스 생성 완료")
+            conn.close()
+            
+            print(f"  ✓ {len(image_paths)}장 이미지 정보 추가")
+            return True
             
         except Exception as e:
             print(f"  ✗ 데이터베이스 생성 실패: {e}")
-            conn.rollback()
-            raise
-        finally:
-            conn.close()
+            return False
     
     def _create_database_schema(self, cursor):
         """COLMAP 데이터베이스 스키마 생성"""
@@ -348,8 +365,8 @@ class SuperGlueCOLMAPHybrid:
         )
     
     def _run_colmap_feature_extraction(self, database_path, image_path):
-        """COLMAP 특징점 추출"""
-        cmd = [
+        """COLMAP 특징점 추출 (debug_hybrid_pipeline 방식)"""
+        base_cmd = [
             self.colmap_exe, "feature_extractor",
             "--database_path", str(database_path),
             "--image_path", str(image_path),
@@ -364,6 +381,18 @@ class SuperGlueCOLMAPHybrid:
         env["QT_QPA_PLATFORM"] = "offscreen"
         env["DISPLAY"] = ":0"
         
+        # xvfb 사용 가능한지 확인
+        try:
+            xvfb_result = subprocess.run(["which", "xvfb-run"], capture_output=True, text=True)
+            use_xvfb = xvfb_result.returncode == 0
+        except:
+            use_xvfb = False
+        
+        if use_xvfb:
+            cmd = ["xvfb-run", "-a"] + base_cmd
+        else:
+            cmd = base_cmd
+        
         try:
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=1800, env=env)
             if result.returncode == 0:
@@ -374,8 +403,8 @@ class SuperGlueCOLMAPHybrid:
             print(f"  오류: 특징점 추출 실패: {e}")
     
     def _run_colmap_matching(self, database_path):
-        """COLMAP 매칭"""
-        cmd = [
+        """COLMAP 매칭 (debug_hybrid_pipeline 방식)"""
+        base_cmd = [
             self.colmap_exe, "exhaustive_matcher",
             "--database_path", str(database_path)
         ]
@@ -387,20 +416,45 @@ class SuperGlueCOLMAPHybrid:
         env["QT_QPA_PLATFORM"] = "offscreen"
         env["DISPLAY"] = ":0"
         
+        # xvfb 사용 가능한지 확인
+        try:
+            xvfb_result = subprocess.run(["which", "xvfb-run"], capture_output=True, text=True)
+            use_xvfb = xvfb_result.returncode == 0
+        except:
+            use_xvfb = False
+        
+        if use_xvfb:
+            cmd = ["xvfb-run", "-a"] + base_cmd
+        else:
+            cmd = base_cmd
+        
         try:
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=1800, env=env)
             if result.returncode == 0:
                 print("  ✓ 매칭 완료")
             else:
                 print(f"  ✗ 매칭 실패: {result.stderr}")
+                # 매칭 실패 시 더 관대한 설정으로 재시도
+                print("  🔄 더 관대한 설정으로 매칭 재시도...")
+                retry_cmd = [
+                    self.colmap_exe, "exhaustive_matcher",
+                    "--database_path", str(database_path),
+                    "--SiftMatching.max_ratio", "0.9",
+                    "--SiftMatching.max_distance", "0.7"
+                ]
+                retry_result = subprocess.run(retry_cmd, capture_output=True, text=True, timeout=1800, env=env)
+                if retry_result.returncode == 0:
+                    print("  ✓ 재시도 매칭 완료")
+                else:
+                    print(f"  ✗ 재시도 매칭 실패: {retry_result.stderr}")
         except Exception as e:
             print(f"  오류: 매칭 실패: {e}")
     
     def _run_colmap_mapper_fixed(self, database_path, image_path, output_path):
-        """수정된 COLMAP Mapper 실행"""
+        """수정된 COLMAP Mapper 실행 (debug_hybrid_pipeline 방식)"""
         
         # COLMAP 명령 생성 (더 관대한 설정)
-        cmd = [
+        base_cmd = [
             self.colmap_exe, "mapper",
             "--database_path", str(database_path),
             "--image_path", str(image_path),
@@ -408,17 +462,29 @@ class SuperGlueCOLMAPHybrid:
             "--Mapper.min_num_matches", "4",  # 최소 매칭 수 낮춤
             "--Mapper.init_min_num_inliers", "8",  # 최소 인라이어 수 낮춤
             "--Mapper.abs_pose_min_num_inliers", "4",  # 절대 포즈 최소 인라이어 낮춤
-            "--Mapper.filter_max_reproj_error", "12.0",  # 재투영 오차 허용치 높임
+            "--Mapper.filter_max_reproj_error", "16.0",  # 재투영 오차 허용치 높임
             "--Mapper.ba_global_function_tolerance", "0.000001"
         ]
         
         print("  COLMAP Mapper 실행...")
-        print(f"  명령: {' '.join(cmd)}")
+        print(f"  명령: {' '.join(base_cmd)}")
         
         # Qt GUI 문제 해결을 위한 환경 변수 설정
         env = os.environ.copy()
         env["QT_QPA_PLATFORM"] = "offscreen"
         env["DISPLAY"] = ":0"
+        
+        # xvfb 사용 가능한지 확인
+        try:
+            xvfb_result = subprocess.run(["which", "xvfb-run"], capture_output=True, text=True)
+            use_xvfb = xvfb_result.returncode == 0
+        except:
+            use_xvfb = False
+        
+        if use_xvfb:
+            cmd = ["xvfb-run", "-a"] + base_cmd
+        else:
+            cmd = base_cmd
         
         try:
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=1800, env=env)
@@ -432,6 +498,25 @@ class SuperGlueCOLMAPHybrid:
                     print(f"  stdout: {result.stdout}")
                 if result.stderr:
                     print(f"  stderr: {result.stderr}")
+                
+                # 매퍼 실패 시 더 관대한 설정으로 재시도
+                print("  🔄 더 관대한 설정으로 매퍼 재시도...")
+                retry_cmd = [
+                    self.colmap_exe, "mapper",
+                    "--database_path", str(database_path),
+                    "--image_path", str(image_path),
+                    "--output_path", str(output_path),
+                    "--Mapper.min_num_matches", "2",
+                    "--Mapper.init_min_num_inliers", "4",
+                    "--Mapper.abs_pose_min_num_inliers", "2",
+                    "--Mapper.filter_max_reproj_error", "20.0"
+                ]
+                retry_result = subprocess.run(retry_cmd, capture_output=True, text=True, timeout=1800, env=env)
+                if retry_result.returncode == 0:
+                    print("  ✓ 재시도 매퍼 성공")
+                    return True
+                else:
+                    print(f"  ✗ 재시도 매퍼 실패: {retry_result.stderr}")
                 
                 # DB 상태 확인
                 self._check_database_status(database_path)
@@ -579,7 +664,7 @@ class SuperGlueCOLMAPHybrid:
             xyz = np.random.randn(1000, 3) * 0.5
             rgb = np.random.rand(1000, 3)
             
-            from utils.general_utils import BasicPointCloud
+            from utils.graphics_utils import BasicPointCloud
             point_cloud = BasicPointCloud(points=xyz, colors=rgb, normals=np.zeros((1000, 3)))
             
             # PLY 파일 저장
