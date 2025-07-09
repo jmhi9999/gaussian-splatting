@@ -325,8 +325,7 @@ class SuperGlueCOLMAPHybrid:
     def _create_default_scene_info(self, image_paths, output_path):
         """기본 SceneInfo 생성 (COLMAP 실패시 fallback)"""
         try:
-            from scene.camera_info import CameraInfo
-            from scene.scene_info import SceneInfo
+            from scene.dataset_readers import CameraInfo, SceneInfo
             from utils.graphics_utils import focal2fov
             import numpy as np
             
@@ -368,11 +367,13 @@ class SuperGlueCOLMAPHybrid:
                     T=T,
                     FovY=FovY,
                     FovX=FovX,
-                    image=None,
+                    depth_params=None,
                     image_path=str(image_path),
                     image_name=image_path.name,
+                    depth_path="",
                     width=width,
-                    height=height
+                    height=height,
+                    is_test=(i % 5 == 0)
                 )
                 
                 if i % 5 == 0:
@@ -390,7 +391,8 @@ class SuperGlueCOLMAPHybrid:
                 train_cameras=cam_infos,
                 test_cameras=test_cam_infos,
                 nerf_normalization=nerf_normalization,
-                ply_path=None
+                ply_path="",
+                is_nerf_synthetic=False
             )
             
             print(f"  ✓ 기본 SceneInfo 생성 완료")
@@ -720,8 +722,7 @@ class SuperGlueCOLMAPHybrid:
     def _read_colmap_scene_info_custom(self, path, images="images", eval=False):
         """자체 COLMAP SceneInfo 로더 구현"""
         try:
-            from scene.camera_info import CameraInfo
-            from scene.scene_info import SceneInfo
+            from scene.dataset_readers import CameraInfo, SceneInfo
             from utils.graphics_utils import getWorld2View2, focal2fov, fov2focal
             import numpy as np
             
@@ -786,11 +787,13 @@ class SuperGlueCOLMAPHybrid:
                     T=T,
                     FovY=FovY,
                     FovX=FovX,
-                    image=None,  # 나중에 로드
+                    depth_params=None,
                     image_path=str(image_path),
                     image_name=image_path.name,
+                    depth_path="",
                     width=width,
-                    height=height
+                    height=height,
+                    is_test=(i % 5 == 0)
                 )
                 
                 # train/test 분할 (8:2)
