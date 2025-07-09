@@ -241,7 +241,8 @@ class SuperGlueCOLMAPHybrid:
                 model INTEGER NOT NULL,
                 width INTEGER NOT NULL,
                 height INTEGER NOT NULL,
-                params BLOB NOT NULL
+                params BLOB NOT NULL,
+                prior_focal_length INTEGER NOT NULL
             )
         ''')
         
@@ -314,8 +315,8 @@ class SuperGlueCOLMAPHybrid:
         params = np.array([fx, fy, cx, cy], dtype=np.float64)
         
         cursor.execute(
-            "INSERT INTO cameras (camera_id, model, width, height, params) VALUES (?, ?, ?, ?, ?)",
-            (1, 1, width, height, params.tobytes())
+            "INSERT INTO cameras (camera_id, model, width, height, params, prior_focal_length) VALUES (?, ?, ?, ?, ?, ?)",
+            (1, 1, width, height, params.tobytes(), int(fx))
         )
         
         print(f"  카메라 추가: {width}x{height}, focal={fx:.1f}")
@@ -323,24 +324,27 @@ class SuperGlueCOLMAPHybrid:
     
     def _add_dummy_keypoints(self, cursor, image_id):
         """더미 키포인트 추가 (COLMAP 호환성)"""
-        # 더미 키포인트 생성 (코너점들)
-        keypoints = np.array([
-            [10, 10], [50, 10], [10, 50], [50, 50]
-        ], dtype=np.float32)
+        # 더 많은 더미 키포인트 생성 (격자 패턴)
+        keypoints = []
+        for i in range(0, 640, 50):
+            for j in range(0, 480, 50):
+                keypoints.append([i, j])
+        
+        keypoints = np.array(keypoints, dtype=np.float32)
         
         # 더미 디스크립터 (128차원)
-        descriptors = np.random.randint(0, 255, (4, 128), dtype=np.uint8)
+        descriptors = np.random.randint(0, 255, (len(keypoints), 128), dtype=np.uint8)
         
         # 키포인트 추가
         cursor.execute(
             "INSERT INTO keypoints (image_id, rows, cols, data) VALUES (?, ?, ?, ?)",
-            (image_id, 4, 2, keypoints.tobytes())
+            (image_id, len(keypoints), 2, keypoints.tobytes())
         )
         
         # 디스크립터 추가
         cursor.execute(
             "INSERT INTO descriptors (image_id, rows, cols, data) VALUES (?, ?, ?, ?)",
-            (image_id, 4, 128, descriptors.tobytes())
+            (image_id, len(keypoints), 128, descriptors.tobytes())
         )
     
     def _run_colmap_feature_extraction(self, database_path, image_path):
@@ -565,9 +569,9 @@ class SuperGlueCOLMAPHybrid:
                 
                 cam_info = CameraInfo(
                     uid=i, R=R, T=T, FovY=fov_y, FovX=fov_x,
-                    image=image, image_path=str(img_path), 
-                    image_name=img_path.name, width=width, height=height,
-                    depth_params=None, depth_path="", is_test=(i % 8 == 0)
+                    depth_params=None, image_path=str(img_path), 
+                    image_name=img_path.name, depth_path="", width=width, height=height,
+                    is_test=(i % 8 == 0)
                 )
                 train_cameras.append(cam_info)
             
