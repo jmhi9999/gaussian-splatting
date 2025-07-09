@@ -58,6 +58,7 @@ class ModelParams(ParamGroup):
         self.scene_type = "SuperGlue"  # "Colmap", "Blender", "SuperGlue", "SuperGlueCOLMAPHybrid"
         self.superglue_config = "indoor"  # "indoor" or "outdoor"
         self.max_images = 100  # SuperGlue용 최대 이미지 수
+        self.colmap_exe = "colmap"  # COLMAP 실행 파일 경로
         self.eval = False
         super().__init__(parser, "Loading Parameters", sentinel)
 

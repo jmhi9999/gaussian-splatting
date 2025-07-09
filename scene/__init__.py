@@ -63,7 +63,8 @@ class Scene:
                 args.eval, 
                 args.train_test_exp,
                 superglue_config=getattr(args, 'superglue_config', 'outdoor'),
-                max_images=getattr(args, 'max_images', 100)
+                max_images=getattr(args, 'max_images', 100),
+                colmap_exe=getattr(args, 'colmap_exe', 'colmap')
             )
         elif os.path.exists(os.path.join(args.source_path, "sparse")):
             print("Found COLMAP sparse reconstruction")

@@ -194,7 +194,7 @@ def readSuperGlueSceneInfo(path, images="images", eval=False, train_test_exp=Fal
     return _create_fallback_scene_info(images_folder, max_images)
 
 def readSuperGlueCOLMAPHybridSceneInfo(path, images="images", eval=False, train_test_exp=False, 
-                                      llffhold=8, superglue_config="outdoor", max_images=100):
+                                      llffhold=8, superglue_config="outdoor", max_images=100, colmap_exe="colmap"):
     """SuperGlue + COLMAP 하이브리드 파이프라인으로 SceneInfo 생성"""
     
     print("\n" + "="*60)
@@ -205,6 +205,7 @@ def readSuperGlueCOLMAPHybridSceneInfo(path, images="images", eval=False, train_
     print(f"🖼️  Images folder: {images}")
     print(f"🔧 SuperGlue config: {superglue_config}")
     print(f"📊 Max images: {max_images}")
+    print(f"🔧 COLMAP exe: {colmap_exe}")
     print(f"🚀 Hybrid pipeline available: {SUPERGLUE_COLMAP_HYBRID_AVAILABLE}")
     
     # 이미지 디렉토리 경로
@@ -228,7 +229,7 @@ def readSuperGlueCOLMAPHybridSceneInfo(path, images="images", eval=False, train_
             
             # 하이브리드 파이프라인 실행
             pipeline = SuperGlueCOLMAPHybrid(
-                colmap_exe="colmap",
+                colmap_exe=colmap_exe,
                 device="cuda" if torch.cuda.is_available() else "cpu"
             )
             

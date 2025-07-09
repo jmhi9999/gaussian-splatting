@@ -24,6 +24,8 @@ def main():
                        help="3DGS 학습 반복 수 (기본값: 30000)")
     parser.add_argument("--device", type=str, default="cuda",
                        help="GPU 디바이스 (기본값: cuda)")
+    parser.add_argument("--colmap_exe", type=str, default="colmap",
+                       help="COLMAP 실행 파일 경로 (기본값: colmap)")
     parser.add_argument("--skip_training", action="store_true",
                        help="SfM만 실행하고 3DGS 학습은 건너뛰기")
     
@@ -66,6 +68,7 @@ def main():
         "--max_images", str(args.max_images),
         "--data_device", args.device,
         "--iterations", str(args.iterations),
+        "--colmap_exe", args.colmap_exe,  # COLMAP 경로 추가
         "--quiet"  # 출력 줄이기
     ]
     
