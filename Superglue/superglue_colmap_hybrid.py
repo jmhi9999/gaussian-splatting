@@ -11,6 +11,8 @@ import subprocess
 import os
 import tempfile
 from collections import defaultdict
+import argparse
+import sys
 
 class SuperGlueCOLMAPHybrid:
     """SuperGlue 특징점 + COLMAP SfM 하이브리드 시스템"""
@@ -79,6 +81,9 @@ class SuperGlueCOLMAPHybrid:
         # 1. 이미지 수집 및 복사
         print("\n[1/5] 이미지 수집...")
         image_paths = self._collect_images(image_dir, max_images)
+        if len(image_paths) == 0:
+            raise RuntimeError("처리할 이미지를 찾을 수 없습니다")
+        
         input_dir = self._prepare_input_images(image_paths, output_path)
         
         # 2. SuperGlue 특징점 추출 및 매칭
@@ -509,10 +514,9 @@ class SuperGlueCOLMAPHybrid:
     
     def _convert_to_3dgs_format(self, colmap_path):
         """COLMAP 결과를 3DGS SceneInfo로 변환"""
-        from scene.dataset_readers import readColmapSceneInfo
-        
         try:
             # COLMAP 데이터 읽기
+            from scene.dataset_readers import readColmapSceneInfo
             scene_info = readColmapSceneInfo(str(colmap_path), "images", eval=False)
             
             print(f"  ✓ 3DGS 변환 완료")
@@ -525,19 +529,52 @@ class SuperGlueCOLMAPHybrid:
             print(f"  오류: 3DGS 변환 실패: {e}")
             return None
 
-# 사용 예시
-if __name__ == "__main__":
-    # 하이브리드 파이프라인 초기화
-    pipeline = SuperGlueCOLMAPHybrid(colmap_exe="colmap")
+def main():
+    """메인 실행 함수"""
+    parser = argparse.ArgumentParser(description="SuperGlue + COLMAP 하이브리드 파이프라인")
+    parser.add_argument("--image_dir", type=str, required=True, 
+                       help="입력 이미지 디렉토리")
+    parser.add_argument("--output_dir", type=str, required=True,
+                       help="출력 디렉토리")
+    parser.add_argument("--max_images", type=int, default=100,
+                       help="최대 처리 이미지 수 (기본값: 100)")
+    parser.add_argument("--colmap_exe", type=str, default="colmap",
+                       help="COLMAP 실행 파일 경로 (기본값: colmap)")
+    parser.add_argument("--device", type=str, default="cuda",
+                       help="GPU 디바이스 (기본값: cuda)")
+    
+    args = parser.parse_args()
+    
+    # 파이프라인 초기화
+    try:
+        pipeline = SuperGlueCOLMAPHybrid(
+            colmap_exe=args.colmap_exe,
+            device=args.device
+        )
+    except Exception as e:
+        print(f"✗ 파이프라인 초기화 실패: {e}")
+        sys.exit(1)
     
     # 이미지 처리
-    scene_info = pipeline.process_images(
-        image_dir="path/to/your/images",
-        output_dir="path/to/output",
-        max_images=100
-    )
-    
-    if scene_info:
-        print("\n🎉 성공! 3DGS 학습 준비 완료")
-        print("다음 명령으로 3DGS 학습:")
-        print("python train.py -s path/to/output")
+    try:
+        scene_info = pipeline.process_images(
+            image_dir=args.image_dir,
+            output_dir=args.output_dir,
+            max_images=args.max_images
+        )
+        
+        if scene_info:
+            print("\n🎉 성공! 3DGS 학습 준비 완료")
+            print(f"결과 디렉토리: {args.output_dir}")
+            print("\n다음 명령으로 3DGS 학습:")
+            print(f"python train.py -s {args.output_dir}")
+        else:
+            print("\n❌ 실패: 3DGS 변환에 실패했습니다")
+            sys.exit(1)
+            
+    except Exception as e:
+        print(f"\n❌ 오류: {e}")
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()

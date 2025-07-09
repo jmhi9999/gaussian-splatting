@@ -55,6 +55,16 @@ class Scene:
                 superglue_config=getattr(args, 'superglue_config', 'outdoor'),
                 max_images=getattr(args, 'max_images', 100)
             )
+        elif args.scene_type == "SuperGlueCOLMAPHybrid":
+            print("Loading scene with SuperGlue + COLMAP hybrid pipeline...")
+            scene_info = sceneLoadTypeCallbacks["SuperGlueCOLMAPHybrid"](
+                args.source_path, 
+                args.images, 
+                args.eval, 
+                args.train_test_exp,
+                superglue_config=getattr(args, 'superglue_config', 'outdoor'),
+                max_images=getattr(args, 'max_images', 100)
+            )
         elif os.path.exists(os.path.join(args.source_path, "sparse")):
             print("Found COLMAP sparse reconstruction")
             scene_info = sceneLoadTypeCallbacks["Colmap"](

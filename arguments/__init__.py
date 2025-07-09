@@ -55,7 +55,7 @@ class ModelParams(ParamGroup):
         self._white_background = False
         self.train_test_exp = False
         self.data_device = "cuda"
-        self.scene_type = "SuperGlue"  # "Colmap", "Blender", "SuperGlue"
+        self.scene_type = "SuperGlue"  # "Colmap", "Blender", "SuperGlue", "SuperGlueCOLMAPHybrid"
         self.superglue_config = "indoor"  # "indoor" or "outdoor"
         self.max_images = 100  # SuperGlue용 최대 이미지 수
         self.eval = False
