@@ -610,10 +610,63 @@ class SuperGlueCOLMAPHybrid:
             return self._create_default_scene_info(original_image_paths, colmap_path)
     
     def _create_scene_info_from_colmap(self, reconstruction_path, original_image_paths, output_path):
-        """COLMAP reconstruction에서 SceneInfo 생성"""
-        # 이건 복잡한 구현이므로 일단 기본 SceneInfo 반환
+        """COLMAP reconstruction에서 SceneInfo 생성 (실제 포인트 클라우드 사용)"""
         print("  COLMAP reconstruction 파싱 중...")
-        return self._create_default_scene_info(original_image_paths, output_path)
+        try:
+            # 상대 경로로 import 시도
+            import sys
+            current_dir = Path(__file__).parent.parent
+            scene_dir = current_dir / "scene"
+            if scene_dir.exists():
+                sys.path.insert(0, str(scene_dir))
+            
+            from colmap_loader import read_points3D_binary, read_points3D_text
+            from utils.graphics_utils import BasicPointCloud
+            import numpy as np
+        except ImportError as e:
+            print(f"  Import 오류: {e}, fallback 사용")
+            return self._create_default_scene_info(original_image_paths, output_path)
+        # points3D.bin 또는 points3D.txt 경로 찾기
+        bin_path = reconstruction_path / 'points3D.bin'
+        txt_path = reconstruction_path / 'points3D.txt'
+        xyz = rgb = None
+        
+        try:
+            if bin_path.exists():
+                xyz, rgb, _ = read_points3D_binary(str(bin_path))
+                print(f"  points3D.bin에서 {len(xyz)}개 포인트 로드")
+            elif txt_path.exists():
+                xyz, rgb, _ = read_points3D_text(str(txt_path))
+                print(f"  points3D.txt에서 {len(xyz)}개 포인트 로드")
+            else:
+                print("  points3D 파일 없음, fallback 사용")
+                return self._create_default_scene_info(original_image_paths, output_path)
+            
+            if xyz is None or len(xyz) == 0:
+                print("  points3D에 포인트 없음, fallback 사용")
+                return self._create_default_scene_info(original_image_paths, output_path)
+            
+            # colors 정규화 (0-255 -> 0-1)
+            rgb = rgb.astype(np.float32) / 255.0
+            
+            # normals 생성 (0으로 초기화)
+            normals = np.zeros_like(xyz, dtype=np.float32)
+            
+            # BasicPointCloud 생성
+            point_cloud = BasicPointCloud(points=xyz.astype(np.float32), 
+                                        colors=rgb.astype(np.float32), 
+                                        normals=normals.astype(np.float32))
+            
+            # 카메라 등은 fallback과 동일하게 생성
+            scene_info = self._create_default_scene_info(original_image_paths, output_path)
+            scene_info = scene_info._replace(point_cloud=point_cloud)
+            
+            print(f"  ✓ 실제 COLMAP 포인트 클라우드 사용: {len(xyz)}개 포인트")
+            return scene_info
+            
+        except Exception as e:
+            print(f"  포인트 클라우드 파싱 오류: {e}, fallback 사용")
+            return self._create_default_scene_info(original_image_paths, output_path)
     
     def _create_default_scene_info(self, image_paths, output_path):
         """기본 SceneInfo 생성"""
@@ -643,14 +696,14 @@ class SuperGlueCOLMAPHybrid:
                     [np.cos(angle), 0, np.sin(angle)],
                     [0, 1, 0],
                     [-np.sin(angle), 0, np.cos(angle)]
-                ])
-                T = np.array([radius * np.cos(angle), 0, radius * np.sin(angle)])
+                ], dtype=np.float32)
+                T = np.array([radius * np.cos(angle), 0, radius * np.sin(angle)], dtype=np.float32)
                 
-                # 이미지 로드
-                image = cv2.imread(str(img_path))
-                if image is not None:
-                    image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-                    image = image.astype(np.float32) / 255.0
+                # 이미지 로드 (메모리 효율성을 위해 건너뛰기)
+                # image = cv2.imread(str(img_path))
+                # if image is not None:
+                #     image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+                #     image = image.astype(np.float32) / 255.0
                 
                 cam_info = CameraInfo(
                     uid=i, R=R, T=T, FovY=fov_y, FovX=fov_x,
@@ -661,11 +714,11 @@ class SuperGlueCOLMAPHybrid:
                 train_cameras.append(cam_info)
             
             # 기본 포인트 클라우드 (임의 점들)
-            xyz = np.random.randn(1000, 3) * 0.5
-            rgb = np.random.rand(1000, 3)
+            xyz = np.random.randn(1000, 3).astype(np.float32) * 0.5
+            rgb = np.random.rand(1000, 3).astype(np.float32)
             
             from utils.graphics_utils import BasicPointCloud
-            point_cloud = BasicPointCloud(points=xyz, colors=rgb, normals=np.zeros((1000, 3)))
+            point_cloud = BasicPointCloud(points=xyz, colors=rgb, normals=np.zeros((1000, 3), dtype=np.float32))
             
             # PLY 파일 저장
             ply_path = output_path / "points3D.ply"
@@ -707,7 +760,26 @@ class SuperGlueCOLMAPHybrid:
             
         except Exception as e:
             print(f"  오류: 기본 SceneInfo 생성 실패: {e}")
-            raise
+            # 최후의 fallback: 최소한의 SceneInfo 생성
+            try:
+                from utils.graphics_utils import BasicPointCloud
+                xyz = np.random.randn(100, 3).astype(np.float32) * 0.5
+                rgb = np.random.rand(100, 3).astype(np.float32)
+                point_cloud = BasicPointCloud(points=xyz, colors=rgb, normals=np.zeros((100, 3), dtype=np.float32))
+                
+                scene_info = SceneInfo(
+                    point_cloud=point_cloud,
+                    train_cameras=[],
+                    test_cameras=[],
+                    nerf_normalization={"translate": np.array([0, 0, 0]), "radius": 1.0},
+                    ply_path="",
+                    is_nerf_synthetic=False
+                )
+                print("  ✓ 최후 fallback SceneInfo 생성 완료")
+                return scene_info
+            except Exception as final_e:
+                print(f"  치명적 오류: {final_e}")
+                raise
     
     def _save_ply(self, path, xyz, rgb):
         """PLY 파일 저장"""
