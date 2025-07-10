@@ -104,6 +104,21 @@ class SuperGlueCOLMAPHybrid:
                     _ = self.superpoint({'image': test_tensor})
                 print("  ✓ SuperPoint 테스트 성공")
                 
+                # SuperGlue 테스트
+                test_data = {
+                    'image0': test_tensor,
+                    'image1': test_tensor,
+                    'keypoints0': torch.zeros(1, 10, 2).to(self.device),
+                    'keypoints1': torch.zeros(1, 10, 2).to(self.device),
+                    'scores0': torch.zeros(1, 10).to(self.device),
+                    'scores1': torch.zeros(1, 10).to(self.device),
+                    'descriptors0': torch.zeros(1, 10, 256).to(self.device),
+                    'descriptors1': torch.zeros(1, 10, 256).to(self.device),
+                }
+                with torch.no_grad():
+                    _ = self.superglue(test_data)
+                print("  ✓ SuperGlue 테스트 성공")
+                
             except Exception as e:
                 print(f"  ✗ 모델 로드/테스트 실패: {e}")
                 print("  COLMAP-only 모드로 실행됩니다")
@@ -407,6 +422,192 @@ class SuperGlueCOLMAPHybrid:
             else:
                 return descriptors.astype(np.uint8)
 
+    def _match_single_pair(self, image_path1, image_path2):
+        """두 이미지 간 SuperGlue 매칭 수행"""
+        try:
+            print(f"        🔍 SuperGlue 매칭: {image_path1.name} ↔ {image_path2.name}")
+            
+            # 이미지 로드 및 전처리
+            img1 = self._load_and_preprocess_image(image_path1)
+            img2 = self._load_and_preprocess_image(image_path2)
+            
+            if img1 is None or img2 is None:
+                print(f"        ❌ 이미지 로드 실패")
+                return None
+            
+            # SuperPoint 특징점 추출
+            pred1 = self._extract_superpoint_features_for_matching(img1)
+            pred2 = self._extract_superpoint_features_for_matching(img2)
+            
+            if pred1 is None or pred2 is None:
+                print(f"        ❌ SuperPoint 특징점 추출 실패")
+                return None
+            
+            # SuperGlue 매칭
+            matches = self._run_superglue_matching_on_pair(pred1, pred2)
+            
+            if matches is not None and len(matches) > 0:
+                print(f"        ✅ {len(matches)}개 매칭 발견")
+                return matches
+            else:
+                print(f"        ❌ 매칭 실패")
+                return None
+                
+        except Exception as e:
+            print(f"        ❌ 매칭 오류: {e}")
+            return None
+
+    def _load_and_preprocess_image(self, image_path):
+        """이미지 로드 및 전처리"""
+        try:
+            img = cv2.imread(str(image_path))
+            if img is None:
+                return None
+            
+            h, w = img.shape[:2]
+            
+            # 큰 이미지 리사이즈
+            if h > 1600 or w > 1600:
+                scale = min(1600/w, 1600/h)
+                new_w, new_h = int(w * scale), int(h * scale)
+                img = cv2.resize(img, (new_w, new_h))
+            
+            # 그레이스케일 변환
+            if len(img.shape) == 3:
+                img_gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            else:
+                img_gray = img
+            
+            return img_gray
+            
+        except Exception as e:
+            print(f"        ❌ 이미지 전처리 오류: {e}")
+            return None
+
+    def _extract_superpoint_features_for_matching(self, img_gray):
+        """매칭용 SuperPoint 특징점 추출"""
+        try:
+            # 텐서 변환
+            img_tensor = torch.from_numpy(img_gray).float().to(self.device) / 255.0
+            img_tensor = img_tensor.unsqueeze(0).unsqueeze(0)  # (1, 1, H, W)
+            
+            # SuperPoint 추론
+            with torch.no_grad():
+                pred = self.superpoint({'image': img_tensor})
+                keypoints = pred['keypoints'][0].cpu().numpy()  # (N, 2)
+                scores = pred['scores'][0].cpu().numpy()  # (N,)
+                descriptors = pred['descriptors'][0].cpu().numpy()  # (256, N)
+            
+            # descriptor transpose
+            if len(descriptors.shape) == 2 and descriptors.shape[0] == 256:
+                descriptors = descriptors.T  # (N, 256)
+            
+            # 최소 특징점 수 확인
+            if len(keypoints) < 10:
+                print(f"        ⚠️  특징점 부족: {len(keypoints)}개")
+                return None
+            
+            # 메모리 정리
+            del img_tensor
+            if self.device == "cuda":
+                torch.cuda.empty_cache()
+            
+            return {
+                'keypoints': keypoints,
+                'scores': scores,
+                'descriptors': descriptors
+            }
+            
+        except Exception as e:
+            print(f"        ❌ SuperPoint 추출 오류: {e}")
+            return None
+
+    def _run_superglue_matching_on_pair(self, pred1, pred2):
+        """SuperGlue를 사용한 두 이미지 간 매칭"""
+        try:
+            # 입력 데이터 준비
+            data = {
+                'image0': torch.zeros(1, 1, 480, 640).to(self.device),  # 더미 이미지
+                'image1': torch.zeros(1, 1, 480, 640).to(self.device),  # 더미 이미지
+                'keypoints0': torch.from_numpy(pred1['keypoints']).unsqueeze(0).to(self.device),
+                'keypoints1': torch.from_numpy(pred2['keypoints']).unsqueeze(0).to(self.device),
+                'scores0': torch.from_numpy(pred1['scores']).unsqueeze(0).to(self.device),
+                'scores1': torch.from_numpy(pred2['scores']).unsqueeze(0).to(self.device),
+                'descriptors0': torch.from_numpy(pred1['descriptors']).unsqueeze(0).to(self.device),
+                'descriptors1': torch.from_numpy(pred2['descriptors']).unsqueeze(0).to(self.device),
+            }
+            
+            # SuperGlue 추론
+            with torch.no_grad():
+                pred = self.superglue(data)
+                matches = pred['matches0'][0].cpu().numpy()  # (N,)
+                confidence = pred['matching_scores0'][0].cpu().numpy()  # (N,)
+            
+            # 메모리 정리
+            del data
+            if self.device == "cuda":
+                torch.cuda.empty_cache()
+            
+            # 유효한 매칭 필터링
+            valid_matches = []
+            for i, match_idx in enumerate(matches):
+                if match_idx != -1:  # -1은 매칭되지 않음을 의미
+                    confidence_score = confidence[i]
+                    if confidence_score > self.superglue_config['match_threshold']:
+                        valid_matches.append([i, match_idx])
+            
+            if len(valid_matches) > 0:
+                print(f"        ✅ SuperGlue 매칭: {len(valid_matches)}개 (임계값: {self.superglue_config['match_threshold']})")
+                return np.array(valid_matches, dtype=np.int32)
+            else:
+                print(f"        ⚠️  SuperGlue 매칭 부족, fallback 시도...")
+                # SuperGlue 실패시 간단한 descriptor 매칭으로 fallback
+                return self._fallback_descriptor_matching(pred1, pred2)
+                
+        except Exception as e:
+            print(f"        ❌ SuperGlue 매칭 오류: {e}")
+            # fallback 매칭 시도
+            return self._fallback_descriptor_matching(pred1, pred2)
+
+    def _fallback_descriptor_matching(self, pred1, pred2):
+        """간단한 descriptor 매칭 fallback"""
+        try:
+            print(f"        🔄 Fallback descriptor 매칭 시도...")
+            
+            desc1 = pred1['descriptors']  # (N1, 256)
+            desc2 = pred2['descriptors']  # (N2, 256)
+            
+            # L2 거리 계산
+            desc1_norm = desc1 / (np.linalg.norm(desc1, axis=1, keepdims=True) + 1e-8)
+            desc2_norm = desc2 / (np.linalg.norm(desc2, axis=1, keepdims=True) + 1e-8)
+            
+            # 모든 쌍의 거리 계산
+            distances = np.zeros((desc1.shape[0], desc2.shape[0]))
+            for i in range(desc1.shape[0]):
+                for j in range(desc2.shape[0]):
+                    distances[i, j] = np.linalg.norm(desc1_norm[i] - desc2_norm[j])
+            
+            # 최근접 이웃 매칭
+            matches = []
+            for i in range(desc1.shape[0]):
+                best_j = np.argmin(distances[i])
+                best_distance = distances[i, best_j]
+                
+                # 거리 임계값 체크
+                if best_distance < 0.8:  # 더 관대한 임계값
+                    matches.append([i, best_j])
+            
+            if len(matches) > 0:
+                print(f"        ✅ Fallback 매칭: {len(matches)}개")
+                return np.array(matches, dtype=np.int32)
+            else:
+                print(f"        ❌ Fallback 매칭도 실패")
+                return None
+                
+        except Exception as e:
+            print(f"        ❌ Fallback 매칭 오류: {e}")
+            return None
+
     # 나머지 메서드들은 기존과 동일하게 유지...
     def process_images(self, image_dir: str, output_dir: str, max_images: int = 100):
         """메인 처리 메서드"""
@@ -668,6 +869,18 @@ class SuperGlueCOLMAPHybrid:
             
             print(f"    {len(image_paths)}장 이미지에서 매칭 수행...")
             
+            # 이미지 ID 매핑 생성
+            image_id_map = {}
+            cursor.execute("SELECT image_id, name FROM images ORDER BY image_id")
+            for image_id, name in cursor.fetchall():
+                # image_0000.jpg -> 0
+                try:
+                    idx = int(name.split('_')[1].split('.')[0])
+                    image_id_map[idx] = image_id
+                except:
+                    continue
+            
+            # 매칭 수행
             for i in range(len(image_paths)):
                 for j in range(i + 1, min(i + 5, len(image_paths))):  # 인접한 5장씩만
                     total_pairs += 1
@@ -677,15 +890,18 @@ class SuperGlueCOLMAPHybrid:
                     
                     if matches is not None and len(matches) >= 10:  # 최소 10개 매칭
                         # COLMAP DB에 저장
-                        pair_id = i * len(image_paths) + j
-                        
-                        cursor.execute(
-                            "INSERT INTO matches (pair_id, rows, cols, data) VALUES (?, ?, ?, ?)",
-                            (pair_id, len(matches), 2, matches.tobytes())
-                        )
-                        
-                        print(f"        ✅ {len(matches)}개 매칭 저장")
-                        successful_matches += 1
+                        if i in image_id_map and j in image_id_map:
+                            pair_id = image_id_map[i] * 2147483647 + image_id_map[j]  # COLMAP pair_id 형식
+                            
+                            cursor.execute(
+                                "INSERT INTO matches (pair_id, rows, cols, data) VALUES (?, ?, ?, ?)",
+                                (pair_id, len(matches), 2, matches.tobytes())
+                            )
+                            
+                            print(f"        ✅ {len(matches)}개 매칭 저장 (pair_id: {pair_id})")
+                            successful_matches += 1
+                        else:
+                            print(f"        ❌ 이미지 ID 매핑 실패")
                     else:
                         print(f"        ❌ 매칭 실패 또는 부족")
             
