@@ -276,6 +276,7 @@ class SuperGlueCOLMAPHybrid:
             cursor.execute("SELECT image_id, name FROM images ORDER BY image_id")
             images = cursor.fetchall()
             
+            successful_extractions = 0
             for image_id, image_name in images:
                 # 이미지 로드
                 img_path = input_dir / image_name
@@ -295,8 +296,10 @@ class SuperGlueCOLMAPHybrid:
                 # SuperPoint 특징점 추출
                 keypoints, descriptors = self._extract_single_superpoint_features(original_img_path)
                 
-                if keypoints is not None and len(keypoints) > 0:
-                    # COLMAP DB에 저장
+                if keypoints is not None and len(keypoints) > 0 and descriptors is not None:
+                    # COLMAP DB에 저장 (descriptor 차원을 128로 고정)
+                    descriptor_dim = descriptors.shape[1] if len(descriptors.shape) > 1 else 128
+                    
                     cursor.execute(
                         "INSERT INTO keypoints (image_id, rows, cols, data) VALUES (?, ?, ?, ?)",
                         (image_id, len(keypoints), 2, keypoints.tobytes())
@@ -304,16 +307,22 @@ class SuperGlueCOLMAPHybrid:
                     
                     cursor.execute(
                         "INSERT INTO descriptors (image_id, rows, cols, data) VALUES (?, ?, ?, ?)",
-                        (image_id, len(descriptors), 256, descriptors.tobytes())
+                        (image_id, len(descriptors), descriptor_dim, descriptors.tobytes())
                     )
                     
-                    print(f"    {image_name}: {len(keypoints)}개 키포인트")
+                    print(f"    {image_name}: {len(keypoints)}개 키포인트 ({descriptor_dim}차원)")
+                    successful_extractions += 1
                 else:
                     print(f"    {image_name}: 키포인트 추출 실패")
             
             conn.commit()
             conn.close()
-            print("  ✓ SuperPoint 특징점 추출 완료")
+            
+            if successful_extractions > 0:
+                print(f"  ✓ SuperPoint 특징점 추출 완료 ({successful_extractions}개)")
+            else:
+                print("  ⚠️  SuperPoint 추출 실패, COLMAP SIFT로 fallback...")
+                self._run_colmap_feature_extraction(database_path, input_dir)
             
         except Exception as e:
             print(f"  오류: SuperPoint 특징점 추출 실패: {e}")
@@ -342,11 +351,36 @@ class SuperGlueCOLMAPHybrid:
                 keypoints = pred['keypoints'][0].cpu().numpy()  # (N, 2)
                 descriptors = pred['descriptors'][0].cpu().numpy()  # (N, 256)
             
+            # COLMAP SIFT 형식으로 변환 (256 -> 128)
+            if descriptors.shape[1] == 256:
+                # PCA를 사용하여 256차원을 128차원으로 축소
+                descriptors_128 = self._convert_descriptors_to_sift_format(descriptors)
+                return keypoints, descriptors_128
+            
             return keypoints, descriptors
             
         except Exception as e:
             print(f"    SuperPoint 추출 오류: {e}")
             return None, None
+    
+    def _convert_descriptors_to_sift_format(self, descriptors):
+        """SuperPoint descriptor를 COLMAP SIFT 형식으로 변환"""
+        try:
+            # 간단한 차원 축소: 256차원을 128차원으로 평균화
+            n_features = descriptors.shape[0]
+            descriptors_128 = np.zeros((n_features, 128), dtype=np.float32)
+            
+            for i in range(n_features):
+                # 256차원을 2개씩 묶어서 평균
+                for j in range(128):
+                    descriptors_128[i, j] = (descriptors[i, j*2] + descriptors[i, j*2+1]) / 2.0
+            
+            return descriptors_128
+            
+        except Exception as e:
+            print(f"    Descriptor 변환 오류: {e}")
+            # 변환 실패 시 원본 반환
+            return descriptors[:, :128] if descriptors.shape[1] >= 128 else descriptors
     
     def _run_superglue_matching(self, image_paths, database_path):
         """SuperGlue로 매칭하고 COLMAP DB에 저장"""
@@ -361,14 +395,19 @@ class SuperGlueCOLMAPHybrid:
             conn = sqlite3.connect(str(database_path))
             cursor = conn.cursor()
             
-            # 이미지 쌍 생성
+            # 기존 matches 테이블 정리
+            cursor.execute("DELETE FROM matches")
+            conn.commit()
+            
+            # 이미지 쌍 생성 (더 많은 쌍 생성)
             image_pairs = []
             for i in range(len(image_paths)):
-                for j in range(i + 1, min(i + 5, len(image_paths))):  # 인접한 5개 이미지만 매칭
+                for j in range(i + 1, min(i + 10, len(image_paths))):  # 인접한 10개 이미지까지 매칭
                     image_pairs.append((i, j))
             
             print(f"  {len(image_pairs)}개 이미지 쌍 매칭...")
             
+            successful_matches = 0
             for pair_idx, (i, j) in enumerate(image_pairs):
                 # 이미지 ID 가져오기
                 cursor.execute("SELECT image_id FROM images ORDER BY image_id")
@@ -382,20 +421,33 @@ class SuperGlueCOLMAPHybrid:
                 # SuperGlue 매칭
                 matches = self._match_single_pair(image_paths[i], image_paths[j])
                 
-                if matches is not None and len(matches) > 0:
-                    # COLMAP DB에 저장
+                if matches is not None and len(matches) >= 4:  # 최소 4개 매칭 필요
+                    # COLMAP DB에 저장 (pair_id는 0부터 시작하는 연속된 정수)
                     cursor.execute(
                         "INSERT INTO matches (pair_id, rows, cols, data) VALUES (?, ?, ?, ?)",
-                        (pair_idx, len(matches), 2, matches.tobytes())
+                        (successful_matches, len(matches), 2, matches.tobytes())
                     )
                     
-                    print(f"    쌍 {i}-{j}: {len(matches)}개 매칭")
+                    print(f"    쌍 {i}-{j}: {len(matches)}개 매칭 (pair_id: {successful_matches})")
+                    successful_matches += 1
                 else:
-                    print(f"    쌍 {i}-{j}: 매칭 실패")
+                    print(f"    쌍 {i}-{j}: 매칭 실패 또는 부족 ({len(matches) if matches is not None else 0}개)")
             
+            # two_view_geometry 테이블 생성 (COLMAP이 필요로 함)
             conn.commit()
             conn.close()
-            print("  ✓ SuperGlue 매칭 완료")
+            
+            if successful_matches > 0:
+                print(f"  ✓ SuperGlue 매칭 완료 ({successful_matches}개 성공)")
+                # COLMAP exhaustive_matcher로 two_view_geometries 생성
+                print("  COLMAP exhaustive_matcher로 two_view_geometries 생성...")
+                if not self._run_colmap_exhaustive_matcher(database_path):
+                    print("  ⚠️  exhaustive_matcher 실패, COLMAP SIFT로 fallback...")
+                    self._run_colmap_feature_extraction_fallback(database_path)
+                    self._run_colmap_matching_fallback(database_path)
+            else:
+                print("  ⚠️  성공한 매칭이 없음, COLMAP 매칭으로 fallback...")
+                self._run_colmap_matching(database_path)
             
         except Exception as e:
             print(f"  오류: SuperGlue 매칭 실패: {e}")
@@ -466,6 +518,11 @@ class SuperGlueCOLMAPHybrid:
                     if j < len(indices1) and indices1[j] == i:
                         valid_matches.append([i, j])
             
+            # 최소 매칭 수 확인
+            if len(valid_matches) < 4:
+                print(f"      매칭 수 부족: {len(valid_matches)}개 (최소 4개 필요)")
+                return None
+            
             return np.array(valid_matches, dtype=np.int32)
             
         except Exception as e:
@@ -500,6 +557,17 @@ class SuperGlueCOLMAPHybrid:
     
     def _run_colmap_matching(self, database_path):
         """COLMAP 매칭 (fallback)"""
+        # 기존 matches 테이블 정리
+        try:
+            conn = sqlite3.connect(str(database_path))
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM matches")
+            conn.commit()
+            conn.close()
+            print("  기존 matches 테이블 정리 완료")
+        except Exception as e:
+            print(f"  matches 테이블 정리 실패: {e}")
+        
         base_cmd = [
             self.colmap_exe, "exhaustive_matcher",
             "--database_path", str(database_path)
@@ -520,6 +588,32 @@ class SuperGlueCOLMAPHybrid:
                 print(f"  ✗ 매칭 실패: {result.stderr}")
         except Exception as e:
             print(f"  오류: 매칭 실패: {e}")
+    
+    def _run_colmap_exhaustive_matcher(self, database_path):
+        """COLMAP exhaustive_matcher로 two_view_geometries 생성"""
+        print("  COLMAP exhaustive_matcher 실행...")
+        
+        base_cmd = [
+            self.colmap_exe, "exhaustive_matcher",
+            "--database_path", str(database_path)
+        ]
+        
+        # Qt GUI 문제 해결을 위한 환경 변수 설정
+        env = os.environ.copy()
+        env["QT_QPA_PLATFORM"] = "offscreen"
+        env["DISPLAY"] = ":0"
+        
+        try:
+            result = subprocess.run(base_cmd, capture_output=True, text=True, timeout=1800, env=env)
+            if result.returncode == 0:
+                print("  ✓ exhaustive_matcher 완료")
+                return True
+            else:
+                print(f"  ✗ exhaustive_matcher 실패: {result.stderr}")
+                return False
+        except Exception as e:
+            print(f"  오류: exhaustive_matcher 실패: {e}")
+            return False
     
     def _run_colmap_mapper(self, database_path, image_path, output_path):
         """COLMAP Mapper 실행"""
@@ -603,6 +697,11 @@ class SuperGlueCOLMAPHybrid:
                 count = cursor.fetchone()[0]
                 print(f"    {table}: {count}개 레코드")
             
+            # matches 테이블 상세 분석
+            cursor.execute("SELECT pair_id, rows, cols FROM matches LIMIT 5")
+            matches_sample = cursor.fetchall()
+            print(f"    matches 샘플: {matches_sample}")
+            
             # 추가 디버깅 정보
             if cursor.execute("SELECT COUNT(*) FROM keypoints").fetchone()[0] == 0:
                 print("  ⚠️  키포인트가 없습니다! SuperPoint 추출이 실패했을 수 있습니다.")
@@ -659,6 +758,17 @@ class SuperGlueCOLMAPHybrid:
         """COLMAP 매칭 (fallback)"""
         print("  COLMAP 매칭 실행...")
         
+        # 기존 matches 테이블 정리
+        try:
+            conn = sqlite3.connect(str(database_path))
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM matches")
+            conn.commit()
+            conn.close()
+            print("  기존 matches 테이블 정리 완료")
+        except Exception as e:
+            print(f"  matches 테이블 정리 실패: {e}")
+        
         base_cmd = [
             self.colmap_exe, "exhaustive_matcher",
             "--database_path", str(database_path)
@@ -711,6 +821,11 @@ class SuperGlueCOLMAPHybrid:
             print(f"  ⚠️  필요한 파일이 없습니다: {missing_files}")
             print("  언디스토션을 건너뜁니다.")
             return
+        
+        # 기존 undistorted 디렉토리 정리
+        if output_path.exists():
+            shutil.rmtree(output_path)
+        output_path.mkdir(parents=True, exist_ok=True)
         
         cmd = [
             self.colmap_exe, "image_undistorter",
