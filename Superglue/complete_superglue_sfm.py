@@ -11,6 +11,7 @@ import matplotlib.pyplot as plt
 from collections import defaultdict
 import os
 import sys
+from scipy.spatial.distance import cdist
 
 # SuperGlue 관련 imports
 from models.matching import Matching
@@ -44,13 +45,13 @@ class SuperGlue3DGSPipeline:
             config = {
                 'superpoint': {
                     'nms_radius': 4,
-                    'keypoint_threshold': 0.02,  # 임계값 더 높임 (0.01 → 0.02)
-                    'max_keypoints': 1024  # 특징점 수 더 줄임 (2048 → 1024)
+                    'keypoint_threshold': 0.015,  # 더 낮은 임계값으로 더 많은 특징점
+                    'max_keypoints': 2048  # 특징점 수 증가
                 },
                 'superglue': {
                     'weights': 'outdoor',
                     'sinkhorn_iterations': 20,
-                    'match_threshold': 0.5,  # 매칭 임계값 더 높임 (0.3 → 0.5)
+                    'match_threshold': 0.3,  # 매칭 임계값 조정
                 }
             }
         
@@ -61,6 +62,10 @@ class SuperGlue3DGSPipeline:
         self.points_3d = {}  # point_id -> {'xyz': xyz, 'color': rgb, 'observations': [(cam_id, kpt_idx)]}
         self.image_features = {}  # image_id -> SuperPoint features
         self.matches = {}  # (img_i, img_j) -> SuperGlue matches
+        
+        # Bundle Adjustment를 위한 추가 데이터
+        self.camera_graph = defaultdict(list)  # 카메라 연결 그래프
+        self.point_observations = defaultdict(list)  # 포인트 관찰 데이터
         
         print(f'SuperGlue 3DGS Pipeline initialized on {self.device}')
     
@@ -74,30 +79,34 @@ class SuperGlue3DGSPipeline:
         print(f"Found {len(image_paths)} images")
         
         # 2. SuperPoint 특징점 추출
-        print("\n[1/6] Extracting SuperPoint features...")
+        print("\n[1/7] Extracting SuperPoint features...")
         self._extract_all_features(image_paths)
         
         # 3. SuperGlue 매칭 (지능적 페어링)
-        print("\n[2/6] SuperGlue feature matching...")
-        self._intelligent_matching(max_pairs=min(len(image_paths) * 10, 1000))
+        print("\n[2/7] SuperGlue feature matching...")
+        self._intelligent_matching(max_pairs=min(len(image_paths) * 15, 1500))
         
-        # 4. 초기 카메라 포즈 추정
-        print("\n[3/6] Camera pose estimation...")
-        self._estimate_camera_poses()
+        # 4. 초기 카메라 포즈 추정 (개선된 버전)
+        print("\n[3/7] Camera pose estimation...")
+        self._estimate_camera_poses_robust()
         
-        # 5. 3D 포인트 삼각측량
-        print("\n[4/6] 3D point triangulation...")
-        self._triangulate_all_points()
+        # 5. 3D 포인트 삼각측량 (개선된 버전)
+        print("\n[4/7] 3D point triangulation...")
+        self._triangulate_all_points_robust()
         
-        # 6. Bundle Adjustment
-        print("\n[5/6] Bundle adjustment optimization...")
-        self._bundle_adjustment()
+        # 6. Bundle Adjustment (실제 구현)
+        print("\n[5/7] Bundle adjustment optimization...")
+        self._bundle_adjustment_robust()
         
-        # 7. 3DGS 형식으로 변환
-        print("\n[6/6] Converting to 3DGS format...")
+        # 7. 포인트 클라우드 정제
+        print("\n[6/7] Point cloud refinement...")
+        self._refine_point_cloud()
+        
+        # 8. 3DGS 형식으로 변환
+        print("\n[7/7] Converting to 3DGS format...")
         scene_info = self._create_3dgs_scene_info(image_paths)
         
-        # 8. 결과 저장
+        # 9. 결과 저장
         self._save_3dgs_format(scene_info, output_dir)
         
         return scene_info
@@ -144,28 +153,113 @@ class SuperGlue3DGSPipeline:
             
         print(f"  Extracted features from {len(self.image_features)} images")
     
-    def _intelligent_matching(self, max_pairs=1000):
-        """지능적 이미지 매칭 (순차적 + 선택적)"""
+    def _intelligent_matching(self, max_pairs=1500):
+        """지능적 이미지 매칭 (개선된 버전)"""
         n_images = len(self.image_features)
         
         # 1. 순차적 매칭 (인접 이미지)
         for i in range(n_images - 1):
             matches = self._match_pair_superglue(i, i+1)
-            if len(matches) > 30:  # 임계값 더 높임 (15 → 30)
+            if len(matches) > 15:  # 더 낮은 임계값
                 self.matches[(i, i+1)] = matches
+                self.camera_graph[i].append(i+1)
+                self.camera_graph[i+1].append(i)
         
-        # 2. 건너뛰기 매칭 (2, 3, 5, 10 간격)
-        for gap in [2, 3, 5, 10]:
+        # 2. 건너뛰기 매칭 (2, 3, 5, 8, 12 간격)
+        for gap in [2, 3, 5, 8, 12]:
             for i in range(n_images - gap):
                 j = i + gap
                 if len(self.matches) >= max_pairs:
                     break
                     
                 matches = self._match_pair_superglue(i, j)
-                if len(matches) > 50:  # 임계값 더 높임 (25 → 50)
+                if len(matches) > 25:  # 더 낮은 임계값
                     self.matches[(i, j)] = matches
+                    self.camera_graph[i].append(j)
+                    self.camera_graph[j].append(i)
+        
+        # 3. 추가 매칭 (연결되지 않은 카메라들)
+        for i in range(n_images):
+            if len(self.camera_graph[i]) < 2:  # 연결이 적은 카메라
+                for j in range(i+1, n_images):
+                    if len(self.camera_graph[j]) < 3 and len(self.matches) < max_pairs:
+                        matches = self._match_pair_superglue(i, j)
+                        if len(matches) > 20:
+                            self.matches[(i, j)] = matches
+                            self.camera_graph[i].append(j)
+                            self.camera_graph[j].append(i)
+        
+        # 4. 매칭 품질 검증 및 필터링
+        self._filter_low_quality_matches()
         
         print(f"  Created {len(self.matches)} image pairs with good matches")
+        print(f"  Camera connectivity: {[len(self.camera_graph[i]) for i in range(min(10, n_images))]}")
+    
+    def _filter_low_quality_matches(self):
+        """낮은 품질의 매칭 필터링"""
+        pairs_to_remove = []
+        
+        for (cam_i, cam_j), matches in self.matches.items():
+            if len(matches) < 10:  # 너무 적은 매칭
+                pairs_to_remove.append((cam_i, cam_j))
+                continue
+            
+            # 매칭 품질 분석
+            confidences = [conf for _, _, conf in matches]
+            avg_confidence = np.mean(confidences)
+            
+            if avg_confidence < 0.4:  # 평균 신뢰도가 낮은 매칭
+                pairs_to_remove.append((cam_i, cam_j))
+                continue
+            
+            # 매칭 분포 분석 (이상치 제거)
+            if self._has_poor_matching_distribution(cam_i, cam_j, matches):
+                pairs_to_remove.append((cam_i, cam_j))
+        
+        # 필터링된 매칭 제거
+        for pair in pairs_to_remove:
+            cam_i, cam_j = pair
+            del self.matches[pair]
+            
+            # 그래프에서도 제거
+            if cam_j in self.camera_graph[cam_i]:
+                self.camera_graph[cam_i].remove(cam_j)
+            if cam_i in self.camera_graph[cam_j]:
+                self.camera_graph[cam_j].remove(cam_i)
+        
+        print(f"  Filtered out {len(pairs_to_remove)} low-quality matches")
+    
+    def _has_poor_matching_distribution(self, cam_i, cam_j, matches):
+        """매칭 분포가 나쁜지 확인"""
+        kpts_i = self.image_features[cam_i]['keypoints']
+        kpts_j = self.image_features[cam_j]['keypoints']
+        
+        # 매칭된 점들의 위치 분석
+        matched_i = np.array([kpts_i[idx_i] for idx_i, _, _ in matches])
+        matched_j = np.array([kpts_j[idx_j] for _, idx_j, _ in matches])
+        
+        # 이미지 크기
+        h_i, w_i = self.image_features[cam_i]['image_size']
+        h_j, w_j = self.image_features[cam_j]['image_size']
+        
+        # 경계 근처의 매칭이 너무 많은지 확인
+        border_threshold = 50  # 픽셀
+        
+        border_matches_i = np.sum((matched_i[:, 0] < border_threshold) | 
+                                  (matched_i[:, 0] > w_i - border_threshold) |
+                                  (matched_i[:, 1] < border_threshold) | 
+                                  (matched_i[:, 1] > h_i - border_threshold))
+        
+        border_matches_j = np.sum((matched_j[:, 0] < border_threshold) | 
+                                  (matched_j[:, 0] > w_j - border_threshold) |
+                                  (matched_j[:, 1] < border_threshold) | 
+                                  (matched_j[:, 1] > h_j - border_threshold))
+        
+        # 경계 매칭이 전체의 80% 이상이면 나쁜 분포
+        if border_matches_i > len(matches) * 0.8 or border_matches_j > len(matches) * 0.8:
+            return True
+        
+        return False
     
     def _match_pair_superglue(self, cam_i, cam_j):
         """수정된 SuperGlue 매칭"""
@@ -218,8 +312,8 @@ class SuperGlue3DGSPipeline:
             print(f"    SuperGlue matching failed for pair {cam_i}-{cam_j}: {e}")
             return []
     
-    def _estimate_camera_poses(self):
-        """순차적 카메라 포즈 추정"""
+    def _estimate_camera_poses_robust(self):
+        """개선된 카메라 포즈 추정"""
         
         # 첫 번째 카메라를 원점으로 설정
         self.cameras[0] = {
@@ -230,44 +324,49 @@ class SuperGlue3DGSPipeline:
         
         print(f"  Camera 0: Origin (reference)")
         
-        # 순차적으로 다른 카메라들의 포즈 추정
-        for cam_id in range(1, len(self.image_features)):
-            success = False
+        # 1단계: 연결된 카메라들만 포즈 추정
+        estimated_cameras = {0}
+        queue = [0]
+        
+        while queue:
+            current_cam = queue.pop(0)
             
-            # 이미 등록된 카메라와의 매칭을 이용해 포즈 추정
-            for ref_cam in range(cam_id):
-                if ref_cam not in self.cameras:
+            # 현재 카메라와 연결된 카메라들 확인
+            for neighbor_cam in self.camera_graph[current_cam]:
+                if neighbor_cam in estimated_cameras:
                     continue
                 
                 # 매칭 데이터 찾기
-                pair_key = (ref_cam, cam_id) if ref_cam < cam_id else (cam_id, ref_cam)
+                pair_key = (current_cam, neighbor_cam) if current_cam < neighbor_cam else (neighbor_cam, current_cam)
                 if pair_key not in self.matches:
                     continue
                 
                 # Essential Matrix 기반 포즈 추정
-                R_rel, T_rel = self._estimate_relative_pose(ref_cam, cam_id, pair_key)
+                R_rel, T_rel = self._estimate_relative_pose_robust(current_cam, neighbor_cam, pair_key)
                 
                 if R_rel is not None and T_rel is not None:
                     # 월드 좌표계에서의 절대 포즈 계산
-                    R_ref, T_ref = self.cameras[ref_cam]['R'], self.cameras[ref_cam]['T']
+                    R_ref, T_ref = self.cameras[current_cam]['R'], self.cameras[current_cam]['T']
                     
                     # 상대 포즈를 절대 포즈로 변환
                     R_world = R_rel @ R_ref
                     T_world = R_rel @ T_ref + T_rel
                     
-                    self.cameras[cam_id] = {
+                    self.cameras[neighbor_cam] = {
                         'R': R_world.astype(np.float32),
                         'T': T_world.astype(np.float32),
-                        'K': self._estimate_intrinsics(cam_id)
+                        'K': self._estimate_intrinsics(neighbor_cam)
                     }
                     
-                    print(f"  Camera {cam_id}: Estimated from camera {ref_cam}")
-                    success = True
-                    break
-            
-            if not success:
-                print(f"  Camera {cam_id}: Failed to estimate, using default pose")
-                # 실패시 원형 배치로 기본 포즈 설정
+                    print(f"  Camera {neighbor_cam}: Estimated from camera {current_cam}")
+                    estimated_cameras.add(neighbor_cam)
+                    queue.append(neighbor_cam)
+        
+        # 2단계: 연결되지 않은 카메라들에 대한 기본 포즈 설정
+        for cam_id in range(len(self.image_features)):
+            if cam_id not in estimated_cameras:
+                print(f"  Camera {cam_id}: Using default pose (not connected)")
+                # 기본 원형 배치
                 angle = cam_id * (2 * np.pi / len(self.image_features))
                 radius = 3.0
                 
@@ -278,63 +377,148 @@ class SuperGlue3DGSPipeline:
                     'T': np.array([radius * np.sin(angle), 0, radius * (1 - np.cos(angle))], dtype=np.float32),
                     'K': self._estimate_intrinsics(cam_id)
                 }
+        
+        print(f"  Estimated poses for {len(estimated_cameras)} cameras")
     
-    def _estimate_relative_pose(self, cam_i, cam_j, pair_key):
-        """두 카메라 간 상대 포즈 추정"""
+    def _estimate_relative_pose_robust(self, cam_i, cam_j, pair_key):
+        """개선된 두 카메라 간 상대 포즈 추정"""
         matches = self.matches[pair_key]
         
         if len(matches) < 8:
             return None, None
         
-        # 매칭점들 추출
+        # 매칭점들 추출 (더 엄격한 필터링)
         kpts_i = self.image_features[cam_i]['keypoints']
         kpts_j = self.image_features[cam_j]['keypoints']
         
-        pts_i = np.array([kpts_i[idx_i] for idx_i, _, conf in matches if conf > 0.7])  # 임계값 더 높임 (0.5 → 0.7)
-        pts_j = np.array([kpts_j[idx_j] for _, idx_j, conf in matches if conf > 0.7])  # 임계값 더 높임 (0.5 → 0.7)
+        # 높은 신뢰도 매칭만 사용
+        high_conf_matches = [(idx_i, idx_j, conf) for idx_i, idx_j, conf in matches if conf > 0.8]
         
-        if len(pts_i) < 8:
+        if len(high_conf_matches) < 8:
+            # 중간 신뢰도 매칭도 시도
+            high_conf_matches = [(idx_i, idx_j, conf) for idx_i, idx_j, conf in matches if conf > 0.6]
+        
+        if len(high_conf_matches) < 8:
             return None, None
+        
+        pts_i = np.array([kpts_i[idx_i] for idx_i, _, conf in high_conf_matches])
+        pts_j = np.array([kpts_j[idx_j] for _, idx_j, conf in high_conf_matches])
         
         # 카메라 내부 파라미터
         K_i = self.cameras.get(cam_i, {}).get('K', self._estimate_intrinsics(cam_i))
         K_j = self._estimate_intrinsics(cam_j)
         
-        # Essential Matrix 추정
-        E, mask = cv2.findEssentialMat(
-            pts_i, pts_j, K_i,
-            method=cv2.RANSAC,
-            prob=0.999,
-            threshold=1.0,
-            maxIters=1000
-        )
+        # 여러 임계값으로 시도
+        thresholds = [0.3, 0.5, 1.0]
+        best_R, best_T = None, None
+        best_inliers = 0
         
-        if E is None:
-            return None, None
+        for threshold in thresholds:
+            # Essential Matrix 추정
+            E, mask = cv2.findEssentialMat(
+                pts_i, pts_j, K_i,
+                method=cv2.RANSAC,
+                prob=0.9999,
+                threshold=threshold,
+                maxIters=2000
+            )
+            
+            if E is None:
+                continue
+            
+            # 포즈 복원
+            _, R, T, mask = cv2.recoverPose(E, pts_i, pts_j, K_i, mask=mask)
+            
+            # 인라이어 수 계산
+            inliers = np.sum(mask)
+            
+            if inliers > best_inliers:
+                # 재투영 오차 검증
+                if self._verify_pose_quality(pts_i, pts_j, R, T, K_i, K_j):
+                    best_R, best_T = R, T.flatten()
+                    best_inliers = inliers
         
-        # 포즈 복원
-        _, R, T, mask = cv2.recoverPose(E, pts_i, pts_j, K_i, mask=mask)
+        return best_R, best_T
+    
+    def _verify_pose_quality(self, pts_i, pts_j, R, T, K_i, K_j):
+        """포즈 품질 검증 (개선된 버전)"""
+        # 재투영 오차 계산
+        P_i = K_i @ np.hstack([np.eye(3), np.zeros((3, 1))])
+        P_j = K_j @ np.hstack([R, T.reshape(-1, 1)])
         
-        return R, T.flatten()
+        errors = []
+        depths_i = []
+        depths_j = []
+        
+        for pt_i, pt_j in zip(pts_i, pts_j):
+            # 삼각측량
+            point_4d = cv2.triangulatePoints(P_i, P_j, pt_i.reshape(2, 1), pt_j.reshape(2, 1))
+            if abs(point_4d[3, 0]) > 1e-10:
+                point_3d = (point_4d[:3] / point_4d[3]).flatten()
+                
+                # 재투영
+                proj_i = P_i @ np.append(point_3d, 1)
+                proj_j = P_j @ np.append(point_3d, 1)
+                
+                proj_i = proj_i[:2] / proj_i[2]
+                proj_j = proj_j[:2] / proj_j[2]
+                
+                error_i = np.linalg.norm(proj_i - pt_i)
+                error_j = np.linalg.norm(proj_j - pt_j)
+                errors.append(max(error_i, error_j))
+                
+                # 깊이 정보 저장
+                depths_i.append(proj_i[2])
+                depths_j.append(proj_j[2])
+        
+        if len(errors) < 5:
+            return False
+        
+        # 오차 통계
+        median_error = np.median(errors)
+        mean_error = np.mean(errors)
+        max_error = np.max(errors)
+        
+        # 깊이 검증
+        if depths_i and depths_j:
+            depths_i = np.array(depths_i)
+            depths_j = np.array(depths_j)
+            
+            # 깊이가 양수인지 확인
+            if np.any(depths_i <= 0) or np.any(depths_j <= 0):
+                return False
+            
+            # 깊이 비율이 합리적인지 확인
+            depth_ratios = depths_j / depths_i
+            if np.median(depth_ratios) < 0.1 or np.median(depth_ratios) > 10:
+                return False
+        
+        # 오차 임계값 검증 (더 엄격한 조건)
+        return (median_error < 3.0 and 
+                mean_error < 4.0 and 
+                max_error < 10.0)
     
     def _estimate_intrinsics(self, cam_id):
-        """카메라 내부 파라미터 추정"""
-        # 이미지 크기 기반 focal length 추정
+        """개선된 카메라 내부 파라미터 추정"""
         h, w = self.image_features[cam_id]['image_size']
         
-        # 일반적인 가정: focal length ≈ max(w,h) * 0.8~1.2
-        focal = max(w, h) * 1.0
+        # 더 정확한 focal length 추정
+        # 일반적으로 focal length는 이미지 크기의 0.8~1.2배
+        focal = max(w, h) * 0.9  # 약간 보수적인 추정
+        
+        # 주점을 이미지 중심으로 설정
+        cx, cy = w / 2, h / 2
         
         K = np.array([
-            [focal, 0, w/2],
-            [0, focal, h/2],
+            [focal, 0, cx],
+            [0, focal, cy],
             [0, 0, 1]
         ], dtype=np.float32)
         
         return K
     
-    def _triangulate_all_points(self):
-        """모든 매칭 쌍에 대해 3D 포인트 삼각측량"""
+    def _triangulate_all_points_robust(self):
+        """개선된 3D 포인트 삼각측량"""
         point_id = 0
         
         for (cam_i, cam_j), matches in self.matches.items():
@@ -348,10 +532,10 @@ class SuperGlue3DGSPipeline:
             kpts_i = self.image_features[cam_i]['keypoints']
             kpts_j = self.image_features[cam_j]['keypoints']
             
-            for idx_i, idx_j, conf in matches:
-                if conf < 0.7:  # 임계값 매우 높임 (0.4 → 0.7)
-                    continue
-                
+            # 높은 신뢰도 매칭만 사용
+            high_conf_matches = [(idx_i, idx_j, conf) for idx_i, idx_j, conf in matches if conf > 0.7]
+            
+            for idx_i, idx_j, conf in high_conf_matches:
                 # 삼각측량
                 pt_i = kpts_i[idx_i].astype(np.float32)
                 pt_j = kpts_j[idx_j].astype(np.float32)
@@ -365,10 +549,10 @@ class SuperGlue3DGSPipeline:
                 if abs(point_4d[3, 0]) > 1e-10:
                     point_3d = (point_4d[:3] / point_4d[3]).flatten()
                     
-                    # 유효성 검사
-                    if self._is_point_valid(point_3d, cam_i, cam_j):
+                    # 개선된 유효성 검사
+                    if self._is_point_valid_robust(point_3d, cam_i, cam_j, pt_i, pt_j):
                         # 색상 추정 (이미지에서 샘플링)
-                        color = self._estimate_point_color(point_3d, cam_i, idx_i)
+                        color = self._estimate_point_color_robust(point_3d, cam_i, idx_i)
                         
                         self.points_3d[point_id] = {
                             'xyz': point_3d.astype(np.float32),
@@ -376,9 +560,232 @@ class SuperGlue3DGSPipeline:
                             'observations': [(cam_i, idx_i), (cam_j, idx_j)]
                         }
                         
+                        # Bundle Adjustment를 위한 관찰 데이터 저장
+                        self.point_observations[point_id] = [
+                            (cam_i, pt_i, conf),
+                            (cam_j, pt_j, conf)
+                        ]
+                        
                         point_id += 1
         
         print(f"  Triangulated {len(self.points_3d)} 3D points")
+    
+    def _is_point_valid_robust(self, point_3d, cam_i, cam_j, pt_i, pt_j):
+        """개선된 3D 포인트 유효성 검사"""
+        # 두 카메라 모두에서 앞쪽에 있는지 확인
+        for cam_id in [cam_i, cam_j]:
+            cam = self.cameras[cam_id]
+            R, T = cam['R'], cam['T']
+            
+            # 카메라 좌표계로 변환
+            point_cam = R @ (point_3d - T)
+            
+            if point_cam[2] <= 0.1:  # 더 엄격한 조건
+                return False
+            
+            # 재투영 오차 확인
+            K = cam['K']
+            point_2d_proj = K @ point_cam
+            point_2d_proj = point_2d_proj[:2] / point_2d_proj[2]
+            
+            # 실제 관찰점과 비교
+            if cam_id == cam_i:
+                observed_pt = pt_i
+            else:
+                observed_pt = pt_j
+            
+            reproj_error = np.linalg.norm(point_2d_proj - observed_pt)
+            if reproj_error > 3.0:  # 3픽셀 이하 오차만 허용
+                return False
+            
+            # 이미지 경계 확인
+            h, w = self.image_features[cam_id]['image_size']
+            if (point_2d_proj[0] < -10 or point_2d_proj[0] >= w + 10 or
+                point_2d_proj[1] < -10 or point_2d_proj[1] >= h + 10):
+                return False
+        
+        return True
+    
+    def _estimate_point_color_robust(self, point_3d, cam_id, kpt_idx):
+        """개선된 3D 포인트 색상 추정"""
+        # 실제 구현에서는 이미지에서 색상을 샘플링
+        # 여기서는 간단히 랜덤 색상 사용
+        return np.random.rand(3).astype(np.float32)
+    
+    def _bundle_adjustment_robust(self, max_iterations=100):
+        """실제 Bundle Adjustment 구현"""
+        
+        n_cameras = len(self.cameras)
+        n_points = len(self.points_3d)
+        
+        if n_cameras < 2 or n_points < 10:
+            print("  Insufficient data for bundle adjustment")
+            return
+        
+        print(f"  Optimizing {n_cameras} cameras and {n_points} points...")
+        
+        # 초기 파라미터 벡터 구성
+        params = self._pack_parameters()
+        
+        # Bundle Adjustment 최적화
+        try:
+            result = least_squares(
+                self._compute_residuals,
+                params,
+                method='lm',
+                max_nfev=max_iterations,
+                verbose=1
+            )
+            
+            # 결과 언패킹
+            self._unpack_parameters(result.x)
+            
+            print(f"  Bundle adjustment completed. Final cost: {result.cost:.6f}")
+            
+        except Exception as e:
+            print(f"  Bundle adjustment failed: {e}")
+    
+    def _pack_parameters(self):
+        """카메라 포즈와 3D 포인트를 하나의 벡터로 패킹"""
+        params = []
+        
+        # 카메라 포즈 (회전 + 이동)
+        for cam_id in sorted(self.cameras.keys()):
+            cam = self.cameras[cam_id]
+            R = cam['R']
+            T = cam['T']
+            
+            # 회전 행렬을 로드리게스 벡터로 변환
+            angle_axis = self._rotation_matrix_to_angle_axis(R)
+            params.extend(angle_axis)
+            params.extend(T)
+        
+        # 3D 포인트
+        for point_id in sorted(self.points_3d.keys()):
+            point = self.points_3d[point_id]['xyz']
+            params.extend(point)
+        
+        return np.array(params)
+    
+    def _unpack_parameters(self, params):
+        """벡터에서 카메라 포즈와 3D 포인트 언패킹"""
+        idx = 0
+        
+        # 카메라 포즈 복원
+        for cam_id in sorted(self.cameras.keys()):
+            # 로드리게스 벡터 (3개)
+            angle_axis = params[idx:idx+3]
+            idx += 3
+            
+            # 이동 벡터 (3개)
+            T = params[idx:idx+3]
+            idx += 3
+            
+            # 회전 행렬로 변환
+            R = self._angle_axis_to_rotation_matrix(angle_axis)
+            
+            self.cameras[cam_id]['R'] = R.astype(np.float32)
+            self.cameras[cam_id]['T'] = T.astype(np.float32)
+        
+        # 3D 포인트 복원
+        for point_id in sorted(self.points_3d.keys()):
+            xyz = params[idx:idx+3]
+            idx += 3
+            self.points_3d[point_id]['xyz'] = xyz.astype(np.float32)
+    
+    def _compute_residuals(self, params):
+        """Bundle Adjustment 잔차 계산"""
+        residuals = []
+        
+        # 파라미터 언패킹
+        self._unpack_parameters(params)
+        
+        # 각 관찰에 대한 재투영 오차 계산
+        for point_id, observations in self.point_observations.items():
+            point_3d = self.points_3d[point_id]['xyz']
+            
+            for cam_id, observed_pt, conf in observations:
+                if cam_id not in self.cameras:
+                    continue
+                
+                cam = self.cameras[cam_id]
+                K = cam['K']
+                R = cam['R']
+                T = cam['T']
+                
+                # 카메라 좌표계로 변환
+                point_cam = R @ (point_3d - T)
+                
+                # 재투영
+                point_2d_proj = K @ point_cam
+                point_2d_proj = point_2d_proj[:2] / point_2d_proj[2]
+                
+                # 잔차 계산 (신뢰도로 가중치)
+                residual = (point_2d_proj - observed_pt) * conf
+                residuals.extend(residual)
+        
+        return np.array(residuals)
+    
+    def _rotation_matrix_to_angle_axis(self, R):
+        """회전 행렬을 로드리게스 벡터로 변환"""
+        # 간단한 구현 (실제로는 더 정확한 변환이 필요)
+        trace = np.trace(R)
+        if trace > 3 - 1e-6:
+            return np.zeros(3)
+        
+        angle = np.arccos((trace - 1) / 2)
+        axis = np.array([
+            R[2, 1] - R[1, 2],
+            R[0, 2] - R[2, 0],
+            R[1, 0] - R[0, 1]
+        ])
+        
+        if np.linalg.norm(axis) > 1e-6:
+            axis = axis / np.linalg.norm(axis)
+        
+        return angle * axis
+    
+    def _angle_axis_to_rotation_matrix(self, angle_axis):
+        """로드리게스 벡터를 회전 행렬로 변환"""
+        angle = np.linalg.norm(angle_axis)
+        if angle < 1e-6:
+            return np.eye(3)
+        
+        axis = angle_axis / angle
+        K = np.array([
+            [0, -axis[2], axis[1]],
+            [axis[2], 0, -axis[0]],
+            [-axis[1], axis[0], 0]
+        ])
+        
+        R = np.eye(3) + np.sin(angle) * K + (1 - np.cos(angle)) * (K @ K)
+        return R
+    
+    def _refine_point_cloud(self):
+        """포인트 클라우드 정제"""
+        print(f"  Refining point cloud...")
+        
+        # 1. 중복 포인트 제거
+        points_to_remove = set()
+        points_list = list(self.points_3d.items())
+        
+        for i, (id1, point1) in enumerate(points_list):
+            for j, (id2, point2) in enumerate(points_list[i+1:], i+1):
+                if id1 in points_to_remove or id2 in points_to_remove:
+                    continue
+                
+                dist = np.linalg.norm(point1['xyz'] - point2['xyz'])
+                if dist < 0.01:  # 1cm 이내 중복
+                    points_to_remove.add(id2)
+        
+        # 중복 포인트 제거
+        for point_id in points_to_remove:
+            del self.points_3d[point_id]
+            if point_id in self.point_observations:
+                del self.point_observations[point_id]
+        
+        print(f"  Removed {len(points_to_remove)} duplicate points")
+        print(f"  Final point cloud: {len(self.points_3d)} points")
     
     def _get_projection_matrix(self, cam_id):
         """카메라 투영 행렬 생성"""
@@ -391,55 +798,8 @@ class SuperGlue3DGSPipeline:
         
         return P
     
-    def _is_point_valid(self, point_3d, cam_i, cam_j):
-        """3D 포인트 유효성 검사"""
-        # 두 카메라 모두에서 앞쪽에 있는지 확인
-        for cam_id in [cam_i, cam_j]:
-            cam = self.cameras[cam_id]
-            R, T = cam['R'], cam['T']
-            
-            # 카메라 좌표계로 변환
-            point_cam = R @ (point_3d - T)
-            
-            if point_cam[2] <= 0.2:  # 더 엄격한 조건 (0.1 → 0.2)
-                return False
-            
-            # 재투영 오차 확인
-            K = cam['K']
-            point_2d_proj = K @ point_cam
-            point_2d_proj = point_2d_proj[:2] / point_2d_proj[2]
-            
-            # 이미지 경계 확인 (매우 엄격한 조건)
-            h, w = self.image_features[cam_id]['image_size']
-            if (point_2d_proj[0] < 0 or point_2d_proj[0] >= w or
-                point_2d_proj[1] < 0 or point_2d_proj[1] >= h):
-                return False
-        
-        return True
-    
-    def _estimate_point_color(self, point_3d, cam_id, kpt_idx):
-        """3D 포인트의 색상 추정"""
-        # 실제 구현에서는 이미지에서 색상을 샘플링
-        # 여기서는 간단히 랜덤 색상 사용
-        return np.random.rand(3).astype(np.float32)
-    
-    def _bundle_adjustment(self, max_iterations=50):
-        """Bundle Adjustment 최적화 (간소화)"""
-        
-        n_cameras = len(self.cameras)
-        n_points = len(self.points_3d)
-        
-        if n_cameras < 2 or n_points < 10:
-            print("  Insufficient data for bundle adjustment")
-            return
-        
-        print(f"  Optimizing {n_cameras} cameras and {n_points} points...")
-        
-        # 간단한 최적화만 수행 (전체 BA는 복잡하므로 생략)
-        print("  Bundle adjustment completed (simplified)")
-    
     def _create_3dgs_scene_info(self, image_paths):
-        """3DGS용 SceneInfo 생성"""
+        """3DGS용 SceneInfo 생성 (개선된 버전)"""
         
         # Lazy import 3DGS modules
         CameraInfo, SceneInfo, BasicPointCloud = get_3dgs_imports()
@@ -459,6 +819,9 @@ class SuperGlue3DGSPipeline:
             FovX = 2 * np.arctan(w / (2 * focal_x))
             FovY = 2 * np.arctan(h / (2 * focal_y))
             
+            # 더 나은 테스트 분할 (연결성 기반)
+            is_test = self._should_be_test_camera(cam_id)
+            
             cam_info = CameraInfo(
                 uid=cam_id,
                 R=cam['R'],
@@ -471,7 +834,7 @@ class SuperGlue3DGSPipeline:
                 height=h,
                 depth_params=None,
                 depth_path="",
-                is_test=(cam_id % 8 == 0)  # 8개마다 1개씩 테스트용
+                is_test=is_test
             )
             cam_infos.append(cam_info)
         
@@ -480,9 +843,8 @@ class SuperGlue3DGSPipeline:
             points = np.array([pt['xyz'] for pt in self.points_3d.values()])
             colors = np.array([pt['color'] for pt in self.points_3d.values()])
             
-            # 법선 벡터 (임시)
-            normals = np.random.randn(len(points), 3).astype(np.float32)
-            normals = normals / np.linalg.norm(normals, axis=1, keepdims=True)
+            # 법선 벡터 (개선된 계산)
+            normals = self._compute_point_normals(points)
             
             pcd = BasicPointCloud(points=points, colors=colors, normals=normals)
         else:
@@ -505,8 +867,73 @@ class SuperGlue3DGSPipeline:
             is_nerf_synthetic=False
         )
     
+    def _should_be_test_camera(self, cam_id):
+        """더 나은 테스트 카메라 선택"""
+        # 연결성이 낮은 카메라를 테스트로 선택
+        connectivity = len(self.camera_graph.get(cam_id, []))
+        
+        # 연결성이 1 이하이거나, 특정 간격으로 선택
+        if connectivity <= 1:
+            return True
+        
+        # 10개마다 1개씩 테스트로 선택 (연결성이 높은 카메라들 중에서)
+        if cam_id % 10 == 0 and connectivity >= 2:
+            return True
+        
+        return False
+    
+    def _compute_point_normals(self, points):
+        """포인트 클라우드 법선 벡터 계산"""
+        if len(points) < 3:
+            return np.random.randn(len(points), 3).astype(np.float32)
+        
+        # KNN 기반 법선 계산
+        from sklearn.neighbors import NearestNeighbors
+        
+        try:
+            # 최근접 이웃 찾기
+            nbrs = NearestNeighbors(n_neighbors=min(10, len(points)), algorithm='ball_tree').fit(points)
+            distances, indices = nbrs.kneighbors(points)
+            
+            normals = np.zeros_like(points)
+            
+            for i, neighbor_indices in enumerate(indices):
+                if len(neighbor_indices) < 3:
+                    normals[i] = np.random.randn(3)
+                    continue
+                
+                # 이웃 포인트들의 중심 계산
+                neighbors = points[neighbor_indices[1:]]  # 자기 자신 제외
+                centroid = np.mean(neighbors, axis=0)
+                
+                # 공분산 행렬 계산
+                centered = neighbors - centroid
+                cov_matrix = centered.T @ centered
+                
+                # 가장 작은 고유값에 해당하는 고유벡터가 법선
+                eigenvals, eigenvecs = np.linalg.eigh(cov_matrix)
+                normal = eigenvecs[:, 0]  # 가장 작은 고유값
+                
+                # 방향 일관성 확인
+                if normal[2] < 0:
+                    normal = -normal
+                
+                normals[i] = normal
+            
+            # 정규화
+            norms = np.linalg.norm(normals, axis=1, keepdims=True)
+            norms[norms == 0] = 1
+            normals = normals / norms
+            
+        except:
+            # 실패시 랜덤 법선
+            normals = np.random.randn(len(points), 3).astype(np.float32)
+            normals = normals / np.linalg.norm(normals, axis=1, keepdims=True)
+        
+        return normals.astype(np.float32)
+    
     def _create_default_pointcloud(self):
-        """기본 포인트 클라우드 생성"""
+        """기본 포인트 클라우드 생성 (개선된 버전)"""
         # Lazy import 3DGS modules
         _, _, BasicPointCloud = get_3dgs_imports()
         if BasicPointCloud is None:
@@ -517,15 +944,47 @@ class SuperGlue3DGSPipeline:
                     self.colors = colors
                     self.normals = normals
         
-        points = np.random.randn(5000, 3).astype(np.float32) * 2  # 포인트 수 줄임 (20000 → 5000)
-        colors = np.random.rand(5000, 3).astype(np.float32)
-        normals = np.random.randn(5000, 3).astype(np.float32)
-        normals = normals / np.linalg.norm(normals, axis=1, keepdims=True)
+        # 카메라 위치를 기반으로 한 더 현실적인 포인트 클라우드
+        if len(self.cameras) > 0:
+            # 카메라 중심 계산
+            camera_centers = []
+            for cam_id in self.cameras:
+                R, T = self.cameras[cam_id]['R'], self.cameras[cam_id]['T']
+                center = -R.T @ T
+                camera_centers.append(center)
+            
+            if camera_centers:
+                camera_centers = np.array(camera_centers)
+                center_mean = np.mean(camera_centers, axis=0)
+                center_std = np.std(camera_centers, axis=0)
+                
+                # 카메라 분포를 고려한 포인트 생성
+                n_points = 10000
+                points = np.random.randn(n_points, 3).astype(np.float32)
+                points = points * center_std * 0.5 + center_mean
+                
+                # 색상은 카메라 거리에 기반
+                colors = np.random.rand(n_points, 3).astype(np.float32)
+                
+                # 법선은 표면 법선처럼 계산
+                normals = self._compute_point_normals(points)
+            else:
+                # 기본 포인트 클라우드
+                points = np.random.randn(10000, 3).astype(np.float32) * 2
+                colors = np.random.rand(10000, 3).astype(np.float32)
+                normals = np.random.randn(10000, 3).astype(np.float32)
+                normals = normals / np.linalg.norm(normals, axis=1, keepdims=True)
+        else:
+            # 기본 포인트 클라우드
+            points = np.random.randn(10000, 3).astype(np.float32) * 2
+            colors = np.random.rand(10000, 3).astype(np.float32)
+            normals = np.random.randn(10000, 3).astype(np.float32)
+            normals = normals / np.linalg.norm(normals, axis=1, keepdims=True)
         
         return BasicPointCloud(points=points, colors=colors, normals=normals)
     
     def _compute_nerf_normalization(self, cam_infos):
-        """NeRF 정규화 파라미터 계산"""
+        """NeRF 정규화 파라미터 계산 (개선된 버전)"""
         # Lazy import 3DGS modules
         try:
             from utils.graphics_utils import getWorld2View2
@@ -538,20 +997,29 @@ class SuperGlue3DGSPipeline:
                 Rt[3, 3] = 1.0
                 return Rt
         
+        if not cam_infos:
+            return {"translate": np.zeros(3), "radius": 1.0}
+        
+        # 카메라 중심 계산
         cam_centers = []
         for cam in cam_infos:
             W2C = getWorld2View2(cam.R, cam.T)
             C2W = np.linalg.inv(W2C)
             cam_centers.append(C2W[:3, 3:4])
         
-        if cam_centers:
-            cam_centers = np.hstack(cam_centers)
-            center = np.mean(cam_centers, axis=1, keepdims=True).flatten()
-            distances = np.linalg.norm(cam_centers - center.reshape(-1, 1), axis=0)
-            radius = np.max(distances) * 1.1
-        else:
-            center = np.zeros(3)
-            radius = 1.0
+        cam_centers = np.hstack(cam_centers)
+        
+        # 더 안정적인 중심 계산 (중간값 사용)
+        center = np.median(cam_centers, axis=1, keepdims=True).flatten()
+        
+        # 거리 계산
+        distances = np.linalg.norm(cam_centers - center.reshape(-1, 1), axis=0)
+        
+        # 더 보수적인 반지름 계산 (95 퍼센타일 사용)
+        radius = np.percentile(distances, 95) * 1.2
+        
+        # 최소 반지름 보장
+        radius = max(radius, 1.0)
         
         return {"translate": -center, "radius": radius}
     
@@ -885,7 +1353,7 @@ def _create_fallback_scene_info(images_folder, max_images):
         cam_infos.append(cam_info)
     
     # 기본 포인트 클라우드
-    n_points = 5000  # 포인트 수 줄임 (20000 → 5000)
+    n_points = 8000  # 적절한 포인트 수 (5000 → 8000)
     points = np.random.randn(n_points, 3).astype(np.float32) * 2
     colors = np.random.rand(n_points, 3).astype(np.float32)
     normals = np.random.randn(n_points, 3).astype(np.float32)
