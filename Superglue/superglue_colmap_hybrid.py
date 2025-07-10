@@ -60,12 +60,12 @@ class SuperGlueCOLMAPHybrid:
         self.superglue_config = {
             'outdoor': {
                 'weights': 'outdoor',
-                'sinkhorn_iterations': 20,
+                'sinkhorn_iterations': 100,
                 'match_threshold': 0.2,
             },
             'indoor': {
                 'weights': 'indoor', 
-                'sinkhorn_iterations': 20,
+                'sinkhorn_iterations': 100,
                 'match_threshold': 0.2,
             }
         }[superglue_config]
@@ -79,7 +79,7 @@ class SuperGlueCOLMAPHybrid:
             superpoint_config = {
                 'nms_radius': 4,
                 'keypoint_threshold': 0.005,
-                'max_keypoints': 1024
+                'max_keypoints': 4096
             }
             
             # SuperGlue 설정

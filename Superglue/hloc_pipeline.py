@@ -122,11 +122,11 @@ class HlocPipeline:
             # SuperPoint 사용 가능하면 SuperPoint, 아니면 SIFT
             if self.superpoint_available:
                 feature_conf = 'superpoint_aachen'
-                feature_file = 'feats-superpoint-n4096-r1024.h5'
+                feature_file = 'feats-superpoint-n4096-r1024'
                 print("Using SuperPoint extractor")
             else:
                 feature_conf = 'sift'
-                feature_file = 'feats-sift.h5'
+                feature_file = 'feats-sift'
                 print("Using SIFT extractor (SuperPoint not available)")
             
             extract_cmd = [
