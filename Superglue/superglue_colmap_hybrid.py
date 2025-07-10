@@ -230,7 +230,12 @@ class SuperGlueCOLMAPHybrid:
                     original_img_path = input_dir / image_name
                 
                 # SuperPoint 특징점 추출
-                keypoints, descriptors = self._extract_single_superpoint_features(original_img_path)
+                result = self._extract_single_superpoint_features(original_img_path)
+                if result is None:
+                    print(f"      ❌ SuperPoint 추출 실패")
+                    continue
+                    
+                keypoints, descriptors, pred, img_gray = result
                 
                 if keypoints is not None and len(keypoints) > 0 and descriptors is not None:
                     print(f"      추출 성공: {len(keypoints)}개 키포인트, {descriptors.shape}")
@@ -456,9 +461,9 @@ class SuperGlueCOLMAPHybrid:
             # 차원 변환 (256 -> 128) + uint8 변환
             if descriptors.shape[1] == 256:
                 descriptors_128 = self._convert_descriptors_to_sift_format(descriptors)
-                return keypoints, descriptors_128
+                return keypoints, descriptors_128, pred, img_gray  # img_gray도 반환
             
-            return keypoints, descriptors
+            return keypoints, descriptors, pred, img_gray  # img_gray도 반환
             
         except Exception as e:
             print(f"        ❌ SuperPoint 오류: {e}")
