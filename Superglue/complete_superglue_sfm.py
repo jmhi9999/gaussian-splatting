@@ -456,20 +456,21 @@ class SuperGlue3DGSPipeline:
             if abs(point_4d[3, 0]) > 1e-10:
                 point_3d = (point_4d[:3] / point_4d[3]).flatten()
                 
-                # 재투영
-                proj_i = P_i @ np.append(point_3d, 1)
-                proj_j = P_j @ np.append(point_3d, 1)
+                # 재투영 (3D 좌표계에서)
+                proj_i_3d = P_i @ np.append(point_3d, 1)
+                proj_j_3d = P_j @ np.append(point_3d, 1)
                 
-                proj_i = proj_i[:2] / proj_i[2]
-                proj_j = proj_j[:2] / proj_j[2]
+                # 2D 좌표로 변환
+                proj_i_2d = proj_i_3d[:2] / proj_i_3d[2]
+                proj_j_2d = proj_j_3d[:2] / proj_j_3d[2]
                 
-                error_i = np.linalg.norm(proj_i - pt_i)
-                error_j = np.linalg.norm(proj_j - pt_j)
+                error_i = np.linalg.norm(proj_i_2d - pt_i)
+                error_j = np.linalg.norm(proj_j_2d - pt_j)
                 errors.append(max(error_i, error_j))
                 
-                # 깊이 정보 저장
-                depths_i.append(proj_i[2])
-                depths_j.append(proj_j[2])
+                # 깊이 정보 저장 (3D 좌표계에서)
+                depths_i.append(proj_i_3d[2])
+                depths_j.append(proj_j_3d[2])
         
         if len(errors) < 5:
             return False
@@ -622,10 +623,21 @@ class SuperGlue3DGSPipeline:
             print("  Insufficient data for bundle adjustment")
             return
         
+        # 관찰 데이터가 충분한지 확인
+        total_observations = sum(len(obs) for obs in self.point_observations.values())
+        if total_observations < 20:
+            print("  Insufficient observations for bundle adjustment")
+            return
+        
         print(f"  Optimizing {n_cameras} cameras and {n_points} points...")
+        print(f"  Total observations: {total_observations}")
         
         # 초기 파라미터 벡터 구성
-        params = self._pack_parameters()
+        try:
+            params = self._pack_parameters()
+        except Exception as e:
+            print(f"  Parameter packing failed: {e}")
+            return
         
         # Bundle Adjustment 최적화
         try:
@@ -634,7 +646,9 @@ class SuperGlue3DGSPipeline:
                 params,
                 method='lm',
                 max_nfev=max_iterations,
-                verbose=1
+                verbose=1,
+                ftol=1e-6,
+                xtol=1e-6
             )
             
             # 결과 언패킹
@@ -644,6 +658,7 @@ class SuperGlue3DGSPipeline:
             
         except Exception as e:
             print(f"  Bundle adjustment failed: {e}")
+            print("  Continuing without bundle adjustment...")
     
     def _pack_parameters(self):
         """카메라 포즈와 3D 포인트를 하나의 벡터로 패킹"""
@@ -665,7 +680,13 @@ class SuperGlue3DGSPipeline:
             point = self.points_3d[point_id]['xyz']
             params.extend(point)
         
-        return np.array(params)
+        params = np.array(params)
+        
+        # NaN이나 무한대 값 체크
+        if np.any(np.isnan(params)) or np.any(np.isinf(params)):
+            raise ValueError("Invalid parameters detected (NaN or Inf)")
+        
+        return params
     
     def _unpack_parameters(self, params):
         """벡터에서 카메라 포즈와 3D 포인트 언패킹"""
@@ -698,33 +719,56 @@ class SuperGlue3DGSPipeline:
         residuals = []
         
         # 파라미터 언패킹
-        self._unpack_parameters(params)
+        try:
+            self._unpack_parameters(params)
+        except Exception as e:
+            print(f"    Warning: Parameter unpacking failed: {e}")
+            return np.ones(100) * 1e6  # 큰 잔차 반환
         
         # 각 관찰에 대한 재투영 오차 계산
         for point_id, observations in self.point_observations.items():
+            if point_id not in self.points_3d:
+                continue
+                
             point_3d = self.points_3d[point_id]['xyz']
             
             for cam_id, observed_pt, conf in observations:
                 if cam_id not in self.cameras:
                     continue
                 
-                cam = self.cameras[cam_id]
-                K = cam['K']
-                R = cam['R']
-                T = cam['T']
-                
-                # 카메라 좌표계로 변환
-                point_cam = R @ (point_3d - T)
-                
-                # 재투영
-                point_2d_proj = K @ point_cam
-                point_2d_proj = point_2d_proj[:2] / point_2d_proj[2]
-                
-                # 잔차 계산 (신뢰도로 가중치)
-                residual = (point_2d_proj - observed_pt) * conf
-                residuals.extend(residual)
+                try:
+                    cam = self.cameras[cam_id]
+                    K = cam['K']
+                    R = cam['R']
+                    T = cam['T']
+                    
+                    # 카메라 좌표계로 변환
+                    point_cam = R @ (point_3d - T)
+                    
+                    # 재투영
+                    point_2d_proj = K @ point_cam
+                    if abs(point_2d_proj[2]) < 1e-10:  # 0으로 나누기 방지
+                        continue
+                    point_2d_proj = point_2d_proj[:2] / point_2d_proj[2]
+                    
+                    # 잔차 계산 (신뢰도로 가중치)
+                    residual = (point_2d_proj - observed_pt) * conf
+                    residuals.extend(residual)
+                    
+                except Exception as e:
+                    # 개별 관찰에서 오류가 발생해도 계속 진행
+                    continue
         
-        return np.array(residuals)
+        if len(residuals) == 0:
+            return np.ones(100) * 1e6  # 빈 잔차 방지
+        
+        residuals = np.array(residuals)
+        
+        # NaN이나 무한대 값 체크
+        if np.any(np.isnan(residuals)) or np.any(np.isinf(residuals)):
+            return np.ones(len(residuals)) * 1e6
+        
+        return residuals
     
     def _rotation_matrix_to_angle_axis(self, R):
         """회전 행렬을 로드리게스 벡터로 변환"""
@@ -887,23 +931,26 @@ class SuperGlue3DGSPipeline:
         if len(points) < 3:
             return np.random.randn(len(points), 3).astype(np.float32)
         
-        # KNN 기반 법선 계산
-        from sklearn.neighbors import NearestNeighbors
-        
+        # 간단한 법선 계산 (sklearn 의존성 제거)
         try:
-            # 최근접 이웃 찾기
-            nbrs = NearestNeighbors(n_neighbors=min(10, len(points)), algorithm='ball_tree').fit(points)
-            distances, indices = nbrs.kneighbors(points)
-            
             normals = np.zeros_like(points)
             
-            for i, neighbor_indices in enumerate(indices):
-                if len(neighbor_indices) < 3:
+            for i in range(len(points)):
+                # 현재 포인트
+                current_point = points[i]
+                
+                # 다른 모든 포인트와의 거리 계산
+                distances = np.linalg.norm(points - current_point, axis=1)
+                
+                # 가장 가까운 10개 포인트 선택 (자기 자신 제외)
+                nearest_indices = np.argsort(distances)[1:11]  # 자기 자신 제외
+                
+                if len(nearest_indices) < 3:
                     normals[i] = np.random.randn(3)
                     continue
                 
                 # 이웃 포인트들의 중심 계산
-                neighbors = points[neighbor_indices[1:]]  # 자기 자신 제외
+                neighbors = points[nearest_indices]
                 centroid = np.mean(neighbors, axis=0)
                 
                 # 공분산 행렬 계산
@@ -925,7 +972,8 @@ class SuperGlue3DGSPipeline:
             norms[norms == 0] = 1
             normals = normals / norms
             
-        except:
+        except Exception as e:
+            print(f"    Warning: Normal computation failed: {e}")
             # 실패시 랜덤 법선
             normals = np.random.randn(len(points), 3).astype(np.float32)
             normals = normals / np.linalg.norm(normals, axis=1, keepdims=True)
