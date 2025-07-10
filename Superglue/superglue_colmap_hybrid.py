@@ -433,26 +433,38 @@ class SuperGlueCOLMAPHybrid:
                 
                 kpts1 = pred1['keypoints'][0]
                 desc1 = pred1['descriptors'][0]
+                scores1 = pred1['scores'][0]
                 kpts2 = pred2['keypoints'][0]
                 desc2 = pred2['descriptors'][0]
+                scores2 = pred2['scores'][0]
             
-            # SuperGlue 매칭
+            # SuperGlue 매칭 - 필요한 모든 키 포함
             with torch.no_grad():
                 pred = self.superglue({
                     'keypoints0': kpts1.unsqueeze(0),
                     'keypoints1': kpts2.unsqueeze(0),
                     'descriptors0': desc1.unsqueeze(0),
                     'descriptors1': desc2.unsqueeze(0),
+                    'scores0': scores1.unsqueeze(0),
+                    'scores1': scores2.unsqueeze(0),
+                    'image0': img1_tensor,
+                    'image1': img2_tensor,
                 })
                 
-                matches = pred['matches0'][0].cpu().numpy()  # (N,)
-                confidence = pred['matching_scores0'][0].cpu().numpy()
+                # indices0/indices1 사용 (matches0/matches1 대신)
+                indices0 = pred['indices0'][0].cpu().numpy()
+                indices1 = pred['indices1'][0].cpu().numpy()
+                mscores0 = pred['matching_scores0'][0].cpu().numpy()
             
             # 유효한 매칭만 필터링
             valid_matches = []
-            for idx, (match, conf) in enumerate(zip(matches, confidence)):
-                if match >= 0 and conf > self.superglue_config['match_threshold']:
-                    valid_matches.append([idx, match])
+            threshold = self.superglue_config['match_threshold']
+            
+            for i, j in enumerate(indices0):
+                if j >= 0 and mscores0[i] > threshold:
+                    # 상호 매칭 확인
+                    if j < len(indices1) and indices1[j] == i:
+                        valid_matches.append([i, j])
             
             return np.array(valid_matches, dtype=np.int32)
             
