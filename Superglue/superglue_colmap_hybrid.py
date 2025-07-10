@@ -59,19 +59,63 @@ class SuperGlueCOLMAPHybrid:
                 self.superglue = None
                 return
             
-            # SuperPoint/SuperGlue import 시도
-            sys.path.insert(0, str(models_dir.parent))
+            # 가중치 파일 확인
+            weights_dir = models_dir / "weights"
+            if not weights_dir.exists():
+                print(f"  ⚠️  weights 디렉토리 없음: {weights_dir}")
+                print("  가중치 파일이 없어도 모델 구조는 로드 시도...")
             
-            try:
-                from models.superpoint import SuperPoint
-                from models.superglue import SuperGlue
-                print("  ✓ SuperPoint/SuperGlue 모듈 import 성공")
-            except ImportError as e:
-                print(f"  ✗ 모델 import 실패: {e}")
+            # 필수 파일 확인
+            required_files = [
+                models_dir / "superpoint.py",
+                models_dir / "superglue.py",
+                models_dir / "matching.py",
+                models_dir / "utils.py"
+            ]
+            
+            missing_files = [f for f in required_files if not f.exists()]
+            if missing_files:
+                print(f"  ✗ 필수 파일 누락: {missing_files}")
                 print("  COLMAP-only 모드로 실행됩니다")
                 self.superpoint = None
                 self.superglue = None
                 return
+            
+            # SuperPoint/SuperGlue import 시도
+            sys.path.insert(0, str(models_dir.parent))
+            
+            try:
+                # 직접 경로로 import 시도
+                import importlib.util
+                
+                # SuperPoint import
+                superpoint_spec = importlib.util.spec_from_file_location(
+                    "superpoint", models_dir / "superpoint.py")
+                superpoint_module = importlib.util.module_from_spec(superpoint_spec)
+                superpoint_spec.loader.exec_module(superpoint_module)
+                SuperPoint = superpoint_module.SuperPoint
+                
+                # SuperGlue import
+                superglue_spec = importlib.util.spec_from_file_location(
+                    "superglue", models_dir / "superglue.py")
+                superglue_module = importlib.util.module_from_spec(superglue_spec)
+                superglue_spec.loader.exec_module(superglue_module)
+                SuperGlue = superglue_module.SuperGlue
+                
+                print("  ✓ SuperPoint/SuperGlue 모듈 import 성공 (직접 경로)")
+                
+            except Exception as e:
+                print(f"  🔄 직접 import 실패, 일반 import 시도: {e}")
+                try:
+                    from models.superpoint import SuperPoint
+                    from models.superglue import SuperGlue
+                    print("  ✓ SuperPoint/SuperGlue 모듈 import 성공 (일반 import)")
+                except ImportError as e2:
+                    print(f"  ✗ 모델 import 실패: {e2}")
+                    print("  COLMAP-only 모드로 실행됩니다")
+                    self.superpoint = None
+                    self.superglue = None
+                    return
             
             # 설정
             superpoint_config = {
@@ -88,42 +132,69 @@ class SuperGlueCOLMAPHybrid:
             
             # 모델 로드 (메모리 절약 모드)
             try:
+                print(f"    SuperPoint 모델 로드 중...")
                 self.superpoint = SuperPoint(superpoint_config).eval()
                 if self.device == "cuda":
                     self.superpoint = self.superpoint.to(self.device)
+                print(f"    ✓ SuperPoint 모델 로드 완료")
                 
+                print(f"    SuperGlue 모델 로드 중...")
                 self.superglue = SuperGlue(superglue_config).eval()
                 if self.device == "cuda":
                     self.superglue = self.superglue.to(self.device)
+                print(f"    ✓ SuperGlue 모델 로드 완료")
                 
                 print(f"  ✓ SuperPoint/SuperGlue 모델 로드 완료 (device: {self.device})")
                 
                 # 테스트 실행
+                print(f"    SuperPoint 테스트 중...")
                 test_tensor = torch.zeros(1, 1, 480, 640).to(self.device)
                 with torch.no_grad():
                     _ = self.superpoint({'image': test_tensor})
                 print("  ✓ SuperPoint 테스트 성공")
                 
                 # SuperGlue 테스트
-                test_data = {
-                    'image0': test_tensor,
-                    'image1': test_tensor,
-                    'keypoints0': torch.zeros(1, 10, 2).to(self.device),
-                    'keypoints1': torch.zeros(1, 10, 2).to(self.device),
-                    'scores0': torch.zeros(1, 10).to(self.device),
-                    'scores1': torch.zeros(1, 10).to(self.device),
-                    'descriptors0': torch.zeros(1, 10, 256).to(self.device),
-                    'descriptors1': torch.zeros(1, 10, 256).to(self.device),
-                }
-                with torch.no_grad():
-                    _ = self.superglue(test_data)
-                print("  ✓ SuperGlue 테스트 성공")
+                print(f"    SuperGlue 테스트 중...")
+                
+                try:
+                    # SuperPoint로 실제 특징점 추출
+                    with torch.no_grad():
+                        pred0 = self.superpoint({'image': test_tensor})
+                        pred1 = self.superpoint({'image': test_tensor})
+                    
+                    # SuperGlue 입력 데이터 준비
+                    test_data = {
+                        'image0': test_tensor,
+                        'image1': test_tensor,
+                        'keypoints0': pred0['keypoints'][0].unsqueeze(0).to(self.device),
+                        'keypoints1': pred1['keypoints'][0].unsqueeze(0).to(self.device),
+                        'scores0': pred0['scores'][0].unsqueeze(0).to(self.device),
+                        'scores1': pred1['scores'][0].unsqueeze(0).to(self.device),
+                        'descriptors0': pred0['descriptors'][0].unsqueeze(0).to(self.device),
+                        'descriptors1': pred1['descriptors'][0].unsqueeze(0).to(self.device),
+                    }
+                    
+                    with torch.no_grad():
+                        _ = self.superglue(test_data)
+                    print("  ✓ SuperGlue 테스트 성공")
+                    
+                except Exception as e:
+                    print(f"  ⚠️  SuperGlue 테스트 실패 (무시하고 계속): {e}")
+                    print("  SuperGlue는 매칭 시에만 사용됩니다")
                 
             except Exception as e:
                 print(f"  ✗ 모델 로드/테스트 실패: {e}")
-                print("  COLMAP-only 모드로 실행됩니다")
-                self.superpoint = None
-                self.superglue = None
+                import traceback
+                traceback.print_exc()
+                
+                # SuperPoint만이라도 사용 가능한지 확인
+                if self.superpoint is not None:
+                    print("  ⚠️  SuperGlue만 실패, SuperPoint-only 모드로 실행됩니다")
+                    self.superglue = None
+                else:
+                    print("  COLMAP-only 모드로 실행됩니다")
+                    self.superpoint = None
+                    self.superglue = None
                 
         except Exception as e:
             print(f"  ✗ SuperGlue 모델 로드 전체 실패: {e}")
@@ -608,6 +679,106 @@ class SuperGlueCOLMAPHybrid:
             print(f"        ❌ Fallback 매칭 오류: {e}")
             return None
 
+    def _run_superpoint_only_matching(self, image_paths, database_path):
+        """SuperPoint만 사용한 매칭"""
+        print("  🔥 SuperPoint-only 매칭 중...")
+        
+        try:
+            conn = sqlite3.connect(str(database_path))
+            cursor = conn.cursor()
+            
+            # 기존 matches 정리
+            cursor.execute("DELETE FROM matches")
+            cursor.execute("DELETE FROM two_view_geometries")
+            
+            # 이미지 ID 매핑 생성
+            image_id_map = {}
+            cursor.execute("SELECT image_id, name FROM images ORDER BY image_id")
+            for image_id, name in cursor.fetchall():
+                try:
+                    idx = int(name.split('_')[1].split('.')[0])
+                    image_id_map[idx] = image_id
+                except:
+                    continue
+            
+            # 매칭 수행
+            successful_matches = 0
+            total_pairs = 0
+            
+            for i in range(len(image_paths)):
+                for j in range(i + 1, min(i + 5, len(image_paths))):  # 인접한 5장씩만
+                    total_pairs += 1
+                    
+                    print(f"      매칭 {i}-{j}...")
+                    matches = self._match_single_pair_superpoint_only(image_paths[i], image_paths[j])
+                    
+                    if matches is not None and len(matches) >= 10:
+                        if i in image_id_map and j in image_id_map:
+                            pair_id = image_id_map[i] * 2147483647 + image_id_map[j]
+                            
+                            cursor.execute(
+                                "INSERT INTO matches (pair_id, rows, cols, data) VALUES (?, ?, ?, ?)",
+                                (pair_id, len(matches), 2, matches.tobytes())
+                            )
+                            
+                            print(f"        ✅ {len(matches)}개 매칭 저장 (SuperPoint-only)")
+                            successful_matches += 1
+                        else:
+                            print(f"        ❌ 이미지 ID 매핑 실패")
+                    else:
+                        print(f"        ❌ 매칭 실패 또는 부족")
+            
+            conn.commit()
+            conn.close()
+            
+            print(f"    📊 SuperPoint-only 매칭 결과: {successful_matches}/{total_pairs} 성공")
+            
+            if successful_matches == 0:
+                print("    ⚠️  SuperPoint-only 매칭 실패, COLMAP 매칭으로 fallback...")
+                self._run_colmap_matching_fast(database_path)
+            else:
+                print("    ✅ SuperPoint-only 매칭 완료!")
+                
+        except Exception as e:
+            print(f"    ❌ SuperPoint-only 매칭 오류: {e}")
+            print("    🔄 COLMAP 매칭으로 fallback...")
+            self._run_colmap_matching_fast(database_path)
+
+    def _match_single_pair_superpoint_only(self, image_path1, image_path2):
+        """SuperPoint만 사용한 두 이미지 간 매칭"""
+        try:
+            print(f"        🔍 SuperPoint-only 매칭: {image_path1.name} ↔ {image_path2.name}")
+            
+            # 이미지 로드 및 전처리
+            img1 = self._load_and_preprocess_image(image_path1)
+            img2 = self._load_and_preprocess_image(image_path2)
+            
+            if img1 is None or img2 is None:
+                print(f"        ❌ 이미지 로드 실패")
+                return None
+            
+            # SuperPoint 특징점 추출
+            pred1 = self._extract_superpoint_features_for_matching(img1)
+            pred2 = self._extract_superpoint_features_for_matching(img2)
+            
+            if pred1 is None or pred2 is None:
+                print(f"        ❌ SuperPoint 특징점 추출 실패")
+                return None
+            
+            # SuperPoint descriptor 매칭
+            matches = self._fallback_descriptor_matching(pred1, pred2)
+            
+            if matches is not None and len(matches) > 0:
+                print(f"        ✅ {len(matches)}개 매칭 발견 (SuperPoint-only)")
+                return matches
+            else:
+                print(f"        ❌ SuperPoint-only 매칭 실패")
+                return None
+                
+        except Exception as e:
+            print(f"        ❌ SuperPoint-only 매칭 오류: {e}")
+            return None
+
     # 나머지 메서드들은 기존과 동일하게 유지...
     def process_images(self, image_dir: str, output_dir: str, max_images: int = 100):
         """메인 처리 메서드"""
@@ -851,8 +1022,12 @@ class SuperGlueCOLMAPHybrid:
         print("  🔥 SuperGlue 매칭 중...")
         
         if self.superglue is None:
-            print("  ⚠️  SuperGlue 모델 없음, COLMAP 매칭으로 fallback...")
-            self._run_colmap_matching_fast(database_path)
+            if self.superpoint is not None:
+                print("  ⚠️  SuperGlue 모델 없음, SuperPoint-only 매칭으로 fallback...")
+                self._run_superpoint_only_matching(image_paths, database_path)
+            else:
+                print("  ⚠️  SuperGlue 모델 없음, COLMAP 매칭으로 fallback...")
+                self._run_colmap_matching_fast(database_path)
             return
         
         try:
