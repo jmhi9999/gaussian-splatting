@@ -919,11 +919,8 @@ sceneLoadTypeCallbacks["SuperGlue"] = readSuperGlueSceneInfo
 sceneLoadTypeCallbacks["SuperGlueCOLMAPHybrid"] = readSuperGlueCOLMAPHybridSceneInfo
 
 # Colmap과 Blender 로더도 추가 (기존 함수들이 있다면)
-try:
-    from scene.colmap_loader import readColmapSceneInfo
-    sceneLoadTypeCallbacks["Colmap"] = readColmapSceneInfo
-except ImportError:
-    print("Warning: Colmap loader not available")
+# readColmapSceneInfo는 존재하지 않으므로 제거
+print("Warning: Colmap loader not available - using custom implementation")
 
 try:
     from scene.blender_loader import readBlenderSceneInfo

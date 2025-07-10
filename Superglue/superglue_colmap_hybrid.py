@@ -1537,8 +1537,17 @@ class SuperGlueCOLMAPHybrid:
             train_cameras = []
             test_cameras = []
             
-            # 이미지 경로 매핑 생성
-            image_name_to_path = {path.name: path for path in image_paths}
+            # 이미지 경로 매핑 생성 - COLMAP 이름과 실제 파일명 매핑
+            image_name_to_path = {}
+            
+            # 원본 이미지 파일들을 순서대로 정렬
+            sorted_image_paths = sorted(image_paths, key=lambda x: x.name)
+            
+            for i, path in enumerate(sorted_image_paths):
+                # COLMAP이 사용하는 이름 형식: image_0000.jpg, image_0001.jpg, ...
+                colmap_name = f"image_{i:04d}.jpg"
+                image_name_to_path[colmap_name] = path
+                print(f"      매핑: {colmap_name} -> {path.name}")
             
             for image_id, image in images.items():
                 # 이미지 파일 경로 찾기
