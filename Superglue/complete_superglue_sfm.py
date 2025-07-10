@@ -157,15 +157,15 @@ class SuperGlue3DGSPipeline:
         """지능적 이미지 매칭 (개선된 버전)"""
         n_images = len(self.image_features)
         
-        # 1. 순차적 매칭 (인접 이미지)
+        # 1. 순차적 매칭 (인접 이미지) - 더 낮은 임계값
         for i in range(n_images - 1):
             matches = self._match_pair_superglue(i, i+1)
-            if len(matches) > 15:  # 더 낮은 임계값
+            if len(matches) > 8:  # 더 낮은 임계값 (15 → 8)
                 self.matches[(i, i+1)] = matches
                 self.camera_graph[i].append(i+1)
                 self.camera_graph[i+1].append(i)
         
-        # 2. 건너뛰기 매칭 (2, 3, 5, 8, 12 간격)
+        # 2. 건너뛰기 매칭 (2, 3, 5, 8, 12 간격) - 더 낮은 임계값
         for gap in [2, 3, 5, 8, 12]:
             for i in range(n_images - gap):
                 j = i + gap
@@ -173,24 +173,24 @@ class SuperGlue3DGSPipeline:
                     break
                     
                 matches = self._match_pair_superglue(i, j)
-                if len(matches) > 25:  # 더 낮은 임계값
+                if len(matches) > 12:  # 더 낮은 임계값 (25 → 12)
                     self.matches[(i, j)] = matches
                     self.camera_graph[i].append(j)
                     self.camera_graph[j].append(i)
         
-        # 3. 추가 매칭 (연결되지 않은 카메라들)
+        # 3. 추가 매칭 (연결되지 않은 카메라들) - 더 적극적
         for i in range(n_images):
-            if len(self.camera_graph[i]) < 2:  # 연결이 적은 카메라
+            if len(self.camera_graph[i]) < 3:  # 연결이 적은 카메라 (2 → 3)
                 for j in range(i+1, n_images):
-                    if len(self.camera_graph[j]) < 3 and len(self.matches) < max_pairs:
+                    if len(self.camera_graph[j]) < 4 and len(self.matches) < max_pairs:  # (3 → 4)
                         matches = self._match_pair_superglue(i, j)
-                        if len(matches) > 20:
+                        if len(matches) > 8:  # 더 낮은 임계값 (20 → 8)
                             self.matches[(i, j)] = matches
                             self.camera_graph[i].append(j)
                             self.camera_graph[j].append(i)
         
-        # 4. 매칭 품질 검증 및 필터링
-        self._filter_low_quality_matches()
+        # 4. 매칭 품질 검증 및 필터링 (완화된 조건)
+        self._filter_low_quality_matches_relaxed()
         
         print(f"  Created {len(self.matches)} image pairs with good matches")
         print(f"  Camera connectivity: {[len(self.camera_graph[i]) for i in range(min(10, n_images))]}")
@@ -229,6 +229,40 @@ class SuperGlue3DGSPipeline:
         
         print(f"  Filtered out {len(pairs_to_remove)} low-quality matches")
     
+    def _filter_low_quality_matches_relaxed(self):
+        """완화된 낮은 품질의 매칭 필터링"""
+        pairs_to_remove = []
+        
+        for (cam_i, cam_j), matches in self.matches.items():
+            if len(matches) < 5:  # 더 낮은 임계값 (10 → 5)
+                pairs_to_remove.append((cam_i, cam_j))
+                continue
+            
+            # 매칭 품질 분석
+            confidences = [conf for _, _, conf in matches]
+            avg_confidence = np.mean(confidences)
+            
+            if avg_confidence < 0.2:  # 더 낮은 임계값 (0.4 → 0.2)
+                pairs_to_remove.append((cam_i, cam_j))
+                continue
+            
+            # 매칭 분포 분석 (완화된 조건)
+            if self._has_poor_matching_distribution_relaxed(cam_i, cam_j, matches):
+                pairs_to_remove.append((cam_i, cam_j))
+        
+        # 필터링된 매칭 제거
+        for pair in pairs_to_remove:
+            cam_i, cam_j = pair
+            del self.matches[pair]
+            
+            # 그래프에서도 제거
+            if cam_j in self.camera_graph[cam_i]:
+                self.camera_graph[cam_i].remove(cam_j)
+            if cam_i in self.camera_graph[cam_j]:
+                self.camera_graph[cam_j].remove(cam_i)
+        
+        print(f"  Filtered out {len(pairs_to_remove)} low-quality matches (relaxed)")
+    
     def _has_poor_matching_distribution(self, cam_i, cam_j, matches):
         """매칭 분포가 나쁜지 확인"""
         kpts_i = self.image_features[cam_i]['keypoints']
@@ -257,6 +291,38 @@ class SuperGlue3DGSPipeline:
         
         # 경계 매칭이 전체의 80% 이상이면 나쁜 분포
         if border_matches_i > len(matches) * 0.8 or border_matches_j > len(matches) * 0.8:
+            return True
+        
+        return False
+    
+    def _has_poor_matching_distribution_relaxed(self, cam_i, cam_j, matches):
+        """완화된 매칭 분포 검사"""
+        kpts_i = self.image_features[cam_i]['keypoints']
+        kpts_j = self.image_features[cam_j]['keypoints']
+        
+        # 매칭된 점들의 위치 분석
+        matched_i = np.array([kpts_i[idx_i] for idx_i, _, _ in matches])
+        matched_j = np.array([kpts_j[idx_j] for _, idx_j, _ in matches])
+        
+        # 이미지 크기
+        h_i, w_i = self.image_features[cam_i]['image_size']
+        h_j, w_j = self.image_features[cam_j]['image_size']
+        
+        # 경계 근처의 매칭이 너무 많은지 확인 (완화된 조건)
+        border_threshold = 30  # 더 작은 경계 (50 → 30)
+        
+        border_matches_i = np.sum((matched_i[:, 0] < border_threshold) | 
+                                  (matched_i[:, 0] > w_i - border_threshold) |
+                                  (matched_i[:, 1] < border_threshold) | 
+                                  (matched_i[:, 1] > h_i - border_threshold))
+        
+        border_matches_j = np.sum((matched_j[:, 0] < border_threshold) | 
+                                  (matched_j[:, 0] > w_j - border_threshold) |
+                                  (matched_j[:, 1] < border_threshold) | 
+                                  (matched_j[:, 1] > h_j - border_threshold))
+        
+        # 경계 매칭이 전체의 90% 이상이면 나쁜 분포 (80% → 90%)
+        if border_matches_i > len(matches) * 0.9 or border_matches_j > len(matches) * 0.9:
             return True
         
         return False
@@ -381,24 +447,24 @@ class SuperGlue3DGSPipeline:
         print(f"  Estimated poses for {len(estimated_cameras)} cameras")
     
     def _estimate_relative_pose_robust(self, cam_i, cam_j, pair_key):
-        """개선된 두 카메라 간 상대 포즈 추정"""
+        """개선된 두 카메라 간 상대 포즈 추정 (완화된 버전)"""
         matches = self.matches[pair_key]
         
-        if len(matches) < 8:
+        if len(matches) < 6:  # 더 낮은 임계값 (8 → 6)
             return None, None
         
-        # 매칭점들 추출 (더 엄격한 필터링)
+        # 매칭점들 추출 (완화된 필터링)
         kpts_i = self.image_features[cam_i]['keypoints']
         kpts_j = self.image_features[cam_j]['keypoints']
         
-        # 높은 신뢰도 매칭만 사용
-        high_conf_matches = [(idx_i, idx_j, conf) for idx_i, idx_j, conf in matches if conf > 0.8]
+        # 더 낮은 신뢰도 매칭도 사용
+        high_conf_matches = [(idx_i, idx_j, conf) for idx_i, idx_j, conf in matches if conf > 0.5]  # 0.8 → 0.5
         
-        if len(high_conf_matches) < 8:
-            # 중간 신뢰도 매칭도 시도
-            high_conf_matches = [(idx_i, idx_j, conf) for idx_i, idx_j, conf in matches if conf > 0.6]
+        if len(high_conf_matches) < 6:
+            # 더 낮은 신뢰도 매칭도 시도
+            high_conf_matches = [(idx_i, idx_j, conf) for idx_i, idx_j, conf in matches if conf > 0.3]  # 0.6 → 0.3
         
-        if len(high_conf_matches) < 8:
+        if len(high_conf_matches) < 6:
             return None, None
         
         pts_i = np.array([kpts_i[idx_i] for idx_i, _, conf in high_conf_matches])
@@ -408,8 +474,8 @@ class SuperGlue3DGSPipeline:
         K_i = self.cameras.get(cam_i, {}).get('K', self._estimate_intrinsics(cam_i))
         K_j = self._estimate_intrinsics(cam_j)
         
-        # 여러 임계값으로 시도
-        thresholds = [0.3, 0.5, 1.0]
+        # 여러 임계값으로 시도 (더 완화된 임계값)
+        thresholds = [1.0, 2.0, 3.0]  # 더 큰 임계값들
         best_R, best_T = None, None
         best_inliers = 0
         
@@ -418,9 +484,9 @@ class SuperGlue3DGSPipeline:
             E, mask = cv2.findEssentialMat(
                 pts_i, pts_j, K_i,
                 method=cv2.RANSAC,
-                prob=0.9999,
+                prob=0.999,  # 약간 완화
                 threshold=threshold,
-                maxIters=2000
+                maxIters=1000  # 더 적은 반복
             )
             
             if E is None:
@@ -433,8 +499,8 @@ class SuperGlue3DGSPipeline:
             inliers = np.sum(mask)
             
             if inliers > best_inliers:
-                # 재투영 오차 검증
-                if self._verify_pose_quality(pts_i, pts_j, R, T, K_i, K_j):
+                # 완화된 재투영 오차 검증
+                if self._verify_pose_quality_relaxed(pts_i, pts_j, R, T, K_i, K_j):
                     best_R, best_T = R, T.flatten()
                     best_inliers = inliers
         
@@ -499,6 +565,65 @@ class SuperGlue3DGSPipeline:
                 mean_error < 4.0 and 
                 max_error < 10.0)
     
+    def _verify_pose_quality_relaxed(self, pts_i, pts_j, R, T, K_i, K_j):
+        """완화된 포즈 품질 검증"""
+        # 재투영 오차 계산
+        P_i = K_i @ np.hstack([np.eye(3), np.zeros((3, 1))])
+        P_j = K_j @ np.hstack([R, T.reshape(-1, 1)])
+        
+        errors = []
+        depths_i = []
+        depths_j = []
+        
+        for pt_i, pt_j in zip(pts_i, pts_j):
+            # 삼각측량
+            point_4d = cv2.triangulatePoints(P_i, P_j, pt_i.reshape(2, 1), pt_j.reshape(2, 1))
+            if abs(point_4d[3, 0]) > 1e-10:
+                point_3d = (point_4d[:3] / point_4d[3]).flatten()
+                
+                # 재투영 (3D 좌표계에서)
+                proj_i_3d = P_i @ np.append(point_3d, 1)
+                proj_j_3d = P_j @ np.append(point_3d, 1)
+                
+                # 2D 좌표로 변환
+                proj_i_2d = proj_i_3d[:2] / proj_i_3d[2]
+                proj_j_2d = proj_j_3d[:2] / proj_j_3d[2]
+                
+                error_i = np.linalg.norm(proj_i_2d - pt_i)
+                error_j = np.linalg.norm(proj_j_2d - pt_j)
+                errors.append(max(error_i, error_j))
+                
+                # 깊이 정보 저장 (3D 좌표계에서)
+                depths_i.append(proj_i_3d[2])
+                depths_j.append(proj_j_3d[2])
+        
+        if len(errors) < 3:  # 더 낮은 임계값 (5 → 3)
+            return False
+        
+        # 오차 통계
+        median_error = np.median(errors)
+        mean_error = np.mean(errors)
+        max_error = np.max(errors)
+        
+        # 깊이 검증 (완화된 조건)
+        if depths_i and depths_j:
+            depths_i = np.array(depths_i)
+            depths_j = np.array(depths_j)
+            
+            # 깊이가 양수인지 확인
+            if np.any(depths_i <= 0) or np.any(depths_j <= 0):
+                return False
+            
+            # 깊이 비율이 합리적인지 확인 (더 완화된 조건)
+            depth_ratios = depths_j / depths_i
+            if np.median(depth_ratios) < 0.05 or np.median(depth_ratios) > 20:  # 0.1~10 → 0.05~20
+                return False
+        
+        # 오차 임계값 검증 (완화된 조건)
+        return (median_error < 8.0 and   # 3.0 → 8.0
+                mean_error < 10.0 and    # 4.0 → 10.0
+                max_error < 20.0)        # 10.0 → 20.0
+    
     def _estimate_intrinsics(self, cam_id):
         """개선된 카메라 내부 파라미터 추정"""
         h, w = self.image_features[cam_id]['image_size']
@@ -519,7 +644,7 @@ class SuperGlue3DGSPipeline:
         return K
     
     def _triangulate_all_points_robust(self):
-        """개선된 3D 포인트 삼각측량"""
+        """개선된 3D 포인트 삼각측량 (완화된 버전)"""
         point_id = 0
         
         for (cam_i, cam_j), matches in self.matches.items():
@@ -533,8 +658,8 @@ class SuperGlue3DGSPipeline:
             kpts_i = self.image_features[cam_i]['keypoints']
             kpts_j = self.image_features[cam_j]['keypoints']
             
-            # 높은 신뢰도 매칭만 사용
-            high_conf_matches = [(idx_i, idx_j, conf) for idx_i, idx_j, conf in matches if conf > 0.7]
+            # 더 낮은 신뢰도 매칭도 사용 (0.7 → 0.4)
+            high_conf_matches = [(idx_i, idx_j, conf) for idx_i, idx_j, conf in matches if conf > 0.4]
             
             for idx_i, idx_j, conf in high_conf_matches:
                 # 삼각측량
@@ -550,8 +675,8 @@ class SuperGlue3DGSPipeline:
                 if abs(point_4d[3, 0]) > 1e-10:
                     point_3d = (point_4d[:3] / point_4d[3]).flatten()
                     
-                    # 개선된 유효성 검사
-                    if self._is_point_valid_robust(point_3d, cam_i, cam_j, pt_i, pt_j):
+                    # 완화된 유효성 검사
+                    if self._is_point_valid_relaxed(point_3d, cam_i, cam_j, pt_i, pt_j):
                         # 색상 추정 (이미지에서 샘플링)
                         color = self._estimate_point_color_robust(point_3d, cam_i, idx_i)
                         
@@ -603,6 +728,42 @@ class SuperGlue3DGSPipeline:
             h, w = self.image_features[cam_id]['image_size']
             if (point_2d_proj[0] < -10 or point_2d_proj[0] >= w + 10 or
                 point_2d_proj[1] < -10 or point_2d_proj[1] >= h + 10):
+                return False
+        
+        return True
+    
+    def _is_point_valid_relaxed(self, point_3d, cam_i, cam_j, pt_i, pt_j):
+        """완화된 3D 포인트 유효성 검사"""
+        # 두 카메라 모두에서 앞쪽에 있는지 확인
+        for cam_id in [cam_i, cam_j]:
+            cam = self.cameras[cam_id]
+            R, T = cam['R'], cam['T']
+            
+            # 카메라 좌표계로 변환
+            point_cam = R @ (point_3d - T)
+            
+            if point_cam[2] <= 0.05:  # 더 완화된 조건 (0.1 → 0.05)
+                return False
+            
+            # 재투영 오차 확인
+            K = cam['K']
+            point_2d_proj = K @ point_cam
+            point_2d_proj = point_2d_proj[:2] / point_2d_proj[2]
+            
+            # 실제 관찰점과 비교
+            if cam_id == cam_i:
+                observed_pt = pt_i
+            else:
+                observed_pt = pt_j
+            
+            reproj_error = np.linalg.norm(point_2d_proj - observed_pt)
+            if reproj_error > 8.0:  # 더 완화된 조건 (3.0 → 8.0)
+                return False
+            
+            # 이미지 경계 확인 (더 완화된 조건)
+            h, w = self.image_features[cam_id]['image_size']
+            if (point_2d_proj[0] < -20 or point_2d_proj[0] >= w + 20 or
+                point_2d_proj[1] < -20 or point_2d_proj[1] >= h + 20):
                 return False
         
         return True
