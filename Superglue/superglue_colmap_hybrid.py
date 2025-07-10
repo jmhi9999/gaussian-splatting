@@ -162,7 +162,7 @@ class SuperGlueCOLMAPHybrid:
                         pred0 = self.superpoint({'image': test_tensor})
                         pred1 = self.superpoint({'image': test_tensor})
                     
-                    # SuperGlue 입력 데이터 준비 (tensor stack 형태)
+                    # SuperGlue 입력 데이터 준비 (올바른 형태)
                     test_data = {
                         'image0': test_tensor,
                         'image1': test_tensor,
@@ -170,8 +170,8 @@ class SuperGlueCOLMAPHybrid:
                         'keypoints1': torch.stack(pred1['keypoints']).to(self.device),
                         'scores0': torch.stack(pred0['scores']).to(self.device),
                         'scores1': torch.stack(pred1['scores']).to(self.device),
-                        'descriptors0': torch.stack(pred0['descriptors']).to(self.device),
-                        'descriptors1': torch.stack(pred1['descriptors']).to(self.device),
+                        'descriptors0': torch.stack(pred0['descriptors']).transpose(1, 2).to(self.device),  # (B, D, N)
+                        'descriptors1': torch.stack(pred1['descriptors']).transpose(1, 2).to(self.device),  # (B, D, N)
                     }
                     
                     with torch.no_grad():
@@ -605,13 +605,13 @@ class SuperGlueCOLMAPHybrid:
             print(f"        pred2: keypoints={pred2['keypoints'].shape}, scores={pred2['scores'].shape}, descriptors={pred2['descriptors'].shape}")
             
             # SuperGlue가 기대하는 형태로 데이터 변환
-            # SuperGlue는 tensor stack 형태를 기대
+            # SuperGlue는 (B, D, N) 형태를 기대
             keypoints0 = torch.from_numpy(pred1['keypoints']).unsqueeze(0).to(self.device)  # (1, N, 2)
             keypoints1 = torch.from_numpy(pred2['keypoints']).unsqueeze(0).to(self.device)  # (1, N, 2)
             scores0 = torch.from_numpy(pred1['scores']).unsqueeze(0).to(self.device)  # (1, N)
             scores1 = torch.from_numpy(pred2['scores']).unsqueeze(0).to(self.device)  # (1, N)
-            descriptors0 = torch.from_numpy(pred1['descriptors']).unsqueeze(0).to(self.device)  # (1, N, 256)
-            descriptors1 = torch.from_numpy(pred2['descriptors']).unsqueeze(0).to(self.device)  # (1, N, 256)
+            descriptors0 = torch.from_numpy(pred1['descriptors']).unsqueeze(0).transpose(1, 2).to(self.device)  # (1, 256, N)
+            descriptors1 = torch.from_numpy(pred2['descriptors']).unsqueeze(0).transpose(1, 2).to(self.device)  # (1, 256, N)
             
             print(f"        변환된 shapes: keypoints0={keypoints0.shape}, descriptors0={descriptors0.shape}")
             
