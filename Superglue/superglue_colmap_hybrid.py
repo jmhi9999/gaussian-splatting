@@ -524,6 +524,10 @@ class SuperGlueCOLMAPHybrid:
     def _run_colmap_mapper(self, database_path, image_path, output_path):
         """COLMAP Mapper 실행"""
         
+        # 먼저 데이터베이스 상태 확인
+        print("  데이터베이스 상태 확인 중...")
+        self._check_database_status(database_path)
+        
         base_cmd = [
             self.colmap_exe, "mapper",
             "--database_path", str(database_path),
@@ -537,6 +541,7 @@ class SuperGlueCOLMAPHybrid:
         ]
         
         print("  COLMAP Mapper 실행...")
+        print(f"  명령: {' '.join(base_cmd)}")
         
         # Qt GUI 문제 해결을 위한 환경 변수 설정
         env = os.environ.copy()
@@ -551,6 +556,10 @@ class SuperGlueCOLMAPHybrid:
                 return True
             else:
                 print(f"  경고: COLMAP Mapper 오류 (코드: {result.returncode})")
+                if result.stdout:
+                    print(f"  stdout: {result.stdout}")
+                if result.stderr:
+                    print(f"  stderr: {result.stderr}")
                 
                 # 매퍼 실패 시 더 관대한 설정으로 재시도
                 print("  🔄 더 관대한 설정으로 매퍼 재시도...")
@@ -579,15 +588,129 @@ class SuperGlueCOLMAPHybrid:
             print(f"  오류: COLMAP Mapper 실패: {e}")
             return False
     
+    def _check_database_status(self, database_path):
+        """데이터베이스 상태 확인"""
+        try:
+            conn = sqlite3.connect(str(database_path))
+            cursor = conn.cursor()
+            
+            # 각 테이블의 레코드 수 확인
+            tables = ['cameras', 'images', 'keypoints', 'descriptors', 'matches']
+            print("  DB 상태 확인 중...")
+            
+            for table in tables:
+                cursor.execute(f"SELECT COUNT(*) FROM {table}")
+                count = cursor.fetchone()[0]
+                print(f"    {table}: {count}개 레코드")
+            
+            # 추가 디버깅 정보
+            if cursor.execute("SELECT COUNT(*) FROM keypoints").fetchone()[0] == 0:
+                print("  ⚠️  키포인트가 없습니다! SuperPoint 추출이 실패했을 수 있습니다.")
+                print("  COLMAP SIFT로 fallback 시도...")
+                self._run_colmap_feature_extraction_fallback(database_path)
+            
+            if cursor.execute("SELECT COUNT(*) FROM matches").fetchone()[0] == 0:
+                print("  ⚠️  매칭이 없습니다! SuperGlue 매칭이 실패했을 수 있습니다.")
+                print("  COLMAP 매칭으로 fallback 시도...")
+                self._run_colmap_matching_fallback(database_path)
+            
+            conn.close()
+            
+        except Exception as e:
+            print(f"  DB 상태 확인 실패: {e}")
+    
+    def _run_colmap_feature_extraction_fallback(self, database_path):
+        """COLMAP SIFT 특징점 추출 (fallback)"""
+        print("  COLMAP SIFT 특징점 추출 실행...")
+        
+        # 데이터베이스에서 이미지 경로 가져오기
+        conn = sqlite3.connect(str(database_path))
+        cursor = conn.cursor()
+        cursor.execute("SELECT name FROM images ORDER BY image_id")
+        image_names = [row[0] for row in cursor.fetchall()]
+        conn.close()
+        
+        # 입력 디렉토리 찾기
+        input_dir = Path(database_path).parent / "input"
+        
+        base_cmd = [
+            self.colmap_exe, "feature_extractor",
+            "--database_path", str(database_path),
+            "--image_path", str(input_dir),
+            "--ImageReader.single_camera", "1",
+            "--SiftExtraction.max_num_features", "1000"
+        ]
+        
+        # Qt GUI 문제 해결을 위한 환경 변수 설정
+        env = os.environ.copy()
+        env["QT_QPA_PLATFORM"] = "offscreen"
+        env["DISPLAY"] = ":0"
+        
+        try:
+            result = subprocess.run(base_cmd, capture_output=True, text=True, timeout=1800, env=env)
+            if result.returncode == 0:
+                print("  ✓ COLMAP SIFT 특징점 추출 완료")
+            else:
+                print(f"  ✗ COLMAP SIFT 특징점 추출 실패: {result.stderr}")
+        except Exception as e:
+            print(f"  오류: COLMAP SIFT 특징점 추출 실패: {e}")
+    
+    def _run_colmap_matching_fallback(self, database_path):
+        """COLMAP 매칭 (fallback)"""
+        print("  COLMAP 매칭 실행...")
+        
+        base_cmd = [
+            self.colmap_exe, "exhaustive_matcher",
+            "--database_path", str(database_path)
+        ]
+        
+        # Qt GUI 문제 해결을 위한 환경 변수 설정
+        env = os.environ.copy()
+        env["QT_QPA_PLATFORM"] = "offscreen"
+        env["DISPLAY"] = ":0"
+        
+        try:
+            result = subprocess.run(base_cmd, capture_output=True, text=True, timeout=1800, env=env)
+            if result.returncode == 0:
+                print("  ✓ COLMAP 매칭 완료")
+            else:
+                print(f"  ✗ COLMAP 매칭 실패: {result.stderr}")
+        except Exception as e:
+            print(f"  오류: COLMAP 매칭 실패: {e}")
+    
     def _run_colmap_undistortion(self, image_path, sparse_path, output_path):
         """COLMAP 언디스토션"""
+        print("  COLMAP 언디스토션 실행...")
+        
+        # sparse 디렉토리 확인
+        if not sparse_path.exists():
+            print("  ⚠️  sparse 디렉토리가 없습니다. 언디스토션을 건너뜁니다.")
+            return
+        
         sparse_models = list(sparse_path.glob("*/"))
         if not sparse_models:
-            print("  경고: Sparse reconstruction 없음")
+            print("  ⚠️  reconstruction 디렉토리가 없습니다. 언디스토션을 건너뜁니다.")
             return
         
         # 가장 큰 모델 선택
-        best_model = max(sparse_models, key=lambda x: len(list(x.glob("*.bin"))))
+        try:
+            best_model = max(sparse_models, key=lambda x: len(list(x.glob("*.bin"))))
+            print(f"  선택된 reconstruction: {best_model}")
+        except Exception as e:
+            print(f"  ⚠️  reconstruction 선택 실패: {e}")
+            return
+        
+        # reconstruction 파일 확인
+        required_files = ['cameras.bin', 'images.bin', 'points3D.bin']
+        missing_files = []
+        for file in required_files:
+            if not (best_model / file).exists():
+                missing_files.append(file)
+        
+        if missing_files:
+            print(f"  ⚠️  필요한 파일이 없습니다: {missing_files}")
+            print("  언디스토션을 건너뜁니다.")
+            return
         
         cmd = [
             self.colmap_exe, "image_undistorter",
@@ -597,7 +720,7 @@ class SuperGlueCOLMAPHybrid:
             "--output_type", "COLMAP"
         ]
         
-        print("  COLMAP 언디스토션 실행...")
+        print(f"  언디스토션 명령: {' '.join(cmd)}")
         
         # Qt GUI 문제 해결을 위한 환경 변수 설정
         env = os.environ.copy()
@@ -609,9 +732,39 @@ class SuperGlueCOLMAPHybrid:
             if result.returncode == 0:
                 print("  ✓ 언디스토션 완료")
             else:
-                print("  경고: 언디스토션 오류")
+                print(f"  ✗ 언디스토션 실패 (코드: {result.returncode})")
+                if result.stdout:
+                    print(f"  stdout: {result.stdout}")
+                if result.stderr:
+                    print(f"  stderr: {result.stderr}")
+                
+                # 언디스토션 실패 시 원본 이미지 복사
+                print("  🔄 원본 이미지 복사로 fallback...")
+                self._copy_original_images_fallback(image_path, output_path)
+                
+        except subprocess.TimeoutExpired:
+            print("  경고: 언디스토션 타임아웃")
+            self._copy_original_images_fallback(image_path, output_path)
         except Exception as e:
             print(f"  오류: 언디스토션 실패: {e}")
+            self._copy_original_images_fallback(image_path, output_path)
+    
+    def _copy_original_images_fallback(self, image_path, output_path):
+        """언디스토션 실패 시 원본 이미지 복사"""
+        try:
+            output_path.mkdir(parents=True, exist_ok=True)
+            images_dir = output_path / "images"
+            images_dir.mkdir(exist_ok=True)
+            
+            # 원본 이미지들을 undistorted/images로 복사
+            for img_file in Path(image_path).glob("*.jpg"):
+                dst_file = images_dir / img_file.name
+                shutil.copy2(img_file, dst_file)
+            
+            print(f"  ✓ 원본 이미지 복사 완료: {len(list(Path(image_path).glob('*.jpg')))}개")
+            
+        except Exception as e:
+            print(f"  오류: 원본 이미지 복사 실패: {e}")
     
     def _convert_to_3dgs_format(self, colmap_path, original_image_paths):
         """3DGS 형식 변환"""
@@ -629,8 +782,23 @@ class SuperGlueCOLMAPHybrid:
                 return self._create_default_scene_info(original_image_paths, colmap_path)
             
             # 가장 큰 reconstruction 선택
-            best_recon = max(reconstruction_dirs, key=lambda x: len(list(x.glob("*.bin"))))
-            print(f"  선택된 reconstruction: {best_recon}")
+            try:
+                best_recon = max(reconstruction_dirs, key=lambda x: len(list(x.glob("*.bin"))))
+                print(f"  선택된 reconstruction: {best_recon}")
+            except Exception as e:
+                print(f"  reconstruction 선택 실패: {e}")
+                return self._create_default_scene_info(original_image_paths, colmap_path)
+            
+            # reconstruction 파일 확인
+            required_files = ['cameras.bin', 'images.bin']
+            missing_files = []
+            for file in required_files:
+                if not (best_recon / file).exists():
+                    missing_files.append(file)
+            
+            if missing_files:
+                print(f"  필요한 reconstruction 파일이 없음: {missing_files}")
+                return self._create_default_scene_info(original_image_paths, colmap_path)
             
             # SceneInfo 생성 시도
             return self._create_scene_info_from_colmap(best_recon, original_image_paths, colmap_path)
