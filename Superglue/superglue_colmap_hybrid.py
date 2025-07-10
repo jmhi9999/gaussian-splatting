@@ -1516,38 +1516,133 @@ class SuperGlueCOLMAPHybrid:
             if not all([cameras_bin.exists(), images_bin.exists(), points3d_bin.exists()]):
                 raise RuntimeError("COLMAP reconstruction 파일 누락")
             
-            # COLMAP reconstruction을 3DGS 형식으로 변환
-            from scene.colmap_loader import readColmapSceneInfo
+            # COLMAP reconstruction을 직접 파싱
+            from scene.colmap_loader import read_intrinsics_binary, read_extrinsics_binary, read_points3D_binary
+            from utils.graphics_utils import BasicPointCloud
+            from scene.dataset_readers import CameraInfo, SceneInfo
             
-            # 임시 디렉토리 구조 생성
-            temp_dir = output_path / "temp_colmap"
-            temp_dir.mkdir(exist_ok=True)
+            # 카메라 내부 파라미터 읽기
+            cameras = read_intrinsics_binary(str(cameras_bin))
+            print(f"      카메라 내부 파라미터: {len(cameras)}개")
             
-            # sparse 디렉토리 복사
-            temp_sparse = temp_dir / "sparse"
-            temp_sparse.mkdir(exist_ok=True)
+            # 이미지 외부 파라미터 읽기
+            images = read_extrinsics_binary(str(images_bin))
+            print(f"      이미지 외부 파라미터: {len(images)}개")
             
-            import shutil
-            shutil.copytree(reconstruction_path, temp_sparse / "0", dirs_exist_ok=True)
+            # 3D 포인트 읽기
+            xyzs, rgbs, errors = read_points3D_binary(str(points3d_bin))
+            print(f"      3D 포인트: {len(xyzs)}개")
             
-            # COLMAP loader 사용
-            scene_info = readColmapSceneInfo(
-                str(temp_dir),
-                "images",
-                "",
-                False,
-                False
+            # SceneInfo 생성
+            train_cameras = []
+            test_cameras = []
+            
+            # 이미지 경로 매핑 생성
+            image_name_to_path = {path.name: path for path in image_paths}
+            
+            for image_id, image in images.items():
+                # 이미지 파일 경로 찾기
+                image_name = image.name
+                if image_name not in image_name_to_path:
+                    print(f"      ⚠️  이미지 경로 없음: {image_name}")
+                    continue
+                
+                image_path = image_name_to_path[image_name]
+                
+                # 카메라 내부 파라미터
+                camera = cameras[image.camera_id]
+                width, height = camera.width, camera.height
+                
+                # PINHOLE 모델 가정 (fx, fy, cx, cy)
+                if len(camera.params) == 4:
+                    fx, fy, cx, cy = camera.params
+                    focal_length = (fx + fy) / 2.0
+                    fov_x = 2 * np.arctan(width / (2 * fx))
+                    fov_y = 2 * np.arctan(height / (2 * fy))
+                else:
+                    # 기본값
+                    focal_length = max(width, height) * 1.2
+                    fov_x = 2 * np.arctan(width / (2 * focal_length))
+                    fov_y = 2 * np.arctan(height / (2 * focal_length))
+                
+                # 외부 파라미터 (quaternion -> rotation matrix)
+                R = image.qvec2rotmat()
+                T = image.tvec
+                
+                # CameraInfo 생성
+                cam_info = CameraInfo(
+                    uid=image_id,
+                    R=R,
+                    T=T,
+                    FovY=fov_y,
+                    FovX=fov_x,
+                    depth_params=None,
+                    image_path=str(image_path),
+                    image_name=image_name,
+                    depth_path="",
+                    width=width,
+                    height=height,
+                    is_test=(image_id % 8 == 0)  # 8개마다 1개씩 테스트
+                )
+                
+                if cam_info.is_test:
+                    test_cameras.append(cam_info)
+                else:
+                    train_cameras.append(cam_info)
+            
+            # 포인트 클라우드 생성
+            point_cloud = BasicPointCloud(
+                points=xyzs.astype(np.float32),
+                colors=rgbs.astype(np.float32) / 255.0,  # 0-255 -> 0-1
+                normals=np.zeros_like(xyzs, dtype=np.float32)  # 기본값
+            )
+            
+            # NeRF 정규화 계산
+            cam_centers = []
+            for cam in train_cameras:
+                cam_center = -np.dot(cam.R.T, cam.T)
+                cam_centers.append(cam_center)
+            
+            if cam_centers:
+                cam_centers = np.array(cam_centers)
+                center = np.mean(cam_centers, axis=0)
+                distances = np.linalg.norm(cam_centers - center, axis=1)
+                radius = np.max(distances) * 1.1
+            else:
+                center = np.zeros(3)
+                radius = 5.0
+            
+            nerf_normalization = {
+                "translate": -center,
+                "radius": radius
+            }
+            
+            # PLY 파일 저장
+            ply_path = output_path / "points3D.ply"
+            self._save_basic_ply(ply_path, xyzs, rgbs / 255.0)
+            
+            # SceneInfo 생성
+            scene_info = SceneInfo(
+                point_cloud=point_cloud,
+                train_cameras=train_cameras,
+                test_cameras=test_cameras,
+                nerf_normalization=nerf_normalization,
+                ply_path=str(ply_path),
+                is_nerf_synthetic=False
             )
             
             print(f"    ✅ COLMAP reconstruction 파싱 성공!")
-            print(f"      Train cameras: {len(scene_info.train_cameras)}")
-            print(f"      Test cameras: {len(scene_info.test_cameras)}")
-            print(f"      Point cloud: {len(scene_info.point_cloud.points)} points")
+            print(f"      Train cameras: {len(train_cameras)}")
+            print(f"      Test cameras: {len(test_cameras)}")
+            print(f"      Point cloud: {len(xyzs)} points")
+            print(f"      Scene radius: {radius:.3f}")
             
             return scene_info
             
         except Exception as e:
             print(f"    ❌ COLMAP reconstruction 파싱 실패: {e}")
+            import traceback
+            traceback.print_exc()
             raise RuntimeError(f"COLMAP reconstruction 파싱 실패: {e}")
 
 # 사용 예시
