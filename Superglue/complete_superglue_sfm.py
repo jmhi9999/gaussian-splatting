@@ -44,13 +44,13 @@ class SuperGlue3DGSPipeline:
             config = {
                 'superpoint': {
                     'nms_radius': 4,
-                    'keypoint_threshold': 0.01,  # 임계값 높임 (0.005 → 0.01)
-                    'max_keypoints': 2048  # 특징점 수 줄임 (4096 → 2048)
+                    'keypoint_threshold': 0.02,  # 임계값 더 높임 (0.01 → 0.02)
+                    'max_keypoints': 1024  # 특징점 수 더 줄임 (2048 → 1024)
                 },
                 'superglue': {
                     'weights': 'outdoor',
                     'sinkhorn_iterations': 20,
-                    'match_threshold': 0.3,  # 매칭 임계값 높임 (0.2 → 0.3)
+                    'match_threshold': 0.5,  # 매칭 임계값 더 높임 (0.3 → 0.5)
                 }
             }
         
@@ -151,7 +151,7 @@ class SuperGlue3DGSPipeline:
         # 1. 순차적 매칭 (인접 이미지)
         for i in range(n_images - 1):
             matches = self._match_pair_superglue(i, i+1)
-            if len(matches) > 15:  # 임계값 높임 (5 → 15)
+            if len(matches) > 30:  # 임계값 더 높임 (15 → 30)
                 self.matches[(i, i+1)] = matches
         
         # 2. 건너뛰기 매칭 (2, 3, 5, 10 간격)
@@ -162,7 +162,7 @@ class SuperGlue3DGSPipeline:
                     break
                     
                 matches = self._match_pair_superglue(i, j)
-                if len(matches) > 25:  # 임계값 높임 (8 → 25)
+                if len(matches) > 50:  # 임계값 더 높임 (25 → 50)
                     self.matches[(i, j)] = matches
         
         print(f"  Created {len(self.matches)} image pairs with good matches")
@@ -290,8 +290,8 @@ class SuperGlue3DGSPipeline:
         kpts_i = self.image_features[cam_i]['keypoints']
         kpts_j = self.image_features[cam_j]['keypoints']
         
-        pts_i = np.array([kpts_i[idx_i] for idx_i, _, conf in matches if conf > 0.5])  # 임계값 높임 (0.3 → 0.5)
-        pts_j = np.array([kpts_j[idx_j] for _, idx_j, conf in matches if conf > 0.5])  # 임계값 높임 (0.3 → 0.5)
+        pts_i = np.array([kpts_i[idx_i] for idx_i, _, conf in matches if conf > 0.7])  # 임계값 더 높임 (0.5 → 0.7)
+        pts_j = np.array([kpts_j[idx_j] for _, idx_j, conf in matches if conf > 0.7])  # 임계값 더 높임 (0.5 → 0.7)
         
         if len(pts_i) < 8:
             return None, None
@@ -349,7 +349,7 @@ class SuperGlue3DGSPipeline:
             kpts_j = self.image_features[cam_j]['keypoints']
             
             for idx_i, idx_j, conf in matches:
-                if conf < 0.4:  # 임계값 높임 (0.1 → 0.4)
+                if conf < 0.7:  # 임계값 매우 높임 (0.4 → 0.7)
                     continue
                 
                 # 삼각측량
@@ -401,7 +401,7 @@ class SuperGlue3DGSPipeline:
             # 카메라 좌표계로 변환
             point_cam = R @ (point_3d - T)
             
-            if point_cam[2] <= 0.1:  # 더 엄격한 조건 (0.01 → 0.1)
+            if point_cam[2] <= 0.2:  # 더 엄격한 조건 (0.1 → 0.2)
                 return False
             
             # 재투영 오차 확인
@@ -409,10 +409,10 @@ class SuperGlue3DGSPipeline:
             point_2d_proj = K @ point_cam
             point_2d_proj = point_2d_proj[:2] / point_2d_proj[2]
             
-            # 이미지 경계 확인 (더 엄격한 조건)
+            # 이미지 경계 확인 (매우 엄격한 조건)
             h, w = self.image_features[cam_id]['image_size']
-            if (point_2d_proj[0] < -w*0.05 or point_2d_proj[0] >= w*1.05 or
-                point_2d_proj[1] < -h*0.05 or point_2d_proj[1] >= h*1.05):
+            if (point_2d_proj[0] < 0 or point_2d_proj[0] >= w or
+                point_2d_proj[1] < 0 or point_2d_proj[1] >= h):
                 return False
         
         return True
@@ -517,9 +517,9 @@ class SuperGlue3DGSPipeline:
                     self.colors = colors
                     self.normals = normals
         
-        points = np.random.randn(20000, 3).astype(np.float32) * 2  # 더 많은 포인트
-        colors = np.random.rand(20000, 3).astype(np.float32)
-        normals = np.random.randn(20000, 3).astype(np.float32)
+        points = np.random.randn(5000, 3).astype(np.float32) * 2  # 포인트 수 줄임 (20000 → 5000)
+        colors = np.random.rand(5000, 3).astype(np.float32)
+        normals = np.random.randn(5000, 3).astype(np.float32)
         normals = normals / np.linalg.norm(normals, axis=1, keepdims=True)
         
         return BasicPointCloud(points=points, colors=colors, normals=normals)
@@ -885,7 +885,7 @@ def _create_fallback_scene_info(images_folder, max_images):
         cam_infos.append(cam_info)
     
     # 기본 포인트 클라우드
-    n_points = 20000  # 더 많은 포인트
+    n_points = 5000  # 포인트 수 줄임 (20000 → 5000)
     points = np.random.randn(n_points, 3).astype(np.float32) * 2
     colors = np.random.rand(n_points, 3).astype(np.float32)
     normals = np.random.randn(n_points, 3).astype(np.float32)
