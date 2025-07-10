@@ -16,7 +16,8 @@ import sys
 from models.matching import Matching
 from models.utils import frame2tensor
 
-# 3DGS 관련 imports
+# 3DGS 관련 imports - 경로 수정
+sys.path.append(str(Path(__file__).parent.parent))  # gaussian-splatting 루트 추가
 from scene.dataset_readers import CameraInfo, SceneInfo
 from utils.graphics_utils import BasicPointCloud
 

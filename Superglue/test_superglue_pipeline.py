@@ -7,8 +7,13 @@ import sys
 import os
 from pathlib import Path
 
-# Add the current directory to Python path
-sys.path.append(str(Path(__file__).parent))
+# Add the gaussian-splatting root to Python path
+gaussian_splatting_root = Path(__file__).parent.parent
+sys.path.insert(0, str(gaussian_splatting_root))
+
+# Add Superglue directory to path
+superglue_dir = Path(__file__).parent
+sys.path.insert(0, str(superglue_dir))
 
 from complete_superglue_sfm import SuperGlue3DGSPipeline
 
@@ -33,11 +38,15 @@ def test_pipeline():
     pipeline = SuperGlue3DGSPipeline(config, device='cuda')
     
     # Test with a small number of images
-    input_dir = "ImageInputs/images"  # Adjust path as needed
+    input_dir = "../ImageInputs/images"  # Adjust path as needed
     output_dir = "test_output"
     
     if not os.path.exists(input_dir):
         print(f"Input directory {input_dir} not found!")
+        print(f"Current working directory: {os.getcwd()}")
+        print(f"Available directories:")
+        for item in os.listdir(".."):
+            print(f"  - {item}")
         return False
     
     try:
