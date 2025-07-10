@@ -162,16 +162,14 @@ class SuperGlueCOLMAPHybrid:
                         pred0 = self.superpoint({'image': test_tensor})
                         pred1 = self.superpoint({'image': test_tensor})
                     
-                    # SuperGlue 입력 데이터 준비
+                    # SuperGlue 입력 데이터 준비 (올바른 형태)
                     test_data = {
-                        'image0': test_tensor,
-                        'image1': test_tensor,
-                        'keypoints0': pred0['keypoints'][0].unsqueeze(0).to(self.device),
-                        'keypoints1': pred1['keypoints'][0].unsqueeze(0).to(self.device),
-                        'scores0': pred0['scores'][0].unsqueeze(0).to(self.device),
-                        'scores1': pred1['scores'][0].unsqueeze(0).to(self.device),
-                        'descriptors0': pred0['descriptors'][0].unsqueeze(0).to(self.device),
-                        'descriptors1': pred1['descriptors'][0].unsqueeze(0).to(self.device),
+                        'keypoints0': [pred0['keypoints'][0].to(self.device)],
+                        'keypoints1': [pred1['keypoints'][0].to(self.device)],
+                        'scores0': [pred0['scores'][0].to(self.device)],
+                        'scores1': [pred1['scores'][0].to(self.device)],
+                        'descriptors0': [pred0['descriptors'][0].to(self.device)],
+                        'descriptors1': [pred1['descriptors'][0].to(self.device)],
                     }
                     
                     with torch.no_grad():
@@ -569,9 +567,11 @@ class SuperGlueCOLMAPHybrid:
                 scores = pred['scores'][0].cpu().numpy()  # (N,)
                 descriptors = pred['descriptors'][0].cpu().numpy()  # (256, N)
             
-            # descriptor transpose
+            # descriptor transpose - SuperGlue 호환을 위해
             if len(descriptors.shape) == 2 and descriptors.shape[0] == 256:
                 descriptors = descriptors.T  # (N, 256)
+            
+            print(f"        SuperPoint 결과: {len(keypoints)}개 키포인트, {descriptors.shape}")
             
             # 최소 특징점 수 확인
             if len(keypoints) < 10:
@@ -596,16 +596,27 @@ class SuperGlueCOLMAPHybrid:
     def _run_superglue_matching_on_pair(self, pred1, pred2):
         """SuperGlue를 사용한 두 이미지 간 매칭"""
         try:
+            print(f"        SuperGlue 입력 데이터 준비 중...")
+            print(f"        pred1: keypoints={pred1['keypoints'].shape}, scores={pred1['scores'].shape}, descriptors={pred1['descriptors'].shape}")
+            print(f"        pred2: keypoints={pred2['keypoints'].shape}, scores={pred2['scores'].shape}, descriptors={pred2['descriptors'].shape}")
+            
+            # SuperGlue가 기대하는 형태로 데이터 변환
+            # SuperGlue는 list 형태의 keypoints, scores, descriptors를 기대
+            keypoints0 = [torch.from_numpy(pred1['keypoints']).to(self.device)]
+            keypoints1 = [torch.from_numpy(pred2['keypoints']).to(self.device)]
+            scores0 = [torch.from_numpy(pred1['scores']).to(self.device)]
+            scores1 = [torch.from_numpy(pred2['scores']).to(self.device)]
+            descriptors0 = [torch.from_numpy(pred1['descriptors']).to(self.device)]
+            descriptors1 = [torch.from_numpy(pred2['descriptors']).to(self.device)]
+            
             # 입력 데이터 준비
             data = {
-                'image0': torch.zeros(1, 1, 480, 640).to(self.device),  # 더미 이미지
-                'image1': torch.zeros(1, 1, 480, 640).to(self.device),  # 더미 이미지
-                'keypoints0': torch.from_numpy(pred1['keypoints']).unsqueeze(0).to(self.device),
-                'keypoints1': torch.from_numpy(pred2['keypoints']).unsqueeze(0).to(self.device),
-                'scores0': torch.from_numpy(pred1['scores']).unsqueeze(0).to(self.device),
-                'scores1': torch.from_numpy(pred2['scores']).unsqueeze(0).to(self.device),
-                'descriptors0': torch.from_numpy(pred1['descriptors']).unsqueeze(0).to(self.device),
-                'descriptors1': torch.from_numpy(pred2['descriptors']).unsqueeze(0).to(self.device),
+                'keypoints0': keypoints0,
+                'keypoints1': keypoints1,
+                'scores0': scores0,
+                'scores1': scores1,
+                'descriptors0': descriptors0,
+                'descriptors1': descriptors1,
             }
             
             # SuperGlue 추론
@@ -615,7 +626,7 @@ class SuperGlueCOLMAPHybrid:
                 confidence = pred['matching_scores0'][0].cpu().numpy()  # (N,)
             
             # 메모리 정리
-            del data
+            del data, keypoints0, keypoints1, scores0, scores1, descriptors0, descriptors1
             if self.device == "cuda":
                 torch.cuda.empty_cache()
             
