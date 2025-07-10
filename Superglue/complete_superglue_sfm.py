@@ -16,10 +16,21 @@ import sys
 from models.matching import Matching
 from models.utils import frame2tensor
 
-# 3DGS 관련 imports - 경로 수정
-sys.path.append(str(Path(__file__).parent.parent))  # gaussian-splatting 루트 추가
-from scene.dataset_readers import CameraInfo, SceneInfo
-from utils.graphics_utils import BasicPointCloud
+# 3DGS 관련 imports - lazy import로 변경
+def get_3dgs_imports():
+    """3DGS 관련 모듈들을 lazy import"""
+    # gaussian-splatting 루트 디렉토리를 Python path에 추가
+    gaussian_splatting_root = Path(__file__).parent.parent
+    if str(gaussian_splatting_root) not in sys.path:
+        sys.path.insert(0, str(gaussian_splatting_root))
+    
+    try:
+        from scene.dataset_readers import CameraInfo, SceneInfo
+        from utils.graphics_utils import BasicPointCloud
+        return CameraInfo, SceneInfo, BasicPointCloud
+    except ImportError as e:
+        print(f"Warning: Could not import 3DGS modules: {e}")
+        return None, None, None
 
 
 class SuperGlue3DGSPipeline:
@@ -33,13 +44,13 @@ class SuperGlue3DGSPipeline:
             config = {
                 'superpoint': {
                     'nms_radius': 4,
-                    'keypoint_threshold': 0.005,
-                    'max_keypoints': 4096  # 더 많은 특징점
+                    'keypoint_threshold': 0.01,  # 임계값 높임 (0.005 → 0.01)
+                    'max_keypoints': 2048  # 특징점 수 줄임 (4096 → 2048)
                 },
                 'superglue': {
                     'weights': 'outdoor',
                     'sinkhorn_iterations': 20,
-                    'match_threshold': 0.2,
+                    'match_threshold': 0.3,  # 매칭 임계값 높임 (0.2 → 0.3)
                 }
             }
         
@@ -140,7 +151,7 @@ class SuperGlue3DGSPipeline:
         # 1. 순차적 매칭 (인접 이미지)
         for i in range(n_images - 1):
             matches = self._match_pair_superglue(i, i+1)
-            if len(matches) > 5:  # 임계값 더 낮춤
+            if len(matches) > 15:  # 임계값 높임 (5 → 15)
                 self.matches[(i, i+1)] = matches
         
         # 2. 건너뛰기 매칭 (2, 3, 5, 10 간격)
@@ -151,7 +162,7 @@ class SuperGlue3DGSPipeline:
                     break
                     
                 matches = self._match_pair_superglue(i, j)
-                if len(matches) > 8:  # 임계값 더 낮춤
+                if len(matches) > 25:  # 임계값 높임 (8 → 25)
                     self.matches[(i, j)] = matches
         
         print(f"  Created {len(self.matches)} image pairs with good matches")
@@ -279,8 +290,8 @@ class SuperGlue3DGSPipeline:
         kpts_i = self.image_features[cam_i]['keypoints']
         kpts_j = self.image_features[cam_j]['keypoints']
         
-        pts_i = np.array([kpts_i[idx_i] for idx_i, _, conf in matches if conf > 0.3])
-        pts_j = np.array([kpts_j[idx_j] for _, idx_j, conf in matches if conf > 0.3])
+        pts_i = np.array([kpts_i[idx_i] for idx_i, _, conf in matches if conf > 0.5])  # 임계값 높임 (0.3 → 0.5)
+        pts_j = np.array([kpts_j[idx_j] for _, idx_j, conf in matches if conf > 0.5])  # 임계값 높임 (0.3 → 0.5)
         
         if len(pts_i) < 8:
             return None, None
@@ -338,7 +349,7 @@ class SuperGlue3DGSPipeline:
             kpts_j = self.image_features[cam_j]['keypoints']
             
             for idx_i, idx_j, conf in matches:
-                if conf < 0.1:  # 임계값 더 낮춤
+                if conf < 0.4:  # 임계값 높임 (0.1 → 0.4)
                     continue
                 
                 # 삼각측량
@@ -390,7 +401,7 @@ class SuperGlue3DGSPipeline:
             # 카메라 좌표계로 변환
             point_cam = R @ (point_3d - T)
             
-            if point_cam[2] <= 0.01:  # 더 관대한 조건
+            if point_cam[2] <= 0.1:  # 더 엄격한 조건 (0.01 → 0.1)
                 return False
             
             # 재투영 오차 확인
@@ -398,10 +409,10 @@ class SuperGlue3DGSPipeline:
             point_2d_proj = K @ point_cam
             point_2d_proj = point_2d_proj[:2] / point_2d_proj[2]
             
-            # 이미지 경계 확인 (더 관대한 조건)
+            # 이미지 경계 확인 (더 엄격한 조건)
             h, w = self.image_features[cam_id]['image_size']
-            if (point_2d_proj[0] < -w*0.2 or point_2d_proj[0] >= w*1.2 or
-                point_2d_proj[1] < -h*0.2 or point_2d_proj[1] >= h*1.2):
+            if (point_2d_proj[0] < -w*0.05 or point_2d_proj[0] >= w*1.05 or
+                point_2d_proj[1] < -h*0.05 or point_2d_proj[1] >= h*1.05):
                 return False
         
         return True
@@ -429,6 +440,11 @@ class SuperGlue3DGSPipeline:
     
     def _create_3dgs_scene_info(self, image_paths):
         """3DGS용 SceneInfo 생성"""
+        
+        # Lazy import 3DGS modules
+        CameraInfo, SceneInfo, BasicPointCloud = get_3dgs_imports()
+        if CameraInfo is None:
+            raise ImportError("3DGS modules not available")
         
         # CameraInfo 리스트 생성
         cam_infos = []
@@ -491,6 +507,16 @@ class SuperGlue3DGSPipeline:
     
     def _create_default_pointcloud(self):
         """기본 포인트 클라우드 생성"""
+        # Lazy import 3DGS modules
+        _, _, BasicPointCloud = get_3dgs_imports()
+        if BasicPointCloud is None:
+            # Fallback: 간단한 클래스 정의
+            class BasicPointCloud:
+                def __init__(self, points, colors, normals):
+                    self.points = points
+                    self.colors = colors
+                    self.normals = normals
+        
         points = np.random.randn(20000, 3).astype(np.float32) * 2  # 더 많은 포인트
         colors = np.random.rand(20000, 3).astype(np.float32)
         normals = np.random.randn(20000, 3).astype(np.float32)
@@ -500,7 +526,17 @@ class SuperGlue3DGSPipeline:
     
     def _compute_nerf_normalization(self, cam_infos):
         """NeRF 정규화 파라미터 계산"""
-        from utils.graphics_utils import getWorld2View2
+        # Lazy import 3DGS modules
+        try:
+            from utils.graphics_utils import getWorld2View2
+        except ImportError:
+            # Fallback: 간단한 함수 정의
+            def getWorld2View2(R, t):
+                Rt = np.zeros((4, 4))
+                Rt[:3, :3] = R
+                Rt[:3, 3] = t
+                Rt[3, 3] = 1.0
+                return Rt
         
         cam_centers = []
         for cam in cam_infos:
@@ -755,8 +791,39 @@ def readSuperGlueSceneInfo(path, images, eval, train_test_exp=False, llffhold=8,
 
 def _create_fallback_scene_info(images_folder, max_images):
     """SuperGlue 실패시 기본 scene 생성"""
-    from scene.dataset_readers import CameraInfo, SceneInfo
-    from utils.graphics_utils import BasicPointCloud
+    # Lazy import 3DGS modules
+    CameraInfo, SceneInfo, BasicPointCloud = get_3dgs_imports()
+    if CameraInfo is None:
+        # Fallback: 간단한 클래스 정의들
+        class CameraInfo:
+            def __init__(self, uid, R, T, FovY, FovX, image_path, image_name, width, height, depth_params, depth_path, is_test):
+                self.uid = uid
+                self.R = R
+                self.T = T
+                self.FovY = FovY
+                self.FovX = FovX
+                self.image_path = image_path
+                self.image_name = image_name
+                self.width = width
+                self.height = height
+                self.depth_params = depth_params
+                self.depth_path = depth_path
+                self.is_test = is_test
+        
+        class SceneInfo:
+            def __init__(self, point_cloud, train_cameras, test_cameras, nerf_normalization, ply_path, is_nerf_synthetic):
+                self.point_cloud = point_cloud
+                self.train_cameras = train_cameras
+                self.test_cameras = test_cameras
+                self.nerf_normalization = nerf_normalization
+                self.ply_path = ply_path
+                self.is_nerf_synthetic = is_nerf_synthetic
+        
+        class BasicPointCloud:
+            def __init__(self, points, colors, normals):
+                self.points = points
+                self.colors = colors
+                self.normals = normals
     
     # 이미지 수집
     image_paths = []
