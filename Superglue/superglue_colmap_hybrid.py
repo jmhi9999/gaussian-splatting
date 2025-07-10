@@ -1119,9 +1119,16 @@ class SuperGlueCOLMAPHybrid:
                         if i in image_id_map and j in image_id_map:
                             pair_id = image_id_map[i] * 2147483647 + image_id_map[j]  # COLMAP pair_id 형식
                             
+                            # matches 테이블에 저장
                             cursor.execute(
                                 "INSERT INTO matches (pair_id, rows, cols, data) VALUES (?, ?, ?, ?)",
                                 (pair_id, len(matches), 2, matches.tobytes())
+                            )
+                            
+                            # two_view_geometries 테이블에도 저장 (COLMAP 매퍼가 필요로 함)
+                            cursor.execute(
+                                "INSERT INTO two_view_geometries (pair_id, rows, cols, data, config) VALUES (?, ?, ?, ?, ?)",
+                                (pair_id, len(matches), 2, matches.tobytes(), 2)  # config=2는 기본값
                             )
                             
                             print(f"        ✅ {len(matches)}개 매칭 저장 (pair_id: {pair_id})")
@@ -1136,6 +1143,9 @@ class SuperGlueCOLMAPHybrid:
             
             print(f"    📊 매칭 결과: {successful_matches}/{total_pairs} 성공")
             
+            # 매칭 결과 확인
+            self._verify_matches_in_database(database_path)
+            
             if successful_matches == 0:
                 print("    ⚠️  SuperGlue 매칭 실패, COLMAP 매칭으로 fallback...")
                 self._run_colmap_matching_fast(database_path)
@@ -1146,6 +1156,37 @@ class SuperGlueCOLMAPHybrid:
             print(f"    ❌ SuperGlue 매칭 오류: {e}")
             print("    🔄 COLMAP 매칭으로 fallback...")
             self._run_colmap_matching_fast(database_path)
+    
+    def _verify_matches_in_database(self, database_path):
+        """매칭 결과가 DB에 제대로 저장되었는지 확인"""
+        try:
+            import sqlite3
+            
+            conn = sqlite3.connect(database_path)
+            cursor = conn.cursor()
+            
+            # 매칭 개수 확인
+            cursor.execute("SELECT COUNT(*) FROM two_view_geometries")
+            match_count = cursor.fetchone()[0]
+            
+            # 이미지 개수 확인
+            cursor.execute("SELECT COUNT(*) FROM images")
+            image_count = cursor.fetchone()[0]
+            
+            conn.close()
+            
+            print(f"    🔍 DB 검증: {match_count}개 매칭, {image_count}개 이미지")
+            
+            if match_count == 0:
+                print("    ⚠️  경고: DB에 매칭이 없습니다!")
+                return False
+            else:
+                print(f"    ✅ DB에 {match_count}개 매칭 저장됨")
+                return True
+                
+        except Exception as e:
+            print(f"    ⚠️  DB 검증 실패: {e}")
+            return False
         
     def _create_default_scene_info(self, image_paths, output_path):
         """기본 SceneInfo 생성 - CameraInfo 파라미터 수정"""
@@ -1325,27 +1366,26 @@ class SuperGlueCOLMAPHybrid:
         env["DISPLAY"] = ":0"
         env["XDG_RUNTIME_DIR"] = "/tmp/runtime-colmap"
         
-        # Ultra permissive 매퍼 설정
-        base_cmd = [
-            self.colmap_exe, "mapper",
-            "--database_path", str(database_path),
-            "--image_path", str(image_path),
-            "--output_path", str(output_path),
-            
-            # 📉 Ultra permissive 설정
-            "--Mapper.min_num_matches", "2",              # 최소 2개 매칭
-            "--Mapper.init_min_num_inliers", "3",         # 최소 3개 inlier
-            "--Mapper.abs_pose_min_num_inliers", "2",     # 최소 2개 inlier
-            "--Mapper.filter_max_reproj_error", "50.0",   # 매우 큰 허용 오차
-            "--Mapper.ba_refine_focal_length", "0",       # 초점거리 고정
-            "--Mapper.ba_refine_principal_point", "0",    # 주점 고정
-            "--Mapper.ba_refine_extra_params", "0",       # 추가 파라미터 고정
-            
-            # 🚀 성능 개선
-            "--Mapper.max_num_models", "1",               # 단일 모델만
-            "--Mapper.min_model_size", "2",               # 최소 2장 이미지
-            "--Mapper.max_model_size", "1000",            # 최대 모델 크기
-        ]
+                    # Ultra permissive 매퍼 설정
+            base_cmd = [
+                self.colmap_exe, "mapper",
+                "--database_path", str(database_path),
+                "--image_path", str(image_path),
+                "--output_path", str(output_path),
+                
+                # 📉 Ultra permissive 설정
+                "--Mapper.min_num_matches", "2",              # 최소 2개 매칭
+                "--Mapper.init_min_num_inliers", "3",         # 최소 3개 inlier
+                "--Mapper.abs_pose_min_num_inliers", "2",     # 최소 2개 inlier
+                "--Mapper.filter_max_reproj_error", "50.0",   # 매우 큰 허용 오차
+                "--Mapper.ba_refine_focal_length", "0",       # 초점거리 고정
+                "--Mapper.ba_refine_principal_point", "0",    # 주점 고정
+                "--Mapper.ba_refine_extra_params", "0",       # 추가 파라미터 고정
+                
+                # 🚀 성능 개선
+                "--Mapper.max_num_models", "1",               # 단일 모델만
+                "--Mapper.min_model_size", "2",               # 최소 2장 이미지
+            ]
         
         print(f"    명령: {' '.join(base_cmd)}")
         
