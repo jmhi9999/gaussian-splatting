@@ -182,14 +182,14 @@ def readSuperGlueSceneInfo(path, images="images", eval=False, train_test_exp=Fal
             # SuperGlue 설정
             config = {
                 'superpoint': {
-                    'nms_radius': 4,
-                    'keypoint_threshold': 0.005,
-                    'max_keypoints': 2048
+                    'nms_radius': 3,
+                    'keypoint_threshold': 0.003,
+                    'max_keypoints': 4096
                 },
                 'superglue': {
                     'weights': superglue_config,
-                    'sinkhorn_iterations': 20,
-                    'match_threshold': 0.2,
+                    'sinkhorn_iterations': 30,
+                    'match_threshold': 0.15,
                 }
             }
             
