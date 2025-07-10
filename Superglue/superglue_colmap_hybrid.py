@@ -328,13 +328,17 @@ class SuperGlueCOLMAPHybrid:
             if img is None:
                 return None, None
             
+            # RGB로 변환 후 그레이스케일로 변환 (SuperPoint는 1채널 입력 기대)
             img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-            img = torch.from_numpy(img).float().to(self.device) / 255.0
-            img = img.permute(2, 0, 1).unsqueeze(0)  # (1, 3, H, W)
+            img_gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+            
+            # 그레이스케일 이미지를 텐서로 변환
+            img_tensor = torch.from_numpy(img_gray).float().to(self.device) / 255.0
+            img_tensor = img_tensor.unsqueeze(0).unsqueeze(0)  # (1, 1, H, W) - 1채널
             
             # SuperPoint 추론
             with torch.no_grad():
-                pred = self.superpoint({'image': img})
+                pred = self.superpoint({'image': img_tensor})
                 keypoints = pred['keypoints'][0].cpu().numpy()  # (N, 2)
                 descriptors = pred['descriptors'][0].cpu().numpy()  # (N, 256)
             
@@ -408,19 +412,24 @@ class SuperGlueCOLMAPHybrid:
             if img1 is None or img2 is None:
                 return None
             
+            # RGB로 변환 후 그레이스케일로 변환
             img1 = cv2.cvtColor(img1, cv2.COLOR_BGR2RGB)
             img2 = cv2.cvtColor(img2, cv2.COLOR_BGR2RGB)
             
-            img1 = torch.from_numpy(img1).float().to(self.device) / 255.0
-            img2 = torch.from_numpy(img2).float().to(self.device) / 255.0
+            img1_gray = cv2.cvtColor(img1, cv2.COLOR_RGB2GRAY)
+            img2_gray = cv2.cvtColor(img2, cv2.COLOR_RGB2GRAY)
             
-            img1 = img1.permute(2, 0, 1).unsqueeze(0)
-            img2 = img2.permute(2, 0, 1).unsqueeze(0)
+            # 그레이스케일 이미지를 텐서로 변환
+            img1_tensor = torch.from_numpy(img1_gray).float().to(self.device) / 255.0
+            img2_tensor = torch.from_numpy(img2_gray).float().to(self.device) / 255.0
+            
+            img1_tensor = img1_tensor.unsqueeze(0).unsqueeze(0)  # (1, 1, H, W)
+            img2_tensor = img2_tensor.unsqueeze(0).unsqueeze(0)  # (1, 1, H, W)
             
             # SuperPoint 특징점 추출
             with torch.no_grad():
-                pred1 = self.superpoint({'image': img1})
-                pred2 = self.superpoint({'image': img2})
+                pred1 = self.superpoint({'image': img1_tensor})
+                pred2 = self.superpoint({'image': img2_tensor})
                 
                 kpts1 = pred1['keypoints'][0]
                 desc1 = pred1['descriptors'][0]
