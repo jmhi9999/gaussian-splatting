@@ -112,6 +112,43 @@ SUPERGLUE_PIPELINE_AVAILABLE = (SuperGlue3DGSPipeline is not None)
 SuperGlueCOLMAPHybrid = import_superglue_colmap_hybrid()
 SUPERGLUE_COLMAP_HYBRID_AVAILABLE = (SuperGlueCOLMAPHybrid is not None)
 
+# Hloc 파이프라인 import 시도
+def import_hloc_pipeline():
+    """Hloc 파이프라인 동적 import"""
+    try:
+        # 현재 디렉토리에서 SuperGlue 경로 찾기
+        current_dir = Path(__file__).parent.parent  # gaussian-splatting 루트
+        
+        # SuperGlue 경로들
+        superglue_paths = [
+            current_dir / "Superglue",
+            current_dir / "SuperGlue", 
+            current_dir
+        ]
+        
+        for path in superglue_paths:
+            hloc_file = path / "hloc_pipeline.py"
+            if hloc_file.exists():
+                # 해당 경로를 sys.path에 추가
+                sys.path.insert(0, str(path))
+                
+                # 모듈 import
+                from hloc_pipeline import readHlocSceneInfo
+                print(f"✓ Hloc pipeline imported from {path}")
+                return readHlocSceneInfo
+        
+        print("✗ Hloc pipeline not found")
+        return None
+        
+    except ImportError as e:
+        print(f"✗ Hloc import failed: {e}")
+        return None
+
+# Hloc 파이프라인 import 시도
+readHlocSceneInfo = import_hloc_pipeline()
+HLOC_PIPELINE_AVAILABLE = (readHlocSceneInfo is not None)
+
+
 def readSuperGlueSceneInfo(path, images="images", eval=False, train_test_exp=False, 
                           llffhold=8, superglue_config="outdoor", max_images=100):
     """SuperGlue 완전 파이프라인으로 SceneInfo 생성"""
