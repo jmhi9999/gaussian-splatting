@@ -175,7 +175,9 @@ class SuperGlueCOLMAPHybrid:
                     }
                     
                     with torch.no_grad():
-                        _ = self.superglue(test_data)
+                        result = self.superglue(test_data)
+                        # 결과 키 확인
+                        print(f"    SuperGlue 결과 키: {list(result.keys())}")
                     print("  ✓ SuperGlue 테스트 성공")
                     
                 except Exception as e:
@@ -628,7 +630,7 @@ class SuperGlueCOLMAPHybrid:
             # SuperGlue 추론
             with torch.no_grad():
                 pred = self.superglue(data)
-                matches = pred['matches0'][0].cpu().numpy()  # (N,)
+                matches = pred['indices0'][0].cpu().numpy()  # (N,)
                 confidence = pred['matching_scores0'][0].cpu().numpy()  # (N,)
             
             # 메모리 정리
