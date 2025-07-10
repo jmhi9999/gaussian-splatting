@@ -162,14 +162,14 @@ class SuperGlueCOLMAPHybrid:
                         pred0 = self.superpoint({'image': test_tensor})
                         pred1 = self.superpoint({'image': test_tensor})
                     
-                    # SuperGlue 입력 데이터 준비 (올바른 형태)
+                    # SuperGlue 입력 데이터 준비 (tensor stack 형태)
                     test_data = {
-                        'keypoints0': [pred0['keypoints'][0].to(self.device)],
-                        'keypoints1': [pred1['keypoints'][0].to(self.device)],
-                        'scores0': [pred0['scores'][0].to(self.device)],
-                        'scores1': [pred1['scores'][0].to(self.device)],
-                        'descriptors0': [pred0['descriptors'][0].to(self.device)],
-                        'descriptors1': [pred1['descriptors'][0].to(self.device)],
+                        'keypoints0': torch.stack(pred0['keypoints']).to(self.device),
+                        'keypoints1': torch.stack(pred1['keypoints']).to(self.device),
+                        'scores0': torch.stack(pred0['scores']).to(self.device),
+                        'scores1': torch.stack(pred1['scores']).to(self.device),
+                        'descriptors0': torch.stack(pred0['descriptors']).to(self.device),
+                        'descriptors1': torch.stack(pred1['descriptors']).to(self.device),
                     }
                     
                     with torch.no_grad():
@@ -601,13 +601,15 @@ class SuperGlueCOLMAPHybrid:
             print(f"        pred2: keypoints={pred2['keypoints'].shape}, scores={pred2['scores'].shape}, descriptors={pred2['descriptors'].shape}")
             
             # SuperGlue가 기대하는 형태로 데이터 변환
-            # SuperGlue는 list 형태의 keypoints, scores, descriptors를 기대
-            keypoints0 = [torch.from_numpy(pred1['keypoints']).to(self.device)]
-            keypoints1 = [torch.from_numpy(pred2['keypoints']).to(self.device)]
-            scores0 = [torch.from_numpy(pred1['scores']).to(self.device)]
-            scores1 = [torch.from_numpy(pred2['scores']).to(self.device)]
-            descriptors0 = [torch.from_numpy(pred1['descriptors']).to(self.device)]
-            descriptors1 = [torch.from_numpy(pred2['descriptors']).to(self.device)]
+            # SuperGlue는 tensor stack 형태를 기대
+            keypoints0 = torch.from_numpy(pred1['keypoints']).unsqueeze(0).to(self.device)  # (1, N, 2)
+            keypoints1 = torch.from_numpy(pred2['keypoints']).unsqueeze(0).to(self.device)  # (1, N, 2)
+            scores0 = torch.from_numpy(pred1['scores']).unsqueeze(0).to(self.device)  # (1, N)
+            scores1 = torch.from_numpy(pred2['scores']).unsqueeze(0).to(self.device)  # (1, N)
+            descriptors0 = torch.from_numpy(pred1['descriptors']).unsqueeze(0).to(self.device)  # (1, N, 256)
+            descriptors1 = torch.from_numpy(pred2['descriptors']).unsqueeze(0).to(self.device)  # (1, N, 256)
+            
+            print(f"        변환된 shapes: keypoints0={keypoints0.shape}, descriptors0={descriptors0.shape}")
             
             # 입력 데이터 준비
             data = {
