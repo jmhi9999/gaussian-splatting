@@ -833,7 +833,10 @@ class SuperGlueCOLMAPHybrid:
             print("\n[5/6] 포즈 추정...")
             sparse_dir = output_path / "sparse"
             sparse_dir.mkdir(exist_ok=True)
-            self._run_colmap_mapper_fast(database_path, input_dir, sparse_dir)
+            
+            # COLMAP 매퍼 실행 - 실패시 예외 발생
+            if not self._run_colmap_mapper_fast(database_path, input_dir, sparse_dir):
+                raise RuntimeError("COLMAP 매퍼 실패 - SceneInfo fallback 방지")
             
             # 6. 언디스토션 (옵션)
             print("\n[6/6] 언디스토션...")
@@ -883,15 +886,28 @@ class SuperGlueCOLMAPHybrid:
         """빠른 COLMAP 매퍼"""
         print("  ⚡ 빠른 COLMAP 매퍼...")
         
+        # 더 관대한 설정으로 COLMAP 매퍼 실행
         base_cmd = [
             self.colmap_exe, "mapper",
             "--database_path", str(database_path),
             "--image_path", str(image_path),
             "--output_path", str(output_path),
-            "--Mapper.min_num_matches", "8",
-            "--Mapper.init_min_num_inliers", "16",
-            "--Mapper.abs_pose_min_num_inliers", "8"
+            
+            # 📉 더 관대한 설정
+            "--Mapper.min_num_matches", "3",              # 8 → 3
+            "--Mapper.init_min_num_inliers", "6",         # 16 → 6
+            "--Mapper.abs_pose_min_num_inliers", "3",     # 8 → 3
+            "--Mapper.filter_max_reproj_error", "20.0",   # 더 큰 허용 오차
+            "--Mapper.ba_refine_focal_length", "0",       # 초점거리 고정
+            "--Mapper.ba_refine_principal_point", "0",    # 주점 고정
+            "--Mapper.ba_refine_extra_params", "0",       # 추가 파라미터 고정
+            
+            # 🚀 성능 개선
+            "--Mapper.max_num_models", "1",               # 단일 모델만
+            "--Mapper.min_model_size", "3",               # 최소 3장 이미지
         ]
+        
+        print(f"    명령: {' '.join(base_cmd)}")
         
         env = os.environ.copy()
         env["QT_QPA_PLATFORM"] = "offscreen"
@@ -900,17 +916,33 @@ class SuperGlueCOLMAPHybrid:
         try:
             result = subprocess.run(base_cmd, capture_output=True, text=True, 
                                  timeout=600, env=env)  # 10분 제한
+            
             if result.returncode == 0:
-                print("  ✓ COLMAP 매퍼 완료")
+                print("  ✅ COLMAP 매퍼 성공!")
+                
+                # 결과 확인
+                reconstruction_dirs = [d for d in output_path.iterdir() if d.is_dir()]
+                if reconstruction_dirs:
+                    print(f"    생성된 reconstruction: {len(reconstruction_dirs)}개")
+                    for recon_dir in reconstruction_dirs:
+                        bin_files = list(recon_dir.glob("*.bin"))
+                        print(f"      {recon_dir.name}: {len(bin_files)}개 파일")
+                
                 return True
             else:
-                print(f"  ✗ COLMAP 매퍼 실패: {result.stderr}")
-                return False
+                print(f"  ❌ COLMAP 매퍼 실패:")
+                print(f"    stdout: {result.stdout}")
+                print(f"    stderr: {result.stderr}")
+                
+                # 실패시 더 관대한 설정으로 재시도
+                print("  🔄 더 관대한 설정으로 재시도...")
+                return self._run_colmap_mapper_ultra_permissive(database_path, image_path, output_path)
+                
         except subprocess.TimeoutExpired:
             print("  ⚠️  COLMAP 매퍼 타임아웃")
             return False
         except Exception as e:
-            print(f"  ✗ COLMAP 매퍼 오류: {e}")
+            print(f"  ❌ COLMAP 매퍼 오류: {e}")
             return False
 
     def _run_colmap_undistortion_fast(self, image_path, sparse_path, output_path):
@@ -1283,9 +1315,9 @@ class SuperGlueCOLMAPHybrid:
         except Exception as e:
             print(f"      PLY 저장 실패: {e}")
 
-    def _run_colmap_mapper_improved(self, database_path, image_path, output_path):
-        """개선된 COLMAP 매퍼 - 더 관대한 설정"""
-        print("  🔥 개선된 COLMAP 매퍼...")
+    def _run_colmap_mapper_ultra_permissive(self, database_path, image_path, output_path):
+        """Ultra permissive COLMAP 매퍼 - 최대한 관대한 설정"""
+        print("  🔥 Ultra permissive COLMAP 매퍼...")
         
         # 환경 변수 설정
         env = os.environ.copy()
@@ -1293,25 +1325,26 @@ class SuperGlueCOLMAPHybrid:
         env["DISPLAY"] = ":0"
         env["XDG_RUNTIME_DIR"] = "/tmp/runtime-colmap"
         
-        # 더 관대한 매퍼 설정
+        # Ultra permissive 매퍼 설정
         base_cmd = [
             self.colmap_exe, "mapper",
             "--database_path", str(database_path),
             "--image_path", str(image_path),
             "--output_path", str(output_path),
             
-            # 📉 더 관대한 설정
-            "--Mapper.min_num_matches", "3",              # 4 → 3
-            "--Mapper.init_min_num_inliers", "6",         # 8 → 6  
-            "--Mapper.abs_pose_min_num_inliers", "3",     # 4 → 3
-            "--Mapper.filter_max_reproj_error", "20.0",   # 더 큰 허용 오차
+            # 📉 Ultra permissive 설정
+            "--Mapper.min_num_matches", "2",              # 최소 2개 매칭
+            "--Mapper.init_min_num_inliers", "3",         # 최소 3개 inlier
+            "--Mapper.abs_pose_min_num_inliers", "2",     # 최소 2개 inlier
+            "--Mapper.filter_max_reproj_error", "50.0",   # 매우 큰 허용 오차
             "--Mapper.ba_refine_focal_length", "0",       # 초점거리 고정
             "--Mapper.ba_refine_principal_point", "0",    # 주점 고정
             "--Mapper.ba_refine_extra_params", "0",       # 추가 파라미터 고정
             
             # 🚀 성능 개선
             "--Mapper.max_num_models", "1",               # 단일 모델만
-            "--Mapper.min_model_size", "3",               # 최소 3장 이미지
+            "--Mapper.min_model_size", "2",               # 최소 2장 이미지
+            "--Mapper.max_model_size", "1000",            # 최대 모델 크기
         ]
         
         print(f"    명령: {' '.join(base_cmd)}")
@@ -1321,7 +1354,7 @@ class SuperGlueCOLMAPHybrid:
                                 timeout=600, env=env)
             
             if result.returncode == 0:
-                print("  ✅ COLMAP 매퍼 성공!")
+                print("  ✅ Ultra permissive COLMAP 매퍼 성공!")
                 
                 # 결과 확인
                 reconstruction_dirs = [d for d in output_path.iterdir() if d.is_dir()]
@@ -1333,20 +1366,20 @@ class SuperGlueCOLMAPHybrid:
                 
                 return True
             else:
-                print(f"  ❌ COLMAP 매퍼 실패:")
+                print(f"  ❌ Ultra permissive COLMAP 매퍼도 실패:")
                 print(f"    stdout: {result.stdout}")
                 print(f"    stderr: {result.stderr}")
                 return False
                 
         except subprocess.TimeoutExpired:
-            print("  ⚠️  COLMAP 매퍼 타임아웃 (10분)")
+            print("  ⚠️  Ultra permissive COLMAP 매퍼 타임아웃")
             return False
         except Exception as e:
-            print(f"  ❌ COLMAP 매퍼 오류: {e}")
+            print(f"  ❌ Ultra permissive COLMAP 매퍼 오류: {e}")
             return False
 
     def _convert_to_3dgs_format(self, output_path, image_paths):
-        """3DGS 형식으로 변환 - Import 경로 수정"""
+        """3DGS 형식으로 변환 - COLMAP reconstruction 필수"""
         print("  🔧 3DGS SceneInfo 생성 중...")
         
         try:
@@ -1368,18 +1401,62 @@ class SuperGlueCOLMAPHybrid:
                     return self._parse_colmap_reconstruction(reconstruction_path, image_paths, output_path)
                 except Exception as e:
                     print(f"    COLMAP reconstruction 파싱 실패: {e}")
-                    print("    기본 SceneInfo로 fallback...")
+                    raise RuntimeError("COLMAP reconstruction 파싱 실패 - SceneInfo fallback 방지")
             else:
-                print("    COLMAP reconstruction 없음, 기본 SceneInfo 생성...")
-            
-            # 기본 SceneInfo 생성
-            return self._create_default_scene_info(image_paths, output_path)
+                raise RuntimeError("COLMAP reconstruction 없음 - SceneInfo fallback 방지")
             
         except Exception as e:
             print(f"  ❌ 3DGS 변환 실패: {e}")
             import traceback
             traceback.print_exc()
-            return None
+            raise RuntimeError("3DGS 변환 실패 - SceneInfo fallback 방지")
+
+    def _parse_colmap_reconstruction(self, reconstruction_path, image_paths, output_path):
+        """COLMAP reconstruction 파싱"""
+        print(f"    COLMAP reconstruction 파싱: {reconstruction_path}")
+        
+        try:
+            # COLMAP reconstruction 파일들 확인
+            cameras_bin = reconstruction_path / "cameras.bin"
+            images_bin = reconstruction_path / "images.bin"
+            points3d_bin = reconstruction_path / "points3D.bin"
+            
+            if not all([cameras_bin.exists(), images_bin.exists(), points3d_bin.exists()]):
+                raise RuntimeError("COLMAP reconstruction 파일 누락")
+            
+            # COLMAP reconstruction을 3DGS 형식으로 변환
+            from scene.colmap_loader import readColmapSceneInfo
+            
+            # 임시 디렉토리 구조 생성
+            temp_dir = output_path / "temp_colmap"
+            temp_dir.mkdir(exist_ok=True)
+            
+            # sparse 디렉토리 복사
+            temp_sparse = temp_dir / "sparse"
+            temp_sparse.mkdir(exist_ok=True)
+            
+            import shutil
+            shutil.copytree(reconstruction_path, temp_sparse / "0", dirs_exist_ok=True)
+            
+            # COLMAP loader 사용
+            scene_info = readColmapSceneInfo(
+                str(temp_dir),
+                "images",
+                "",
+                False,
+                False
+            )
+            
+            print(f"    ✅ COLMAP reconstruction 파싱 성공!")
+            print(f"      Train cameras: {len(scene_info.train_cameras)}")
+            print(f"      Test cameras: {len(scene_info.test_cameras)}")
+            print(f"      Point cloud: {len(scene_info.point_cloud.points)} points")
+            
+            return scene_info
+            
+        except Exception as e:
+            print(f"    ❌ COLMAP reconstruction 파싱 실패: {e}")
+            raise RuntimeError(f"COLMAP reconstruction 파싱 실패: {e}")
 
 # 사용 예시
 if __name__ == "__main__":
