@@ -164,6 +164,8 @@ class SuperGlueCOLMAPHybrid:
                     
                     # SuperGlue 입력 데이터 준비 (tensor stack 형태)
                     test_data = {
+                        'image0': test_tensor,
+                        'image1': test_tensor,
                         'keypoints0': torch.stack(pred0['keypoints']).to(self.device),
                         'keypoints1': torch.stack(pred1['keypoints']).to(self.device),
                         'scores0': torch.stack(pred0['scores']).to(self.device),
@@ -613,6 +615,8 @@ class SuperGlueCOLMAPHybrid:
             
             # 입력 데이터 준비
             data = {
+                'image0': torch.zeros(1, 1, 480, 640).to(self.device),  # 더미 이미지
+                'image1': torch.zeros(1, 1, 480, 640).to(self.device),  # 더미 이미지
                 'keypoints0': keypoints0,
                 'keypoints1': keypoints1,
                 'scores0': scores0,
