@@ -873,7 +873,8 @@ class SimpleSuperGluePipeline:
 
 sceneLoadTypeCallbacks = {
     "SuperGlue": readSuperGlueSceneInfo,
-    "SuperGlueCOLMAPHybrid": readSuperGlueCOLMAPHybridSceneInfo
+    "SuperGlueCOLMAPHybrid": readSuperGlueCOLMAPHybridSceneInfo,
+    "Hloc": readHlocSceneInfo,
 }
 
 # sceneLoadTypeCallbacks에 추가

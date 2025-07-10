@@ -66,6 +66,15 @@ class Scene:
                 max_images=getattr(args, 'max_images', 100),
                 colmap_exe=getattr(args, 'colmap_exe', 'colmap')
             )
+        elif args.scene_type == "Hloc":
+            print("Loading scene with Hloc pipeline...")
+            scene_info = sceneLoadTypeCallbacks["Hloc"](
+                args.source_path,
+                args.images,
+                args.eval,
+                args.train_test_exp,
+                max_images=getattr(args, 'max_images', 100)
+            )
         elif os.path.exists(os.path.join(args.source_path, "sparse")):
             print("Found COLMAP sparse reconstruction")
             scene_info = sceneLoadTypeCallbacks["Colmap"](
