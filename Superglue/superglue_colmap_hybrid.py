@@ -271,10 +271,26 @@ class SuperGlueCOLMAPHybrid:
                         print(f"      ⚠️  크기 불일치 발견!")
                     
                     try:
-                        # keypoints 저장
+                        # keypoints 저장 - SIFT 형식으로 변환 (x, y, scale, orientation)
+                        keypoints_sift = np.zeros((n_keypoints, 4), dtype=np.float32)
+                        keypoints_sift[:, :2] = keypoints_colmap  # x, y
+                        
+                        # SuperPoint scores를 기반으로 scale 계산
+                        if 'scores' in pred:
+                            scores = pred['scores'][0].cpu().numpy()
+                            # score를 0.5-2.0 범위의 scale로 변환
+                            scales = 0.5 + 1.5 * (scores - scores.min()) / (scores.max() - scores.min() + 1e-8)
+                            keypoints_sift[:, 2] = scales
+                        else:
+                            keypoints_sift[:, 2] = 1.0  # 기본값
+                        
+                        # orientation 계산 (그라디언트 기반)
+                        orientations = self._calculate_keypoint_orientations(img_gray, keypoints_colmap)
+                        keypoints_sift[:, 3] = orientations
+                        
                         cursor.execute(
                             "INSERT INTO keypoints (image_id, rows, cols, data) VALUES (?, ?, ?, ?)",
-                            (image_id, n_keypoints, 2, keypoints_colmap.tobytes())
+                            (image_id, n_keypoints, 4, keypoints_sift.tobytes())
                         )
                         
                         # descriptors 저장 - ✅ 정확한 차원 수 저장
@@ -494,6 +510,37 @@ class SuperGlueCOLMAPHybrid:
                 return (desc_norm * 255.0).astype(np.uint8)
             else:
                 return descriptors.astype(np.uint8)
+    
+    def _calculate_keypoint_orientations(self, img_gray, keypoints):
+        """키포인트 주변의 그라디언트를 기반으로 orientation 계산"""
+        try:
+            h, w = img_gray.shape
+            orientations = np.zeros(len(keypoints), dtype=np.float32)
+            
+            for i, (x, y) in enumerate(keypoints):
+                x, y = int(x), int(y)
+                
+                # 이미지 경계 확인
+                if x < 1 or x >= w-1 or y < 1 or y >= h-1:
+                    orientations[i] = 0.0
+                    continue
+                
+                # Sobel 연산자로 그라디언트 계산
+                gx = img_gray[y, x+1] - img_gray[y, x-1]
+                gy = img_gray[y+1, x] - img_gray[y-1, x]
+                
+                # orientation 계산 (atan2)
+                if gx != 0 or gy != 0:
+                    orientation = np.arctan2(gy, gx)
+                    orientations[i] = orientation
+                else:
+                    orientations[i] = 0.0
+            
+            return orientations
+            
+        except Exception as e:
+            print(f"      ⚠️  Orientation 계산 오류: {e}")
+            return np.zeros(len(keypoints), dtype=np.float32)
 
     def _match_single_pair(self, image_path1, image_path2):
         """두 이미지 간 SuperGlue 매칭 수행"""
@@ -1367,7 +1414,7 @@ class SuperGlueCOLMAPHybrid:
         env["XDG_RUNTIME_DIR"] = "/tmp/runtime-colmap"
         
                     # Ultra permissive 매퍼 설정
-            base_cmd = [
+        base_cmd = [
                 self.colmap_exe, "mapper",
                 "--database_path", str(database_path),
                 "--image_path", str(image_path),
