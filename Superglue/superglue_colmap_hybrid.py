@@ -19,17 +19,17 @@ class SuperGlueCOLMAPHybrid:
         self.device = device if torch.cuda.is_available() else "cpu"
         self.colmap_exe = colmap_exe
         
-        # SuperGlue 설정
+        # SuperGlue 설정 - 더 관대한 임계값
         self.superglue_config = {
             'outdoor': {
                 'weights': 'outdoor',
                 'sinkhorn_iterations': 20,
-                'match_threshold': 0.2,
+                'match_threshold': 0.1,  # 0.2 → 0.1 (더 관대한 임계값)
             },
             'indoor': {
                 'weights': 'indoor', 
                 'sinkhorn_iterations': 20,
-                'match_threshold': 0.2,
+                'match_threshold': 0.1,  # 0.2 → 0.1 (더 관대한 임계값)
             }
         }[superglue_config]
         
@@ -332,7 +332,7 @@ class SuperGlueCOLMAPHybrid:
 
 
     def _run_colmap_feature_extraction_fast(self, database_path, image_path):
-        """빠른 COLMAP 특징점 추출 (timeout 단축)"""
+        """빠른 COLMAP SIFT 특징점 추출 (timeout 단축)"""
         print("  ⚡ 빠른 COLMAP SIFT 특징점 추출...")
         
         base_cmd = [
@@ -724,7 +724,7 @@ class SuperGlueCOLMAPHybrid:
             return self._fallback_descriptor_matching(pred1, pred2)
 
     def _fallback_descriptor_matching(self, pred1, pred2):
-        """간단한 descriptor 매칭 fallback"""
+        """간단한 descriptor 매칭 fallback - 더 관대한 설정"""
         try:
             print(f"        🔄 Fallback descriptor 매칭 시도...")
             
@@ -747,8 +747,8 @@ class SuperGlueCOLMAPHybrid:
                 best_j = np.argmin(distances[i])
                 best_distance = distances[i, best_j]
                 
-                # 거리 임계값 체크
-                if best_distance < 0.8:  # 더 관대한 임계값
+                # 더 관대한 거리 임계값
+                if best_distance < 1.0:  # 0.8 → 1.0 (더 관대한 임계값)
                     matches.append([i, best_j])
             
             if len(matches) > 0:
@@ -1016,35 +1016,28 @@ class SuperGlueCOLMAPHybrid:
             print(f"  ✗ COLMAP 매칭 오류: {e}")
 
     def _run_colmap_mapper_fast(self, database_path, image_path, output_path):
-        """빠른 COLMAP 매퍼 - 더 관대한 설정"""
+        """빠른 COLMAP 매퍼 - 매우 관대한 설정"""
         print("  ⚡ 빠른 COLMAP 매퍼...")
         
-        # 더 관대한 설정으로 COLMAP 매퍼 실행
+        # 매우 관대한 설정으로 COLMAP 매퍼 실행
         base_cmd = [
             self.colmap_exe, "mapper",
             "--database_path", str(database_path),
             "--image_path", str(image_path),
             "--output_path", str(output_path),
             
-            # 📉 Ultra 관대한 설정
-            "--Mapper.min_num_matches", "2",              # 3 → 2
-            "--Mapper.init_min_num_inliers", "3",         # 6 → 3
-            "--Mapper.abs_pose_min_num_inliers", "2",     # 3 → 2
-            "--Mapper.filter_max_reproj_error", "50.0",   # 20.0 → 50.0
+            # 📉 매우 관대한 설정
+            "--Mapper.min_num_matches", "1",              # 2 → 1 (최소 1개 매칭)
+            "--Mapper.init_min_num_inliers", "2",         # 3 → 2 (최소 2개 inlier)
+            "--Mapper.abs_pose_min_num_inliers", "1",     # 2 → 1 (최소 1개 inlier)
+            "--Mapper.filter_max_reproj_error", "100.0",  # 50.0 → 100.0 (매우 큰 허용 오차)
             "--Mapper.ba_refine_focal_length", "0",       # 초점거리 고정
             "--Mapper.ba_refine_principal_point", "0",    # 주점 고정
             "--Mapper.ba_refine_extra_params", "0",       # 추가 파라미터 고정
             
             # 🚀 성능 개선
             "--Mapper.max_num_models", "1",               # 단일 모델만
-            "--Mapper.min_model_size", "2",               # 3 → 2 (최소 2장 이미지)
-            
-            # 추가 관대한 설정
-            "--Mapper.init_max_error", "10.0",            # 초기화 오차 허용
-            "--Mapper.init_min_track_angle", "1.0",       # 최소 트랙 각도
-            "--Mapper.init_min_num_inliers", "3",         # 최소 inlier 수
-            "--Mapper.abs_pose_max_error", "10.0",        # 절대 포즈 오차
-            "--Mapper.abs_pose_min_num_inliers", "2",     # 절대 포즈 최소 inlier
+            "--Mapper.min_model_size", "1",               # 2 → 1 (최소 1장 이미지)
         ]
         
         print(f"    명령: {' '.join(base_cmd)}")
@@ -1597,7 +1590,7 @@ class SuperGlueCOLMAPHybrid:
             print(f"      PLY 저장 실패: {e}")
 
     def _run_colmap_mapper_ultra_permissive(self, database_path, image_path, output_path):
-        """Ultra permissive COLMAP 매퍼 - 최대한 관대한 설정"""
+        """Ultra permissive COLMAP 매퍼 - 매우 관대한 설정"""
         print("  🔥 Ultra permissive COLMAP 매퍼...")
         
         # 환경 변수 설정
@@ -1606,26 +1599,26 @@ class SuperGlueCOLMAPHybrid:
         env["DISPLAY"] = ":0"
         env["XDG_RUNTIME_DIR"] = "/tmp/runtime-colmap"
         
-                    # Ultra permissive 매퍼 설정
+        # Ultra permissive 매퍼 설정 (매우 관대한 설정)
         base_cmd = [
-                self.colmap_exe, "mapper",
-                "--database_path", str(database_path),
-                "--image_path", str(image_path),
-                "--output_path", str(output_path),
-                
-                # 📉 Ultra permissive 설정
-                "--Mapper.min_num_matches", "2",              # 최소 2개 매칭
-                "--Mapper.init_min_num_inliers", "3",         # 최소 3개 inlier
-                "--Mapper.abs_pose_min_num_inliers", "2",     # 최소 2개 inlier
-                "--Mapper.filter_max_reproj_error", "50.0",   # 매우 큰 허용 오차
-                "--Mapper.ba_refine_focal_length", "0",       # 초점거리 고정
-                "--Mapper.ba_refine_principal_point", "0",    # 주점 고정
-                "--Mapper.ba_refine_extra_params", "0",       # 추가 파라미터 고정
-                
-                # 🚀 성능 개선
-                "--Mapper.max_num_models", "1",               # 단일 모델만
-                "--Mapper.min_model_size", "2",               # 최소 2장 이미지
-            ]
+            self.colmap_exe, "mapper",
+            "--database_path", str(database_path),
+            "--image_path", str(image_path),
+            "--output_path", str(output_path),
+            
+            # 📉 Ultra permissive 설정 (매우 관대한 설정)
+            "--Mapper.min_num_matches", "1",              # 최소 1개 매칭
+            "--Mapper.init_min_num_inliers", "2",         # 최소 2개 inlier
+            "--Mapper.abs_pose_min_num_inliers", "1",     # 최소 1개 inlier
+            "--Mapper.filter_max_reproj_error", "100.0",  # 매우 큰 허용 오차
+            "--Mapper.ba_refine_focal_length", "0",       # 초점거리 고정
+            "--Mapper.ba_refine_principal_point", "0",    # 주점 고정
+            "--Mapper.ba_refine_extra_params", "0",       # 추가 파라미터 고정
+            
+            # 🚀 성능 개선
+            "--Mapper.max_num_models", "1",               # 단일 모델만
+            "--Mapper.min_model_size", "1",               # 최소 1장 이미지
+        ]
         
         print(f"    명령: {' '.join(base_cmd)}")
         
