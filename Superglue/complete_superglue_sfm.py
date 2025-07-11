@@ -72,28 +72,38 @@ class SuperGlue3DGSPipeline:
         print(f'SuperGlue 3DGS Pipeline initialized on {self.device}')
     
     def process_images_to_3dgs(self, image_dir, output_dir, max_images=120):
-        """수정된 메인 프로세스"""
+        """이미지들을 3DGS 형식으로 처리"""
+        print(f"Processing images from {image_dir} to {output_dir}")
         
-        print(f"\n=== SuperGlue + 3DGS Pipeline: Processing up to {max_images} images ===")
+        # output_dir 저장 (COLMAP intrinsics 읽기용)
+        self.output_dir = output_dir
         
-        # 기존 단계들...
+        # 이미지 수집
         image_paths = self._collect_images(image_dir, max_images)
+        if not image_paths:
+            raise RuntimeError("No images found")
+        
+        print(f"Found {len(image_paths)} images")
+        
+        # 특징점 추출
         self._extract_all_features(image_paths)
-        self._intelligent_matching(max_pairs=min(len(image_paths) * 15, 2000))  # 증가
+        
+        # 매칭
+        self._intelligent_matching()
+        
+        # 카메라 포즈 추정
         self._estimate_camera_poses_robust()
         
-        # 🔧 수정된 삼각측량
-        self._triangulate_all_points_robust()
+        # 삼각측량
+        n_points = self._triangulate_all_points_robust()
         
-        # 🔧 추가: 관찰 데이터 확장
-        self._expand_point_observations()
-        
-        # 🔧 수정된 Bundle Adjustment
+        # Bundle Adjustment
         self._bundle_adjustment_robust()
         
-        # 나머지 단계들...
-        self._refine_point_cloud()
+        # 3DGS SceneInfo 생성
         scene_info = self._create_3dgs_scene_info(image_paths)
+        
+        # 3DGS 형식으로 저장
         self._save_3dgs_format(scene_info, output_dir)
         
         return scene_info
@@ -474,11 +484,11 @@ class SuperGlue3DGSPipeline:
         print(f"  Total cameras with poses: {len(self.cameras)}")
     
     def _estimate_relative_pose_robust(self, cam_i, cam_j, pair_key):
-        """개선된 두 카메라 간 상대 포즈 추정 - 인덱스 검증 강화"""
+        """개선된 두 카메라 간 상대 포즈 추정 - 기하학적 검증 강화"""
         matches = self.matches[pair_key]
         
-        if len(matches) < 1:  # 4 → 1로 대폭 완화
-            print(f"    Pair {cam_i}-{cam_j}: Insufficient matches ({len(matches)} < 1)")
+        if len(matches) < 8:  # 최소 8개 매칭 필요
+            print(f"    Pair {cam_i}-{cam_j}: Insufficient matches ({len(matches)} < 8)")
             return None, None
         
         # 매칭점들 추출
@@ -487,59 +497,59 @@ class SuperGlue3DGSPipeline:
         
         print(f"    Pair {cam_i}-{cam_j}: kpts_i shape: {kpts_i.shape}, kpts_j shape: {kpts_j.shape}")
         
-        # 고신뢰도 매칭 필터링 (더 완화)
-        high_conf_matches = [(idx_i, idx_j, conf) for idx_i, idx_j, conf in matches if conf > 0.001]  # 0.05 → 0.001로 대폭 완화
+        # 🔧 개선된 신뢰도 임계값 (더 현실적인 값)
+        high_conf_matches = [(idx_i, idx_j, conf) for idx_i, idx_j, conf in matches if conf > 0.1]  # 0.001 → 0.1로 개선
         
-        if len(high_conf_matches) < 1:  # 4 → 1로 완화
-            high_conf_matches = [(idx_i, idx_j, conf) for idx_i, idx_j, conf in matches if conf > 0.0001]  # 0.01 → 0.0001로 완화
+        if len(high_conf_matches) < 8:  # 최소 8개 필요
+            high_conf_matches = [(idx_i, idx_j, conf) for idx_i, idx_j, conf in matches if conf > 0.05]  # 0.0001 → 0.05로 개선
         
-        if len(high_conf_matches) < 1:  # 4 → 1로 완화
-            print(f"    Pair {cam_i}-{cam_j}: Insufficient high-confidence matches ({len(high_conf_matches)} < 1)")
+        if len(high_conf_matches) < 8:
+            print(f"    Pair {cam_i}-{cam_j}: Insufficient high-confidence matches ({len(high_conf_matches)} < 8)")
             return None, None
         
-        # 🚨 핵심 수정: 인덱스 범위 검증 강화
+        # 🔧 인덱스 범위 검증 강화
         valid_matches = []
         for idx_i, idx_j, conf in high_conf_matches:
-            # 더 엄격한 인덱스 검증
             if (isinstance(idx_i, (int, np.integer)) and isinstance(idx_j, (int, np.integer)) and
                 idx_i >= 0 and idx_j >= 0 and 
                 idx_i < len(kpts_i) and idx_j < len(kpts_j)):
                 valid_matches.append((idx_i, idx_j, conf))
-            else:
-                print(f"    Invalid indices: idx_i={idx_i} (max={len(kpts_i)-1}), idx_j={idx_j} (max={len(kpts_j)-1})")
         
-        if len(valid_matches) < 1:
-            print(f"    Pair {cam_i}-{cam_j}: Insufficient valid matches after index validation ({len(valid_matches)} < 1)")
+        if len(valid_matches) < 8:
+            print(f"    Pair {cam_i}-{cam_j}: Insufficient valid matches after index validation ({len(valid_matches)} < 8)")
             return None, None
         
         print(f"    Pair {cam_i}-{cam_j}: Using {len(valid_matches)} validated matches")
         
-        # 🔧 수정: valid_matches 사용 (high_conf_matches 대신)
+        # 🔧 개선된 포인트 추출
         try:
             pts_i = np.array([kpts_i[idx_i] for idx_i, _, _ in valid_matches])
             pts_j = np.array([kpts_j[idx_j] for _, idx_j, _ in valid_matches])
         except IndexError as e:
             print(f"    IndexError during point extraction: {e}")
-            # 추가 디버깅 정보
-            for i, (idx_i, idx_j, conf) in enumerate(valid_matches):
-                if idx_i >= len(kpts_i) or idx_j >= len(kpts_j):
-                    print(f"    Bad match {i}: idx_i={idx_i}, idx_j={idx_j}, kpts_i.len={len(kpts_i)}, kpts_j.len={len(kpts_j)}")
+            return None, None
+        
+        # 🔧 기하학적 일관성 사전 검증
+        if not self._check_geometric_consistency(pts_i, pts_j):
+            print(f"    Pair {cam_i}-{cam_j}: Failed geometric consistency check")
             return None, None
         
         # 카메라 내부 파라미터
         K_i = self.cameras.get(cam_i, {}).get('K', self._estimate_intrinsics(cam_i))
         K_j = self._estimate_intrinsics(cam_j)
         
-        # Essential Matrix 추정 (여러 방법 시도)
+        # 🔧 개선된 Essential Matrix 추정 방법들
         methods = [
+            (cv2.RANSAC, 0.5, 0.999),   # 더 엄격한 임계값
+            (cv2.LMEDS, 0.5, 0.99),
             (cv2.RANSAC, 1.0, 0.999),
-            (cv2.LMEDS, 1.0, 0.99),
             (cv2.RANSAC, 2.0, 0.99),
             (cv2.RANSAC, 3.0, 0.95)
         ]
         
         best_R, best_T = None, None
         best_inliers = 0
+        best_quality = 0
         
         for method, threshold, confidence in methods:
             try:
@@ -549,7 +559,7 @@ class SuperGlue3DGSPipeline:
                     method=method,
                     prob=confidence,
                     threshold=threshold,
-                    maxIters=1000
+                    maxIters=2000  # 더 많은 반복
                 )
                 
                 if E is None or E.shape != (3, 3):
@@ -563,59 +573,134 @@ class SuperGlue3DGSPipeline:
                 
                 inliers = np.sum(mask)
                 
-                if inliers > best_inliers and inliers >= 1:  # 4 → 1로 완화
-                    # 포즈 품질 검증 (더 완화)
-                    if self._validate_pose_quality_relaxed(pts_i, pts_j, R, T.flatten(), K_i, K_j):
+                if inliers >= 8:  # 최소 8개 inlier 필요
+                    # 🔧 개선된 포즈 품질 검증
+                    quality_score = self._evaluate_pose_quality(pts_i, pts_j, R, T.flatten(), K_i, K_j, mask)
+                    
+                    if quality_score > best_quality:
                         best_R, best_T = R, T.flatten()
                         best_inliers = inliers
+                        best_quality = quality_score
                         
             except Exception as e:
                 print(f"      Method {method} failed: {e}")
                 continue
         
         if best_R is not None:
-            print(f"    Pair {cam_i}-{cam_j}: Successfully estimated pose with {best_inliers} inliers")
+            print(f"    Pair {cam_i}-{cam_j}: Successfully estimated pose with {best_inliers} inliers, quality: {best_quality:.3f}")
         else:
             print(f"    Pair {cam_i}-{cam_j}: Failed to estimate pose")
         
         return best_R, best_T
 
-    def _validate_pose_quality_relaxed(self, pts_i, pts_j, R, T, K_i, K_j):
-        """포즈 품질 검증 (더 완화)"""
+    def _check_geometric_consistency(self, pts_i, pts_j):
+        """기하학적 일관성 사전 검증 (NEW METHOD)"""
         try:
-            # 회전 행렬 유효성 확인 (더 완화)
-            det = np.linalg.det(R)
-            if abs(det - 1.0) > 0.5:  # 0.2 → 0.5로 완화
+            # 1. 호모그래피 기반 일관성 검사
+            H, mask = cv2.findHomography(pts_i, pts_j, cv2.RANSAC, 3.0)
+            if H is not None:
+                homography_inliers = np.sum(mask)
+                if homography_inliers < len(pts_i) * 0.3:  # 30% 미만이면 실패
+                    return False
+            
+            # 2. 포인트 분포 검사 (이미지 크기 정보가 없으므로 간단한 검사만)
+            # 포인트들이 너무 한 곳에 집중되어 있는지 확인
+            if len(pts_i) > 10:
+                # 포인트들의 분산 계산
+                var_i = np.var(pts_i, axis=0)
+                var_j = np.var(pts_j, axis=0)
+                
+                # 분산이 너무 작으면 나쁜 분포
+                if np.min(var_i) < 100 or np.min(var_j) < 100:
+                    return False
+            
+            # 3. 포인트 간 거리 검사
+            # 너무 가까운 포인트들이 많은지 확인
+            distances_i = cdist(pts_i, pts_i)
+            distances_j = cdist(pts_j, pts_j)
+            
+            # 대각선 제거
+            np.fill_diagonal(distances_i, np.inf)
+            np.fill_diagonal(distances_j, np.inf)
+            
+            min_dist_i = np.min(distances_i)
+            min_dist_j = np.min(distances_j)
+            
+            # 최소 거리가 너무 작으면 나쁜 분포
+            if min_dist_i < 5 or min_dist_j < 5:
                 return False
             
-            # 삼각측량 테스트 (더 완화)
+            return True
+            
+        except Exception as e:
+            print(f"      Geometric consistency check failed: {e}")
+            return True  # 오류시 통과
+
+    def _evaluate_pose_quality(self, pts_i, pts_j, R, T, K_i, K_j, mask):
+        """개선된 포즈 품질 평가 (NEW METHOD)"""
+        try:
+            # 1. 회전 행렬 유효성 확인
+            det = np.linalg.det(R)
+            if abs(det - 1.0) > 0.1:
+                return 0.0
+            
+            # 2. 삼각측량 품질 검사
             P_i = K_i @ np.hstack([np.eye(3), np.zeros((3, 1))])
             P_j = K_j @ np.hstack([R, T.reshape(-1, 1)])
             
-            # 몇 개 포인트로 테스트
-            test_indices = np.random.choice(len(pts_i), min(3, len(pts_i)), replace=False)  # 5 → 3으로 완화
+            # inlier 포인트들만 사용
+            inlier_pts_i = pts_i[mask.flatten()]
+            inlier_pts_j = pts_j[mask.flatten()]
+            
+            if len(inlier_pts_i) < 8:
+                return 0.0
+            
+            # 삼각측량 테스트
             valid_points = 0
+            total_error = 0.0
             
-            for idx in test_indices:
-                pt_4d = cv2.triangulatePoints(
-                    P_i, P_j,
-                    pts_i[idx].reshape(2, 1),
-                    pts_j[idx].reshape(2, 1)
-                )
-                
-                if abs(pt_4d[3, 0]) > 1e-10:
-                    pt_3d = (pt_4d[:3] / pt_4d[3]).flatten()
+            for pt_i, pt_j in zip(inlier_pts_i, inlier_pts_j):
+                try:
+                    # 삼각측량
+                    pt_4d = cv2.triangulatePoints(P_i, P_j, pt_i.reshape(2, 1), pt_j.reshape(2, 1))
                     
-                    # 거리 체크 (더 관대함)
-                    if 0.01 < np.linalg.norm(pt_3d) < 1000:  # 0.05 → 0.01, 200 → 1000으로 완화
-                        valid_points += 1
+                    if abs(pt_4d[3, 0]) > 1e-10:
+                        pt_3d = (pt_4d[:3] / pt_4d[3]).flatten()
+                        
+                        # 거리 체크
+                        if 0.1 < np.linalg.norm(pt_3d) < 100:
+                            # 재투영 오차 계산
+                            proj_i = P_i @ np.append(pt_3d, 1)
+                            proj_j = P_j @ np.append(pt_3d, 1)
+                            
+                            if proj_i[2] > 0 and proj_j[2] > 0:
+                                proj_i_2d = proj_i[:2] / proj_i[2]
+                                proj_j_2d = proj_j[:2] / proj_j[2]
+                                
+                                error_i = np.linalg.norm(proj_i_2d - pt_i)
+                                error_j = np.linalg.norm(proj_j_2d - pt_j)
+                                
+                                total_error += max(error_i, error_j)
+                                valid_points += 1
+                                
+                except:
+                    continue
             
-            # 30% 이상의 포인트가 유효하면 통과 (60% → 30%로 완화)
-            return valid_points >= len(test_indices) * 0.3
+            if valid_points < 8:
+                return 0.0
+            
+            # 품질 점수 계산
+            avg_error = total_error / valid_points
+            inlier_ratio = len(inlier_pts_i) / len(pts_i)
+            
+            # 오차가 작고 inlier 비율이 높을수록 높은 점수
+            quality_score = inlier_ratio * (1.0 / (1.0 + avg_error))
+            
+            return quality_score
             
         except Exception as e:
-            print(f"      Pose validation failed: {e}")
-            return False
+            print(f"      Pose quality evaluation failed: {e}")
+            return 0.0
     
     def _estimate_pose_fallback(self, pts_i, pts_j, K_i, K_j):
         """OpenCV 실패시 사용할 fallback 포즈 추정"""
@@ -732,14 +817,32 @@ class SuperGlue3DGSPipeline:
         return pose_quality
     
     def _estimate_intrinsics(self, cam_id):
-        """개선된 카메라 내부 파라미터 추정"""
+        """개선된 카메라 내부 파라미터 추정 (COLMAP 우선)"""
         h, w = self.image_features[cam_id]['image_size']
         
-        # 더 정확한 focal length 추정
-        # 일반적으로 focal length는 이미지 크기의 0.8~1.2배
-        focal = max(w, h) * 0.9  # 약간 보수적인 추정
+        # COLMAP reconstruction이 있으면 그것을 사용
+        try:
+            colmap_cameras = self._get_colmap_intrinsics()
+            if colmap_cameras and cam_id in colmap_cameras:
+                camera = colmap_cameras[cam_id]
+                width, height = camera.width, camera.height
+                
+                # PINHOLE 모델 가정 (fx, fy, cx, cy)
+                if len(camera.params) == 4:
+                    fx, fy, cx, cy = camera.params
+                    # COLMAP에서 추정한 정확한 focal length 사용
+                    K = np.array([
+                        [fx, 0, cx],
+                        [0, fy, cy],
+                        [0, 0, 1]
+                    ], dtype=np.float32)
+                    print(f"    Camera {cam_id}: Using COLMAP focal length (fx={fx:.1f}, fy={fy:.1f})")
+                    return K
+        except Exception as e:
+            print(f"    Camera {cam_id}: COLMAP intrinsics failed, using default: {e}")
         
-        # 주점을 이미지 중심으로 설정
+        # COLMAP이 없으면 기본 추정 사용
+        focal = max(w, h) * 0.9  # 약간 보수적인 추정
         cx, cy = w / 2, h / 2
         
         K = np.array([
@@ -748,10 +851,48 @@ class SuperGlue3DGSPipeline:
             [0, 0, 1]
         ], dtype=np.float32)
         
+        print(f"    Camera {cam_id}: Using default focal length ({focal:.1f})")
         return K
     
+    def _get_colmap_intrinsics(self):
+        """COLMAP reconstruction에서 카메라 내부 파라미터 읽기"""
+        try:
+            # COLMAP reconstruction 경로 확인
+            output_dir = getattr(self, 'output_dir', None)
+            if output_dir is None:
+                return None
+            
+            reconstruction_path = Path(output_dir) / "sparse" / "0"
+            cameras_bin = reconstruction_path / "cameras.bin"
+            
+            if not cameras_bin.exists():
+                return None
+            
+            # COLMAP reconstruction 파싱
+            from scene.colmap_loader import read_intrinsics_binary
+            cameras = read_intrinsics_binary(str(cameras_bin))
+            
+            # 이미지 ID와 카메라 ID 매핑
+            images_bin = reconstruction_path / "images.bin"
+            if images_bin.exists():
+                from scene.colmap_loader import read_extrinsics_binary
+                images = read_extrinsics_binary(str(images_bin))
+                
+                # 이미지 ID -> 카메라 ID 매핑
+                image_to_camera = {}
+                for image_id, image in images.items():
+                    image_to_camera[image_id] = image.camera_id
+                
+                return image_to_camera, cameras
+            
+            return None
+            
+        except Exception as e:
+            print(f"    COLMAP intrinsics 읽기 실패: {e}")
+            return None
+    
     def _triangulate_all_points_robust(self):
-        """3D 포인트 수 최대화를 위한 삼각측량 (대폭 개선된 버전)"""
+        """개선된 삼각측량 - 품질 기반 필터링 강화"""
         point_id = 0
         total_matches_processed = 0
         total_valid_matches = 0
@@ -772,8 +913,8 @@ class SuperGlue3DGSPipeline:
                 kpts_i = self.image_features[cam_i]['keypoints']
                 kpts_j = self.image_features[cam_j]['keypoints']
                 
-                # 🔧 대폭 완화된 신뢰도 임계값 (0.001 → 0.0001)
-                high_conf_matches = [(idx_i, idx_j, conf) for idx_i, idx_j, conf in matches if conf > 0.0001]
+                # 🔧 개선된 신뢰도 임계값
+                high_conf_matches = [(idx_i, idx_j, conf) for idx_i, idx_j, conf in matches if conf > 0.2]  # 0.0001 → 0.2로 개선
                 total_matches_processed += len(matches)
                 
                 # 인덱스 범위 검증
@@ -785,9 +926,9 @@ class SuperGlue3DGSPipeline:
                 
                 total_valid_matches += len(valid_matches)
                 
-                # 🔧 배치 삼각측량으로 성능 향상
+                # 🔧 개선된 배치 삼각측량
                 if len(valid_matches) > 10:
-                    batch_size = min(100, len(valid_matches))
+                    batch_size = min(50, len(valid_matches))  # 배치 크기 줄임
                     for batch_start in range(0, len(valid_matches), batch_size):
                         batch_end = min(batch_start + batch_size, len(valid_matches))
                         batch_matches = valid_matches[batch_start:batch_end]
@@ -798,34 +939,34 @@ class SuperGlue3DGSPipeline:
                         
                         try:
                             # OpenCV 배치 삼각측량
-                            points_4d = cv2.triangulatePoints(
-                                P_i, P_j,
-                                pts_i_batch.T,
-                                pts_j_batch.T
-                            )
+                            points_4d = cv2.triangulatePoints(P_i, P_j, pts_i_batch.T, pts_j_batch.T)
                             
-                            # 4D에서 3D로 변환
-                            points_3d_batch = (points_4d[:3] / points_4d[3]).T
-                            
-                            for i, (idx_i, idx_j, conf) in enumerate(batch_matches):
-                                point_3d = points_3d_batch[i]
+                            # 4D에서 3D로 변환 (개선된 검증)
+                            for i in range(points_4d.shape[1]):
+                                point_4d = points_4d[:, i]
+                                
+                                if abs(point_4d[3]) < 1e-10:
+                                    continue
+                                
+                                point_3d = (point_4d[:3] / point_4d[3]).flatten()
                                 total_triangulated += 1
                                 
-                                # 🔧 매우 완화된 유효성 검사
-                                if self._is_point_valid_ultra_relaxed(point_3d, cam_i, cam_j, pts_i_batch[i], pts_j_batch[i]):
+                                # 🔧 개선된 유효성 검사
+                                if self._is_point_valid_improved(point_3d, cam_i, cam_j, pts_i_batch[i], pts_j_batch[i]):
                                     # 색상 추정
-                                    color = self._estimate_point_color_robust(point_3d, cam_i, idx_i)
+                                    color = self._estimate_point_color_robust(point_3d, cam_i, batch_matches[i][0])
                                     
                                     # 3D 포인트 저장
                                     self.points_3d[point_id] = {
                                         'xyz': point_3d.astype(np.float32),
                                         'color': color,
-                                        'observations': [(cam_i, pts_i_batch[i], conf), (cam_j, pts_j_batch[i], conf)]
+                                        'observations': [(cam_i, pts_i_batch[i], batch_matches[i][2]), 
+                                                        (cam_j, pts_j_batch[i], batch_matches[i][2])]
                                     }
                                     
                                     # 관찰 데이터 추가
-                                    self.point_observations[point_id].append((cam_i, pts_i_batch[i], conf))
-                                    self.point_observations[point_id].append((cam_j, pts_j_batch[i], conf))
+                                    self.point_observations[point_id].append((cam_i, pts_i_batch[i], batch_matches[i][2]))
+                                    self.point_observations[point_id].append((cam_j, pts_j_batch[i], batch_matches[i][2]))
                                     
                                     point_id += 1
                                     total_validated += 1
@@ -841,35 +982,33 @@ class SuperGlue3DGSPipeline:
                             pt_i = kpts_i[idx_i].astype(np.float32)
                             pt_j = kpts_j[idx_j].astype(np.float32)
                             
-                            point_4d = cv2.triangulatePoints(
-                                P_i, P_j,
-                                pt_i.reshape(2, 1),
-                                pt_j.reshape(2, 1)
-                            )
+                            point_4d = cv2.triangulatePoints(P_i, P_j, pt_i.reshape(2, 1), pt_j.reshape(2, 1))
                             
-                            if abs(point_4d[3, 0]) > 1e-10:
-                                point_3d = (point_4d[:3] / point_4d[3]).flatten()
-                                total_triangulated += 1
+                            if abs(point_4d[3, 0]) < 1e-10:
+                                continue
                                 
-                                # 🔧 매우 완화된 유효성 검사
-                                if self._is_point_valid_ultra_relaxed(point_3d, cam_i, cam_j, pt_i, pt_j):
-                                    # 색상 추정
-                                    color = self._estimate_point_color_robust(point_3d, cam_i, idx_i)
-                                    
-                                    # 3D 포인트 저장
-                                    self.points_3d[point_id] = {
-                                        'xyz': point_3d.astype(np.float32),
-                                        'color': color,
-                                        'observations': [(cam_i, pt_i, conf), (cam_j, pt_j, conf)]
-                                    }
-                                    
-                                    # 관찰 데이터 추가
-                                    self.point_observations[point_id].append((cam_i, pt_i, conf))
-                                    self.point_observations[point_id].append((cam_j, pt_j, conf))
-                                    
-                                    point_id += 1
-                                    total_validated += 1
-                                    
+                            point_3d = (point_4d[:3] / point_4d[3]).flatten()
+                            total_triangulated += 1
+                            
+                            # 🔧 개선된 유효성 검사
+                            if self._is_point_valid_improved(point_3d, cam_i, cam_j, pt_i, pt_j):
+                                # 색상 추정
+                                color = self._estimate_point_color_robust(point_3d, cam_i, idx_i)
+                                
+                                # 3D 포인트 저장
+                                self.points_3d[point_id] = {
+                                    'xyz': point_3d.astype(np.float32),
+                                    'color': color,
+                                    'observations': [(cam_i, pt_i, conf), (cam_j, pt_j, conf)]
+                                }
+                                
+                                # 관찰 데이터 추가
+                                self.point_observations[point_id].append((cam_i, pt_i, conf))
+                                self.point_observations[point_id].append((cam_j, pt_j, conf))
+                                
+                                point_id += 1
+                                total_validated += 1
+                                
                         except Exception as e:
                             continue
                         
@@ -886,20 +1025,22 @@ class SuperGlue3DGSPipeline:
         
         return len(self.points_3d)
 
-    def _is_point_valid_ultra_relaxed(self, point_3d, cam_i, cam_j, pt_i, pt_j):
-        """초완화된 3D 포인트 유효성 검사 (최대한 많은 포인트 허용)"""
+    def _is_point_valid_improved(self, point_3d, cam_i, cam_j, pt_i, pt_j):
+        """개선된 3D 포인트 유효성 검사"""
         
-        # 1. 기본 NaN/Inf 체크만
+        # 1. 기본 NaN/Inf 체크
         if np.any(np.isnan(point_3d)) or np.any(np.isinf(point_3d)):
             return False
         
-        # 2. 거리 제한 대폭 완화 (10000 → 50000)
+        # 2. 거리 제한 (더 현실적인 범위)
         distance = np.linalg.norm(point_3d)
-        if distance > 50000 or distance < 0.0001:  # 0.001 → 0.0001
+        if distance > 100 or distance < 0.01:  # 1000 → 100, 0.001 → 0.01로 개선
             return False
         
-        # 3. 재투영 오차 체크 대폭 완화 (200 픽셀 → 500 픽셀)
+        # 3. 개선된 재투영 오차 체크
         try:
+            max_reprojection_error = 0.0
+            
             for cam_id, pt_observed in [(cam_i, pt_i), (cam_j, pt_j)]:
                 if cam_id not in self.cameras:
                     continue
@@ -907,38 +1048,47 @@ class SuperGlue3DGSPipeline:
                 cam = self.cameras[cam_id]
                 K, R, T = cam['K'], cam['R'], cam['T']
                 
-                # 재투영
+                # 카메라 좌표계로 변환
                 point_cam = R @ (point_3d - T)
-                if point_cam[2] <= 0:  # 카메라 뒤쪽
+                
+                # 깊이 체크 (카메라 앞쪽에 있어야 함)
+                if point_cam[2] <= 0.01:  # 0.001 → 0.01로 개선
                     return False
                 
+                # 재투영
                 point_2d_proj = K @ point_cam
+                
+                if abs(point_2d_proj[2]) < 1e-10:
+                    return False
+                    
                 point_2d_proj = point_2d_proj[:2] / point_2d_proj[2]
                 
-                # 재투영 오차 (매우 관대함)
+                # 재투영 오차 계산
                 error = np.linalg.norm(point_2d_proj - pt_observed)
-                if error > 500.0:  # 200 픽셀 → 500 픽셀
-                    return False
+                max_reprojection_error = max(max_reprojection_error, error)
+            
+            # 재투영 오차 임계값 (더 엄격하게)
+            if max_reprojection_error > 10.0:  # 100 → 10으로 개선
+                return False
             
             return True
             
-        except Exception:
-            # 오류 발생시에도 통과
-            return True
-    
+        except Exception as e:
+            return False
+
     def _estimate_point_color_robust(self, point_3d, cam_id, kpt_idx):
         """개선된 3D 포인트 색상 추정"""
         # 실제 구현에서는 이미지에서 색상을 샘플링
         # 여기서는 간단히 랜덤 색상 사용
         return np.random.rand(3).astype(np.float32)
     
-    def _bundle_adjustment_robust(self, max_iterations=30):
-        """개선된 Bundle Adjustment - cost 최적화"""
+    def _bundle_adjustment_robust(self, max_iterations=50):
+        """개선된 Bundle Adjustment - 더 강력한 최적화"""
         
         n_cameras = len(self.cameras)
         n_points = len(self.points_3d)
         
-        if n_cameras < 2 or n_points < 10:
+        if n_cameras < 2 or n_points < 20:  # 10 → 20으로 증가
             print("  Insufficient data for bundle adjustment")
             return
         
@@ -952,10 +1102,10 @@ class SuperGlue3DGSPipeline:
         print(f"    Observations: {total_observations}")
         print(f"    Residuals: {n_residuals}, Variables: {n_variables}")
         
-        # 🔧 핵심 수정: 잔차/변수 비율 체크
-        if n_residuals < n_variables:
-            print(f"  ⚠️  Under-constrained problem: {n_residuals} residuals < {n_variables} variables")
-            print("  Using 'trf' method instead of 'lm'")
+        # 🔧 개선된 방법 선택
+        if n_residuals < n_variables * 2:  # 2배 이상의 잔차가 필요
+            print(f"  ⚠️  Under-constrained problem: {n_residuals} residuals < {n_variables * 2} (2x variables)")
+            print("  Using 'trf' method with conservative settings")
             method = 'trf'
         else:
             print("  Using 'lm' method")
@@ -968,27 +1118,27 @@ class SuperGlue3DGSPipeline:
             return
         
         try:
-            # 🔧 더 보수적인 BA 설정
+            # 🔧 개선된 BA 설정
             if method == 'trf':
                 result = least_squares(
-                    self._compute_residuals,
+                    self._compute_residuals_improved,
                     params,
-                    method='trf',           # Trust Region Reflective
-                    max_nfev=max_iterations * 3,  # 반복 횟수 줄임
+                    method='trf',
+                    max_nfev=max_iterations * 2,
                     verbose=1,
-                    ftol=1e-4,             # 더 엄격한 수렴 조건
-                    xtol=1e-4,
-                    bounds=(-np.inf, np.inf)  # 경계 조건 없음
+                    ftol=1e-6,  # 더 엄격한 수렴 조건
+                    xtol=1e-6,
+                    bounds=(-np.inf, np.inf)
                 )
             else:
                 result = least_squares(
-                    self._compute_residuals,
+                    self._compute_residuals_improved,
                     params,
-                    method='lm',           # Levenberg-Marquardt
-                    max_nfev=max_iterations * 5,  # 반복 횟수 줄임
+                    method='lm',
+                    max_nfev=max_iterations * 3,
                     verbose=1,
-                    ftol=1e-5,            # 더 엄격한 수렴 조건
-                    xtol=1e-5
+                    ftol=1e-7,  # 더 엄격한 수렴 조건
+                    xtol=1e-7
                 )
             
             # 결과 언패킹
@@ -997,11 +1147,11 @@ class SuperGlue3DGSPipeline:
             print(f"  Bundle adjustment completed. Final cost: {result.cost:.6f}")
             print(f"  Method: {method}, Iterations: {result.nfev}")
             
-            # 🔧 cost 평가
-            if result.cost > 1000:
+            # 🔧 개선된 cost 평가
+            if result.cost > 500:
                 print(f"  ⚠️  높은 BA cost: {result.cost:.2f}")
                 print("  포인트 클라우드 품질이 낮을 수 있습니다")
-            elif result.cost > 100:
+            elif result.cost > 50:
                 print(f"  ⚠️  중간 BA cost: {result.cost:.2f}")
             else:
                 print(f"  ✅ 좋은 BA cost: {result.cost:.2f}")
@@ -1010,8 +1160,8 @@ class SuperGlue3DGSPipeline:
             print(f"  Bundle adjustment failed: {e}")
             print("  Continuing without bundle adjustment...")
 
-    def _compute_residuals(self, params):
-        """Bundle Adjustment 잔차 계산 (개선된 버전)"""
+    def _compute_residuals_improved(self, params):
+        """개선된 Bundle Adjustment 잔차 계산"""
         residuals = []
         
         # 파라미터 언패킹
@@ -1019,7 +1169,7 @@ class SuperGlue3DGSPipeline:
             self._unpack_parameters(params)
         except Exception as e:
             print(f"    Warning: Parameter unpacking failed: {e}")
-            return np.ones(100) * 1e6  # 큰 잔차 반환
+            return np.ones(100) * 1e6
         
         # 각 관찰에 대한 재투영 오차 계산
         for point_id, observations in self.point_observations.items():
@@ -1043,36 +1193,35 @@ class SuperGlue3DGSPipeline:
                     
                     # 깊이 체크
                     if point_cam[2] <= 0:
-                        residuals.extend([50.0, 50.0])  # 카메라 뒤쪽
+                        residuals.extend([20.0, 20.0])  # 카메라 뒤쪽 (더 작은 페널티)
                         continue
                     
                     # 재투영
                     point_2d_proj = K @ point_cam
-                    if abs(point_2d_proj[2]) < 1e-10:  # 0으로 나누기 방지
-                        residuals.extend([50.0, 50.0])
+                    if abs(point_2d_proj[2]) < 1e-10:
+                        residuals.extend([20.0, 20.0])
                         continue
                     point_2d_proj = point_2d_proj[:2] / point_2d_proj[2]
                     
                     # 🔧 개선된 잔차 계산
                     residual = point_2d_proj - observed_pt
                     
-                    # 🔧 이상치 제거 (너무 큰 잔차는 제한)
-                    residual = np.clip(residual, -50.0, 50.0)
+                    # 🔧 Huber loss 적용 (이상치에 강함)
+                    residual = self._apply_huber_loss_improved(residual, delta=3.0)
                     
-                    # 🔧 신뢰도 가중치 조정 (너무 낮은 신뢰도는 제한)
-                    weight = max(conf, 0.1)  # 최소 0.1
+                    # 🔧 신뢰도 가중치 (더 현실적인 가중치)
+                    weight = np.clip(conf, 0.1, 1.0)
                     
                     # 🔧 스케일링 (픽셀 단위를 적절한 스케일로)
-                    residual = residual * weight * 0.1  # 스케일링 팩터
+                    residual = residual * weight * 0.05  # 스케일링 팩터 조정
                     
                     residuals.extend(residual)
                     
                 except Exception as e:
-                    # 개별 관찰에서 오류가 발생해도 계속 진행
-                    residuals.extend([10.0, 10.0])
+                    residuals.extend([5.0, 5.0])  # 더 작은 기본 오차
         
         if len(residuals) == 0:
-            return np.ones(100) * 1e6  # 빈 잔차 방지
+            return np.ones(100) * 1e6
         
         residuals = np.array(residuals)
         
@@ -1080,80 +1229,18 @@ class SuperGlue3DGSPipeline:
         if np.any(np.isnan(residuals)) or np.any(np.isinf(residuals)):
             return np.ones(len(residuals)) * 1e6
         
-        # 🔧 추가: 잔차 통계 출력 (디버깅용)
-        if len(residuals) > 0:
-            mean_residual = np.mean(np.abs(residuals))
-            max_residual = np.max(np.abs(residuals))
-            if mean_residual > 10.0 or max_residual > 100.0:
-                print(f"    ⚠️  높은 잔차 감지: mean={mean_residual:.2f}, max={max_residual:.2f}")
-        
         return residuals
-    
-    def _apply_huber_loss(self, residual, delta=2.0):
-        """Huber loss 적용 (NEW METHOD)"""
+
+    def _apply_huber_loss_improved(self, residual, delta=3.0):
+        """개선된 Huber loss 적용"""
         abs_residual = np.abs(residual)
         mask = abs_residual <= delta
         
         result = np.zeros_like(residual)
         result[mask] = residual[mask]
-        result[~mask] = delta * np.sign(residual[~mask])
+        result[~mask] = delta * np.sign(residual[~mask]) * (2 * np.sqrt(abs_residual[~mask] / delta) - 1)
         
         return result
-    
-    def _pack_parameters(self):
-        """카메라 포즈와 3D 포인트를 하나의 벡터로 패킹"""
-        params = []
-        
-        # 카메라 포즈 (회전 + 이동)
-        for cam_id in sorted(self.cameras.keys()):
-            cam = self.cameras[cam_id]
-            R = cam['R']
-            T = cam['T']
-            
-            # 회전 행렬을 로드리게스 벡터로 변환
-            angle_axis = self._rotation_matrix_to_angle_axis(R)
-            params.extend(angle_axis)
-            params.extend(T)
-        
-        # 3D 포인트
-        for point_id in sorted(self.points_3d.keys()):
-            point = self.points_3d[point_id]['xyz']
-            params.extend(point)
-        
-        params = np.array(params)
-        
-        # NaN이나 무한대 값 체크
-        if np.any(np.isnan(params)) or np.any(np.isinf(params)):
-            raise ValueError("Invalid parameters detected (NaN or Inf)")
-        
-        return params
-    
-    def _unpack_parameters(self, params):
-        """벡터에서 카메라 포즈와 3D 포인트 언패킹"""
-        idx = 0
-        
-        # 카메라 포즈 복원
-        for cam_id in sorted(self.cameras.keys()):
-            # 로드리게스 벡터 (3개)
-            angle_axis = params[idx:idx+3]
-            idx += 3
-            
-            # 이동 벡터 (3개)
-            T = params[idx:idx+3]
-            idx += 3
-            
-            # 회전 행렬로 변환
-            R = self._angle_axis_to_rotation_matrix(angle_axis)
-            
-            self.cameras[cam_id]['R'] = R.astype(np.float32)
-            self.cameras[cam_id]['T'] = T.astype(np.float32)
-        
-        # 3D 포인트 복원
-        for point_id in sorted(self.points_3d.keys()):
-            xyz = params[idx:idx+3]
-            idx += 3
-            self.points_3d[point_id]['xyz'] = xyz.astype(np.float32)
-            
     
     def _expand_point_observations(self):
         """포인트 관찰 데이터 확장으로 잔차 수 증가"""
@@ -1266,12 +1353,14 @@ class SuperGlue3DGSPipeline:
         print(f"  Final point cloud: {len(self.points_3d)} points")
     
     def _get_projection_matrix(self, cam_id):
-        """카메라 투영 행렬 생성"""
+        """카메라 투영 행렬 생성 (수정된 버전)"""
         cam = self.cameras[cam_id]
         K, R, T = cam['K'], cam['R'], cam['T']
         
-        # P = K[R|t] (t = -R^T * T_world)
-        RT = np.hstack([R, T.reshape(-1, 1)])
+        # T가 월드 좌표계의 카메라 중심이라고 가정
+        # P = K[R|t] where t = -R * T (카메라 중심을 카메라 좌표계로 변환)
+        t = -R @ T  # 카메라 중심을 카메라 좌표계로 변환
+        RT = np.hstack([R, t.reshape(-1, 1)])
         P = K @ RT
         
         return P
@@ -1707,6 +1796,60 @@ class SuperGlue3DGSPipeline:
                 return [int(w * scale), int(h * scale)]
         except:
             return [1024, 768]  # 기본값
+
+    def _pack_parameters(self):
+        """카메라 포즈와 3D 포인트를 하나의 벡터로 패킹"""
+        params = []
+        
+        # 카메라 포즈 (회전 + 이동)
+        for cam_id in sorted(self.cameras.keys()):
+            cam = self.cameras[cam_id]
+            R = cam['R']
+            T = cam['T']
+            
+            # 회전 행렬을 로드리게스 벡터로 변환
+            angle_axis = self._rotation_matrix_to_angle_axis(R)
+            params.extend(angle_axis)
+            params.extend(T)
+        
+        # 3D 포인트
+        for point_id in sorted(self.points_3d.keys()):
+            point = self.points_3d[point_id]['xyz']
+            params.extend(point)
+        
+        params = np.array(params)
+        
+        # NaN이나 무한대 값 체크
+        if np.any(np.isnan(params)) or np.any(np.isinf(params)):
+            raise ValueError("Invalid parameters detected (NaN or Inf)")
+        
+        return params
+    
+    def _unpack_parameters(self, params):
+        """벡터에서 카메라 포즈와 3D 포인트 언패킹"""
+        idx = 0
+        
+        # 카메라 포즈 복원
+        for cam_id in sorted(self.cameras.keys()):
+            # 로드리게스 벡터 (3개)
+            angle_axis = params[idx:idx+3]
+            idx += 3
+            
+            # 이동 벡터 (3개)
+            T = params[idx:idx+3]
+            idx += 3
+            
+            # 회전 행렬로 변환
+            R = self._angle_axis_to_rotation_matrix(angle_axis)
+            
+            self.cameras[cam_id]['R'] = R.astype(np.float32)
+            self.cameras[cam_id]['T'] = T.astype(np.float32)
+        
+        # 3D 포인트 복원
+        for point_id in sorted(self.points_3d.keys()):
+            xyz = params[idx:idx+3]
+            idx += 3
+            self.points_3d[point_id]['xyz'] = xyz.astype(np.float32)
 
 def readSuperGlueSceneInfo(path, images, eval, train_test_exp=False, llffhold=8, 
                           superglue_config="outdoor", max_images=100):
