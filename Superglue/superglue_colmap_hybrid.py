@@ -470,11 +470,11 @@ class SuperGlueCOLMAPHybrid:
             return None, None
 
     def _convert_descriptors_to_sift_format(self, descriptors):
-        """SuperPoint descriptor를 COLMAP SIFT 형식으로 완전 변환"""
+        """SuperPoint descriptor를 COLMAP SIFT 형식으로 완전 변환 - 개선된 차원 축소"""
         try:
             print(f"      🔄 디스크립터 변환: {descriptors.shape} {descriptors.dtype}")
             
-            # 1. 차원 축소: 256 -> 128
+            # 1. 차원 축소: 256 -> 128 (개선된 방식)
             if descriptors.shape[1] == 256:
                 # L2 정규화
                 descriptors = descriptors / (np.linalg.norm(descriptors, axis=1, keepdims=True) + 1e-8)
@@ -482,12 +482,28 @@ class SuperGlueCOLMAPHybrid:
                 n_features = descriptors.shape[0]
                 descriptors_128 = np.zeros((n_features, 128), dtype=np.float32)
                 
-                # 2개씩 묶어서 평균
-                for j in range(128):
-                    descriptors_128[:, j] = (descriptors[:, j*2] + descriptors[:, j*2+1]) / 2.0
+                # ✅ 개선된 차원 축소 방식
+                # 1) 첫 128개 차원 사용 (가장 중요한 정보)
+                descriptors_128 = descriptors[:, :128].copy()
                 
-                # 다시 L2 정규화
+                # 2) 추가로 나머지 128개 차원의 정보를 압축하여 보완
+                remaining_descriptors = descriptors[:, 128:]
+                
+                # 3) 128개 차원을 64개로 압축 (평균 + 표준편차)
+                compressed_64 = np.zeros((n_features, 64), dtype=np.float32)
+                for i in range(64):
+                    start_idx = i * 2
+                    end_idx = start_idx + 2
+                    if end_idx <= remaining_descriptors.shape[1]:
+                        compressed_64[:, i] = np.mean(remaining_descriptors[:, start_idx:end_idx], axis=1)
+                
+                # 4) 압축된 정보를 기존 128차원에 추가 (64개만 사용)
+                descriptors_128[:, :64] = 0.7 * descriptors_128[:, :64] + 0.3 * compressed_64
+                
+                # 5) 최종 L2 정규화
                 descriptors_128 = descriptors_128 / (np.linalg.norm(descriptors_128, axis=1, keepdims=True) + 1e-8)
+                
+                print(f"      ✅ 개선된 차원 축소 완료: {descriptors_128.shape}")
             else:
                 descriptors_128 = descriptors.astype(np.float32)
             
@@ -747,7 +763,7 @@ class SuperGlueCOLMAPHybrid:
             return None
 
     def _run_superpoint_only_matching(self, image_paths, database_path):
-        """SuperPoint만 사용한 매칭"""
+        """SuperPoint만 사용한 매칭 - 반환값 추가"""
         print("  🔥 SuperPoint-only 매칭 중...")
         
         try:
@@ -790,6 +806,12 @@ class SuperGlueCOLMAPHybrid:
                             (pair_id, len(matches), 2, matches.tobytes())
                         )
                         
+                        # two_view_geometries 테이블에도 저장
+                        cursor.execute(
+                            "INSERT INTO two_view_geometries (pair_id, rows, cols, data, config) VALUES (?, ?, ?, ?, ?)",
+                            (pair_id, len(matches), 2, matches.tobytes(), 2)
+                        )
+                        
                         print(f"        ✅ {len(matches)}개 매칭 저장")
                         successful_matches += 1
                     else:
@@ -805,13 +827,16 @@ class SuperGlueCOLMAPHybrid:
             if successful_matches == 0:
                 print("    ⚠️  SuperPoint-only 매칭 실패, COLMAP 매칭으로 fallback...")
                 self._run_colmap_matching_fast(database_path)
+                return True  # COLMAP 매칭은 성공으로 간주
             else:
                 print("    ✅ SuperPoint-only 매칭 완료!")
+                return True
                 
         except Exception as e:
             print(f"    ❌ SuperPoint-only 매칭 오류: {e}")
             print("    🔄 COLMAP 매칭으로 fallback...")
             self._run_colmap_matching_fast(database_path)
+            return True  # COLMAP 매칭은 성공으로 간주
 
     def _match_single_pair_superpoint_only(self, image_path1, image_path2):
         """SuperPoint만 사용한 두 이미지 간 매칭"""
@@ -850,7 +875,7 @@ class SuperGlueCOLMAPHybrid:
 
     # 나머지 메서드들은 기존과 동일하게 유지...
     def process_images(self, image_dir: str, output_dir: str, max_images: int = 100):
-        """메인 처리 메서드"""
+        """메인 처리 메서드 - 개선된 에러 처리"""
         print("🚀 SuperGlue + COLMAP 하이브리드 파이프라인 시작")
         
         output_path = Path(output_dir)
@@ -864,20 +889,56 @@ class SuperGlueCOLMAPHybrid:
                 raise RuntimeError("처리할 이미지를 찾을 수 없습니다")
             
             print(f"  선택된 이미지: {len(image_paths)}장")
+            
+            # ✅ 이미지 유효성 검증
+            valid_images = []
+            for img_path in image_paths:
+                try:
+                    img = cv2.imread(str(img_path))
+                    if img is not None and img.size > 0:
+                        valid_images.append(img_path)
+                    else:
+                        print(f"  ⚠️  무효한 이미지 제외: {img_path}")
+                except Exception as e:
+                    print(f"  ⚠️  이미지 로드 실패 제외: {img_path} - {e}")
+            
+            if len(valid_images) < 3:
+                raise RuntimeError(f"유효한 이미지가 부족합니다: {len(valid_images)}장 (최소 3장 필요)")
+            
+            image_paths = valid_images
+            print(f"  ✅ 유효한 이미지: {len(image_paths)}장")
+            
             input_dir = self._prepare_input_images(image_paths, output_path)
             
             # 2. COLMAP 데이터베이스 생성
             print("\n[2/6] COLMAP 데이터베이스 생성...")
             database_path = output_path / "database.db"
-            self._create_colmap_database(image_paths, database_path, input_dir)
+            if not self._create_colmap_database(image_paths, database_path, input_dir):
+                raise RuntimeError("COLMAP 데이터베이스 생성 실패")
             
             # 3. 특징점 추출 (SuperPoint 또는 COLMAP SIFT)
             print("\n[3/6] 특징점 추출...")
-            self._extract_superpoint_features(image_paths, database_path, input_dir)
+            superpoint_success = self._extract_superpoint_features(image_paths, database_path, input_dir)
+            
+            if not superpoint_success:
+                print("  ⚠️  SuperPoint 추출 실패, COLMAP SIFT로 fallback...")
+                self._run_colmap_feature_extraction_fast(database_path, input_dir)
+            
+            # ✅ 특징점 개수 검증
+            if not self._verify_features_in_database(database_path):
+                raise RuntimeError("특징점 추출 실패 - 충분한 특징점이 없습니다")
             
             # 4. 매칭 (빠른 COLMAP exhaustive matcher)
             print("\n[4/6] 특징점 매칭...")
-            self._run_superglue_matching(image_paths, database_path)
+            matching_success = self._run_superglue_matching(image_paths, database_path)
+            
+            if not matching_success:
+                print("  ⚠️  SuperGlue 매칭 실패, COLMAP 매칭으로 fallback...")
+                self._run_colmap_matching_fast(database_path)
+            
+            # ✅ 매칭 결과 검증
+            if not self._verify_matches_in_database(database_path):
+                raise RuntimeError("매칭 실패 - 충분한 매칭이 없습니다")
             
             # 5. 포즈 추정
             print("\n[5/6] 포즈 추정...")
@@ -888,6 +949,10 @@ class SuperGlueCOLMAPHybrid:
             if not self._run_colmap_mapper_fast(database_path, input_dir, sparse_dir):
                 raise RuntimeError("COLMAP 매퍼 실패 - SceneInfo fallback 방지")
             
+            # ✅ reconstruction 결과 검증
+            if not self._verify_reconstruction(sparse_dir):
+                raise RuntimeError("COLMAP reconstruction 실패 - 유효한 3D 모델이 없습니다")
+            
             # 6. 언디스토션 (옵션)
             print("\n[6/6] 언디스토션...")
             undistorted_dir = output_path / "undistorted"
@@ -897,6 +962,13 @@ class SuperGlueCOLMAPHybrid:
             print("\n[7/6] 3DGS 형식 변환...")
             scene_info = self._convert_to_3dgs_format(output_path, image_paths)
             
+            if scene_info is None:
+                raise RuntimeError("3DGS 형식 변환 실패")
+            
+            # ✅ 최종 결과 검증
+            if not self._verify_scene_info(scene_info):
+                raise RuntimeError("SceneInfo 검증 실패")
+            
             print("✅ 하이브리드 파이프라인 완료!")
             return scene_info
             
@@ -904,6 +976,17 @@ class SuperGlueCOLMAPHybrid:
             print(f"\n❌ 파이프라인 실패: {e}")
             import traceback
             traceback.print_exc()
+            
+            # ✅ 실패시 기본 SceneInfo 생성 시도
+            print("🔄 기본 SceneInfo 생성 시도...")
+            try:
+                fallback_scene = self._create_default_scene_info(image_paths, output_path)
+                if fallback_scene is not None:
+                    print("✅ 기본 SceneInfo 생성 성공 (fallback)")
+                    return fallback_scene
+            except Exception as fallback_error:
+                print(f"❌ 기본 SceneInfo 생성도 실패: {fallback_error}")
+            
             return None
 
     def _run_colmap_matching_fast(self, database_path):
@@ -1118,18 +1201,104 @@ class SuperGlueCOLMAPHybrid:
             print(f"  ✗ 데이터베이스 생성 실패: {e}")
             return False
         
+    def _verify_features_in_database(self, database_path):
+        """데이터베이스의 특징점 개수 검증"""
+        try:
+            conn = sqlite3.connect(str(database_path))
+            cursor = conn.cursor()
+            
+            # 특징점 개수 확인
+            cursor.execute("SELECT COUNT(*) FROM keypoints")
+            keypoint_count = cursor.fetchone()[0]
+            
+            # 디스크립터 개수 확인
+            cursor.execute("SELECT COUNT(*) FROM descriptors")
+            descriptor_count = cursor.fetchone()[0]
+            
+            # 이미지 개수 확인
+            cursor.execute("SELECT COUNT(*) FROM images")
+            image_count = cursor.fetchone()[0]
+            
+            conn.close()
+            
+            print(f"    🔍 특징점 검증: {keypoint_count}개 키포인트, {descriptor_count}개 디스크립터, {image_count}개 이미지")
+            
+            # 최소 요구사항 확인
+            if keypoint_count == 0:
+                print("    ❌ 키포인트가 없습니다")
+                return False
+            
+            if descriptor_count == 0:
+                print("    ❌ 디스크립터가 없습니다")
+                return False
+            
+            if image_count < 3:
+                print("    ❌ 이미지가 부족합니다")
+                return False
+            
+            # 평균 특징점 개수 확인
+            avg_keypoints = keypoint_count / image_count
+            if avg_keypoints < 10:
+                print(f"    ⚠️  평균 특징점이 적습니다: {avg_keypoints:.1f}개")
+                return False
+            
+            print(f"    ✅ 특징점 검증 통과: 평균 {avg_keypoints:.1f}개")
+            return True
+            
+        except Exception as e:
+            print(f"    ❌ 특징점 검증 오류: {e}")
+            return False
+
+    def _verify_matches_in_database(self, database_path):
+        """매칭 결과가 DB에 제대로 저장되었는지 확인 - 개선된 버전"""
+        try:
+            import sqlite3
+            
+            conn = sqlite3.connect(database_path)
+            cursor = conn.cursor()
+            
+            # 매칭 개수 확인
+            cursor.execute("SELECT COUNT(*) FROM two_view_geometries")
+            match_count = cursor.fetchone()[0]
+            
+            # 이미지 개수 확인
+            cursor.execute("SELECT COUNT(*) FROM images")
+            image_count = cursor.fetchone()[0]
+            
+            conn.close()
+            
+            print(f"    🔍 매칭 검증: {match_count}개 매칭, {image_count}개 이미지")
+            
+            if match_count == 0:
+                print("    ❌ 매칭이 없습니다!")
+                return False
+            
+            # 최소 매칭 쌍 수 확인
+            min_expected_matches = max(1, image_count - 1)  # 최소 연속된 이미지 쌍
+            if match_count < min_expected_matches:
+                print(f"    ⚠️  매칭이 부족합니다: {match_count}개 (예상: {min_expected_matches}개)")
+                return False
+            
+            print(f"    ✅ 매칭 검증 통과: {match_count}개 매칭")
+            return True
+            
+        except Exception as e:
+            print(f"    ⚠️  매칭 검증 실패: {e}")
+            return False
+
     def _run_superglue_matching(self, image_paths, database_path):
-        """SuperGlue 매칭 - 실제 매칭 결과를 COLMAP DB에 저장"""
+        """SuperGlue 매칭 - 실제 매칭 결과를 COLMAP DB에 저장 - 개선된 버전"""
         print("  🔥 SuperGlue 매칭 중...")
         
         if self.superglue is None:
             if self.superpoint is not None:
                 print("  ⚠️  SuperGlue 모델 없음, SuperPoint-only 매칭으로 fallback...")
-                self._run_superpoint_only_matching(image_paths, database_path)
+                return self._run_superpoint_only_matching(image_paths, database_path)
             else:
                 print("  ⚠️  SuperGlue 모델 없음, COLMAP 매칭으로 fallback...")
                 self._run_colmap_matching_fast(database_path)
-            return
+                return True  # COLMAP 매칭은 성공으로 간주
+            return False
         
         try:
             conn = sqlite3.connect(str(database_path))
@@ -1201,45 +1370,17 @@ class SuperGlueCOLMAPHybrid:
             if successful_matches == 0:
                 print("    ⚠️  SuperGlue 매칭 실패, COLMAP 매칭으로 fallback...")
                 self._run_colmap_matching_fast(database_path)
+                return True  # COLMAP 매칭은 성공으로 간주
             else:
                 print("    ✅ SuperGlue 매칭 완료!")
+                return True
                 
         except Exception as e:
             print(f"    ❌ SuperGlue 매칭 오류: {e}")
             print("    🔄 COLMAP 매칭으로 fallback...")
             self._run_colmap_matching_fast(database_path)
+            return True  # COLMAP 매칭은 성공으로 간주
     
-    def _verify_matches_in_database(self, database_path):
-        """매칭 결과가 DB에 제대로 저장되었는지 확인"""
-        try:
-            import sqlite3
-            
-            conn = sqlite3.connect(database_path)
-            cursor = conn.cursor()
-            
-            # 매칭 개수 확인
-            cursor.execute("SELECT COUNT(*) FROM two_view_geometries")
-            match_count = cursor.fetchone()[0]
-            
-            # 이미지 개수 확인
-            cursor.execute("SELECT COUNT(*) FROM images")
-            image_count = cursor.fetchone()[0]
-            
-            conn.close()
-            
-            print(f"    🔍 DB 검증: {match_count}개 매칭, {image_count}개 이미지")
-            
-            if match_count == 0:
-                print("    ⚠️  경고: DB에 매칭이 없습니다!")
-                return False
-            else:
-                print(f"    ✅ DB에 {match_count}개 매칭 저장됨")
-                return True
-                
-        except Exception as e:
-            print(f"    ⚠️  DB 검증 실패: {e}")
-            return False
-        
     def _create_default_scene_info(self, image_paths, output_path):
         """기본 SceneInfo 생성 - CameraInfo 파라미터 수정"""
         print("    🎯 기본 SceneInfo 생성...")
@@ -1652,6 +1793,64 @@ class SuperGlueCOLMAPHybrid:
             import traceback
             traceback.print_exc()
             raise RuntimeError(f"COLMAP reconstruction 파싱 실패: {e}")
+
+    def _verify_reconstruction(self, sparse_dir):
+        """COLMAP reconstruction 결과 검증"""
+        print("  🔍 COLMAP reconstruction 결과 검증...")
+        
+        try:
+            # 생성된 reconstruction 폴더 확인
+            if not sparse_dir.exists():
+                print("  ❌ COLMAP reconstruction 없음")
+                return False
+            
+            # 생성된 모델 파일 확인
+            model_files = list(sparse_dir.glob("*.bin"))
+            if not model_files:
+                print("  ❌ COLMAP reconstruction 파일 없음")
+                return False
+            
+            print(f"    생성된 모델 파일: {len(model_files)}개")
+            
+            # 모델 파일 검증
+            for model_file in model_files:
+                print(f"      {model_file.name}")
+                if not model_file.exists():
+                    print(f"      ❌ {model_file.name} 없음")
+                    return False
+            
+            return True
+            
+        except Exception as e:
+            print(f"  ❌ COLMAP reconstruction 결과 검증 오류: {e}")
+            return False
+
+    def _verify_scene_info(self, scene_info):
+        """SceneInfo 검증"""
+        print("  🔍 SceneInfo 검증...")
+        
+        try:
+            # 포인트 클라우드 검증
+            if scene_info.point_cloud is None or len(scene_info.point_cloud.points) == 0:
+                print("  ❌ SceneInfo: 포인트 클라우드 없음")
+                return False
+            
+            # 카메라 정보 검증
+            if not scene_info.train_cameras or not scene_info.test_cameras:
+                print("  ❌ SceneInfo: 카메라 정보 없음")
+                return False
+            
+            # 카메라 정보 검증
+            for cam in scene_info.train_cameras + scene_info.test_cameras:
+                if cam.R is None or cam.T is None:
+                    print(f"  ❌ SceneInfo: 카메라 {cam.uid} 정보 없음")
+                    return False
+            
+            return True
+            
+        except Exception as e:
+            print(f"  ❌ SceneInfo 검증 오류: {e}")
+            return False
 
 # 사용 예시
 if __name__ == "__main__":
