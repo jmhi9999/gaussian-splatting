@@ -1016,7 +1016,7 @@ class SuperGlueCOLMAPHybrid:
             print(f"  ✗ COLMAP 매칭 오류: {e}")
 
     def _run_colmap_mapper_fast(self, database_path, image_path, output_path):
-        """빠른 COLMAP 매퍼 - 결과 확인 개선"""
+        """빠른 COLMAP 매퍼 - 더 관대한 설정"""
         print("  ⚡ 빠른 COLMAP 매퍼...")
         
         # 더 관대한 설정으로 COLMAP 매퍼 실행
@@ -1026,18 +1026,25 @@ class SuperGlueCOLMAPHybrid:
             "--image_path", str(image_path),
             "--output_path", str(output_path),
             
-            # 📉 더 관대한 설정
-            "--Mapper.min_num_matches", "3",              # 8 → 3
-            "--Mapper.init_min_num_inliers", "6",         # 16 → 6
-            "--Mapper.abs_pose_min_num_inliers", "3",     # 8 → 3
-            "--Mapper.filter_max_reproj_error", "20.0",   # 더 큰 허용 오차
+            # 📉 Ultra 관대한 설정
+            "--Mapper.min_num_matches", "2",              # 3 → 2
+            "--Mapper.init_min_num_inliers", "3",         # 6 → 3
+            "--Mapper.abs_pose_min_num_inliers", "2",     # 3 → 2
+            "--Mapper.filter_max_reproj_error", "50.0",   # 20.0 → 50.0
             "--Mapper.ba_refine_focal_length", "0",       # 초점거리 고정
             "--Mapper.ba_refine_principal_point", "0",    # 주점 고정
             "--Mapper.ba_refine_extra_params", "0",       # 추가 파라미터 고정
             
             # 🚀 성능 개선
             "--Mapper.max_num_models", "1",               # 단일 모델만
-            "--Mapper.min_model_size", "3",               # 최소 3장 이미지
+            "--Mapper.min_model_size", "2",               # 3 → 2 (최소 2장 이미지)
+            
+            # 추가 관대한 설정
+            "--Mapper.init_max_error", "10.0",            # 초기화 오차 허용
+            "--Mapper.init_min_track_angle", "1.0",       # 최소 트랙 각도
+            "--Mapper.init_min_num_inliers", "3",         # 최소 inlier 수
+            "--Mapper.abs_pose_max_error", "10.0",        # 절대 포즈 오차
+            "--Mapper.abs_pose_min_num_inliers", "2",     # 절대 포즈 최소 inlier
         ]
         
         print(f"    명령: {' '.join(base_cmd)}")
@@ -1406,8 +1413,8 @@ class SuperGlueCOLMAPHybrid:
             return True  # COLMAP 매칭은 성공으로 간주
     
     def _create_default_scene_info(self, image_paths, output_path):
-        """기본 SceneInfo 생성 - CameraInfo 파라미터 수정"""
-        print("    🎯 기본 SceneInfo 생성...")
+        """기본 SceneInfo 생성 - 개선된 버전"""
+        print("    🎯 기본 SceneInfo 생성 (개선된 버전)...")
         
         try:
             from utils.graphics_utils import BasicPointCloud
@@ -1420,14 +1427,18 @@ class SuperGlueCOLMAPHybrid:
             else:
                 height, width = sample_img.shape[:2]
             
-            # 카메라 정보 생성
+            # 카메라 정보 생성 - 더 많은 카메라 생성
             train_cameras = []
             test_cameras = []
             
-            for i, img_path in enumerate(image_paths):
+            # 더 나은 카메라 배치 생성
+            n_images = len(image_paths)
+            
+            # 원형 배치 + 약간의 랜덤성 추가
+            for i in range(n_images):
                 # 이미지 실제 크기 확인
                 try:
-                    img = cv2.imread(str(img_path))
+                    img = cv2.imread(str(image_paths[i]))
                     if img is not None:
                         h, w = img.shape[:2]
                     else:
@@ -1440,9 +1451,10 @@ class SuperGlueCOLMAPHybrid:
                 fov_x = 2 * np.arctan(w / (2 * focal_length))
                 fov_y = 2 * np.arctan(h / (2 * focal_length))
                 
-                # 카메라 외부 파라미터 (원형 배치)
-                angle = 2 * np.pi * i / len(image_paths)
-                radius = 3.0
+                # 개선된 카메라 외부 파라미터 (더 나은 배치)
+                angle = 2 * np.pi * i / n_images
+                radius = 3.0 + 0.5 * np.sin(i * 0.7)  # 약간의 변형
+                height_offset = 0.5 * np.cos(i * 0.5)  # 높이 변화
                 
                 # 회전 행렬 (카메라가 중심을 바라보도록)
                 R = np.array([
@@ -1454,24 +1466,24 @@ class SuperGlueCOLMAPHybrid:
                 # 이동 벡터
                 T = np.array([
                     radius * np.cos(angle),
-                    0.0,
+                    height_offset,
                     radius * np.sin(angle)
                 ], dtype=np.float32)
                 
-                # ✅ CameraInfo 생성 - 올바른 파라미터만 사용
+                # ✅ CameraInfo 생성
                 cam_info = CameraInfo(
                     uid=i,
                     R=R,
                     T=T,
                     FovY=fov_y,
                     FovX=fov_x,
-                    depth_params=None,  # ← image가 아님
-                    image_path=str(img_path),
-                    image_name=img_path.name,
+                    depth_params=None,
+                    image_path=str(image_paths[i]),
+                    image_name=image_paths[i].name,
                     depth_path="",
                     width=w,
                     height=h,
-                    is_test=(i % 8 == 0)  # 8개마다 1개씩 테스트
+                    is_test=(i % 5 == 0)  # 5개마다 1개씩 테스트 (더 많은 테스트 카메라)
                 )
                 
                 if cam_info.is_test:
@@ -1481,12 +1493,23 @@ class SuperGlueCOLMAPHybrid:
             
             print(f"      생성된 카메라: train={len(train_cameras)}, test={len(test_cameras)}")
             
-            # 기본 포인트 클라우드 생성
-            n_points = 2000
-            xyz = np.random.randn(n_points, 3).astype(np.float32) * 1.5
+            # 개선된 포인트 클라우드 생성
+            n_points = 5000  # 더 많은 포인트
+            xyz = np.random.randn(n_points, 3).astype(np.float32) * 2.0  # 더 넓은 분포
             rgb = np.random.rand(n_points, 3).astype(np.float32)
             normals = np.random.randn(n_points, 3).astype(np.float32)
             normals = normals / (np.linalg.norm(normals, axis=1, keepdims=True) + 1e-8)
+            
+            # 중앙에 더 밀집된 포인트 추가
+            center_points = np.random.randn(n_points//2, 3).astype(np.float32) * 0.5
+            center_rgb = np.random.rand(n_points//2, 3).astype(np.float32)
+            center_normals = np.random.randn(n_points//2, 3).astype(np.float32)
+            center_normals = center_normals / (np.linalg.norm(center_normals, axis=1, keepdims=True) + 1e-8)
+            
+            # 결합
+            xyz = np.vstack([xyz, center_points])
+            rgb = np.vstack([rgb, center_rgb])
+            normals = np.vstack([normals, center_normals])
             
             point_cloud = BasicPointCloud(
                 points=xyz,
@@ -1505,7 +1528,7 @@ class SuperGlueCOLMAPHybrid:
                 cam_centers = np.array(cam_centers)
                 center = np.mean(cam_centers, axis=0)
                 distances = np.linalg.norm(cam_centers - center, axis=1)
-                radius = np.max(distances) * 1.1
+                radius = np.max(distances) * 1.2  # 약간 더 큰 반지름
             else:
                 center = np.zeros(3)
                 radius = 5.0
@@ -1529,7 +1552,7 @@ class SuperGlueCOLMAPHybrid:
                 is_nerf_synthetic=False
             )
             
-            print(f"      ✅ SceneInfo 생성 완료!")
+            print(f"      ✅ 개선된 SceneInfo 생성 완료!")
             print(f"         Train cameras: {len(train_cameras)}")
             print(f"         Test cameras: {len(test_cameras)}")
             print(f"         Point cloud: {len(xyz)} points")
@@ -1680,7 +1703,7 @@ class SuperGlueCOLMAPHybrid:
             raise RuntimeError("3DGS 변환 실패 - SceneInfo fallback 방지")
 
     def _parse_colmap_reconstruction(self, reconstruction_path, image_paths, output_path):
-        """COLMAP reconstruction 파싱"""
+        """COLMAP reconstruction 파싱 - 개선된 버전"""
         print(f"    COLMAP reconstruction 파싱: {reconstruction_path}")
         
         try:
@@ -1709,6 +1732,13 @@ class SuperGlueCOLMAPHybrid:
             xyzs, rgbs, errors = read_points3D_binary(str(points3d_bin))
             print(f"      3D 포인트: {len(xyzs)}개")
             
+            # ⚠️ 카메라 개수 경고
+            if len(images) < len(image_paths) * 0.5:  # 50% 미만이면 경고
+                print(f"      ⚠️  경고: COLMAP reconstruction에 포함된 이미지가 적습니다!")
+                print(f"         원본 이미지: {len(image_paths)}개")
+                print(f"         Reconstruction 이미지: {len(images)}개")
+                print(f"         포함률: {len(images)/len(image_paths)*100:.1f}%")
+            
             # SceneInfo 생성
             train_cameras = []
             test_cameras = []
@@ -1724,6 +1754,7 @@ class SuperGlueCOLMAPHybrid:
                 colmap_name = f"image_{i:04d}.jpg"
                 image_name_to_path[colmap_name] = path
             
+            successful_cameras = 0
             for image_id, image in images.items():
                 # 이미지 파일 경로 찾기
                 image_name = image.name
@@ -1773,6 +1804,10 @@ class SuperGlueCOLMAPHybrid:
                     test_cameras.append(cam_info)
                 else:
                     train_cameras.append(cam_info)
+                
+                successful_cameras += 1
+            
+            print(f"      ✅ 성공적으로 처리된 카메라: {successful_cameras}개")
             
             # 포인트 클라우드 생성
             point_cloud = BasicPointCloud(
@@ -1820,6 +1855,11 @@ class SuperGlueCOLMAPHybrid:
             print(f"      Test cameras: {len(test_cameras)}")
             print(f"      Point cloud: {len(xyzs)} points")
             print(f"      Scene radius: {radius:.3f}")
+            
+            # 최종 경고
+            if len(train_cameras) + len(test_cameras) < 10:
+                print(f"      ⚠️  경고: 카메라 개수가 매우 적습니다!")
+                print(f"         이는 학습 품질에 영향을 줄 수 있습니다.")
             
             return scene_info
             
