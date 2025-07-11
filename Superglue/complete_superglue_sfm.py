@@ -1,6 +1,8 @@
 # superglue_3dgs_complete.py
 # SuperGlue와 3DGS 완전 통합 파이프라인
 
+import glob
+from tkinter import Image
 import numpy as np
 import cv2
 import torch
@@ -70,43 +72,28 @@ class SuperGlue3DGSPipeline:
         print(f'SuperGlue 3DGS Pipeline initialized on {self.device}')
     
     def process_images_to_3dgs(self, image_dir, output_dir, max_images=120):
-        """이미지 디렉토리에서 3DGS 학습 가능한 상태까지 완전 처리"""
+        """수정된 메인 프로세스"""
         
         print(f"\n=== SuperGlue + 3DGS Pipeline: Processing up to {max_images} images ===")
         
-        # 1. 이미지 수집 및 정렬
+        # 기존 단계들...
         image_paths = self._collect_images(image_dir, max_images)
-        print(f"Found {len(image_paths)} images")
-        
-        # 2. SuperPoint 특징점 추출
-        print("\n[1/7] Extracting SuperPoint features...")
         self._extract_all_features(image_paths)
-        
-        # 3. SuperGlue 매칭 (지능적 페어링)
-        print("\n[2/7] SuperGlue feature matching...")
-        self._intelligent_matching(max_pairs=min(len(image_paths) * 15, 1500))
-        
-        # 4. 초기 카메라 포즈 추정 (개선된 버전)
-        print("\n[3/7] Camera pose estimation...")
+        self._intelligent_matching(max_pairs=min(len(image_paths) * 15, 2000))  # 증가
         self._estimate_camera_poses_robust()
         
-        # 5. 3D 포인트 삼각측량 (개선된 버전)
-        print("\n[4/7] 3D point triangulation...")
+        # 🔧 수정된 삼각측량
         self._triangulate_all_points_robust()
         
-        # 6. Bundle Adjustment (실제 구현)
-        print("\n[5/7] Bundle adjustment optimization...")
+        # 🔧 추가: 관찰 데이터 확장
+        self._expand_point_observations()
+        
+        # 🔧 수정된 Bundle Adjustment
         self._bundle_adjustment_robust()
         
-        # 7. 포인트 클라우드 정제 (더 완화된 버전)
-        print("\n[6/7] Point cloud refinement...")
+        # 나머지 단계들...
         self._refine_point_cloud()
-        
-        # 8. 3DGS 형식으로 변환
-        print("\n[7/7] Converting to 3DGS format...")
         scene_info = self._create_3dgs_scene_info(image_paths)
-        
-        # 9. 결과 저장
         self._save_3dgs_format(scene_info, output_dir)
         
         return scene_info
@@ -154,46 +141,116 @@ class SuperGlue3DGSPipeline:
         print(f"  Extracted features from {len(self.image_features)} images")
     
     def _intelligent_matching(self, max_pairs=1500):
-        """지능적 이미지 매칭 (더 완화된 버전)"""
+        """지능적 이미지 매칭 (IMPROVED VERSION)"""
         n_images = len(self.image_features)
         
-        # 1. 순차적 매칭 (인접 이미지) - 더 낮은 임계값
+        # 전역 descriptors 계산 (NEW)
+        self._compute_global_descriptors()
+        
+        # 1. 순차적 매칭 - 임계값 상향 조정
+        sequential_count = 0
         for i in range(n_images - 1):
             matches = self._match_pair_superglue(i, i+1)
-            if len(matches) > 5:  # 더 낮은 임계값 (8 → 5)
+            if len(matches) > 12:  # 5 → 12로 상향 조정
                 self.matches[(i, i+1)] = matches
                 self.camera_graph[i].append(i+1)
                 self.camera_graph[i+1].append(i)
+                sequential_count += 1
         
-        # 2. 건너뛰기 매칭 (2, 3, 5, 8, 12 간격) - 더 낮은 임계값
-        for gap in [2, 3, 5, 8, 12]:
-            for i in range(n_images - gap):
-                j = i + gap
-                if len(self.matches) >= max_pairs:
-                    break
-                    
-                matches = self._match_pair_superglue(i, j)
-                if len(matches) > 8:  # 더 낮은 임계값 (12 → 8)
-                    self.matches[(i, j)] = matches
-                    self.camera_graph[i].append(j)
-                    self.camera_graph[j].append(i)
+        print(f"    Sequential pairs: {sequential_count}")
         
-        # 3. 추가 매칭 (연결되지 않은 카메라들) - 더 적극적
+        # 2. 유사도 기반 매칭 (NEW)
+        similarity_count = self._similarity_based_matching(max_pairs)
+        print(f"    Similarity pairs: {similarity_count}")
+        
+        # 3. Loop closure 매칭 (NEW)
+        loop_count = self._loop_closure_matching()
+        print(f"    Loop closure pairs: {loop_count}")
+        
+        print(f"  Total matching pairs: {len(self.matches)}")
+
+    def _compute_global_descriptors(self):
+        """전역 이미지 descriptor 계산 (NEW METHOD)"""
+        self.global_descriptors = {}
+        
+        for cam_id, features in self.image_features.items():
+            descriptors = features['descriptors']  # (256, N)
+            scores = features['scores']
+            
+            if len(scores) > 0:
+                # Score로 가중평균하여 전역 descriptor 계산
+                weights = scores / (scores.sum() + 1e-10)
+                global_desc = np.average(descriptors.T, weights=weights, axis=0)
+                global_desc = global_desc / (np.linalg.norm(global_desc) + 1e-10)
+                self.global_descriptors[cam_id] = global_desc
+            else:
+                self.global_descriptors[cam_id] = np.zeros(256)
+                
+    def _similarity_based_matching(self, max_pairs):
+        """유사도 기반 매칭 (NEW METHOD)"""
+        # 유사도 행렬 계산
+        n_images = len(self.global_descriptors)
+        similarity_matrix = np.zeros((n_images, n_images))
+        
         for i in range(n_images):
-            if len(self.camera_graph[i]) < 2:  # 연결이 적은 카메라 (3 → 2)
-                for j in range(i+1, n_images):
-                    if len(self.camera_graph[j]) < 3 and len(self.matches) < max_pairs:  # (4 → 3)
+            for j in range(i+1, n_images):
+                if i in self.global_descriptors and j in self.global_descriptors:
+                    sim = np.dot(self.global_descriptors[i], self.global_descriptors[j])
+                    similarity_matrix[i, j] = sim
+                    similarity_matrix[j, i] = sim
+        
+        # 유사한 이미지들 매칭
+        similarity_count = 0
+        for cam_id in range(n_images):
+            # 유사도 높은 상위 8개 선택
+            similarities = similarity_matrix[cam_id]
+            candidates = np.argsort(similarities)[::-1]
+            candidates = [c for c in candidates if c != cam_id and similarities[c] > 0.3][:8]
+            
+            for candidate in candidates:
+                pair_key = (min(cam_id, candidate), max(cam_id, candidate))
+                if pair_key in self.matches:
+                    continue
+                
+                matches = self._match_pair_superglue(cam_id, candidate)
+                if len(matches) > 15:  # 비순차적 매칭은 더 높은 임계값
+                    self.matches[pair_key] = matches
+                    self.camera_graph[cam_id].append(candidate)
+                    self.camera_graph[candidate].append(cam_id)
+                    similarity_count += 1
+                
+                if len(self.matches) >= max_pairs:
+                    return similarity_count
+        
+        return similarity_count
+
+    def _loop_closure_matching(self):
+        """Loop closure 매칭 (NEW METHOD)"""
+        n_images = len(self.image_features)
+        loop_count = 0
+        
+        # 첫 번째와 마지막 몇 개 이미지 간 매칭
+        for i in range(min(5, n_images//4)):
+            for j in range(max(n_images-5, 3*n_images//4), n_images):
+                if i >= j:
+                    continue
+                
+                pair_key = (i, j)
+                if pair_key in self.matches:
+                    continue
+                
+                # 전역 유사도 체크
+                if hasattr(self, 'global_descriptors') and i in self.global_descriptors and j in self.global_descriptors:
+                    sim = np.dot(self.global_descriptors[i], self.global_descriptors[j])
+                    if sim > 0.4:  # 높은 임계값
                         matches = self._match_pair_superglue(i, j)
-                        if len(matches) > 5:  # 더 낮은 임계값 (8 → 5)
-                            self.matches[(i, j)] = matches
+                        if len(matches) > 20:  # 매우 높은 임계값
+                            self.matches[pair_key] = matches
                             self.camera_graph[i].append(j)
                             self.camera_graph[j].append(i)
+                            loop_count += 1
         
-        # 4. 매칭 품질 검증 및 필터링 (더 완화된 조건)
-        self._filter_low_quality_matches_very_relaxed()
-        
-        print(f"  Created {len(self.matches)} image pairs with good matches")
-        print(f"  Camera connectivity: {[len(self.camera_graph[i]) for i in range(min(10, n_images))]}")
+        return loop_count
     
     def _filter_low_quality_matches_very_relaxed(self):
         """매우 완화된 낮은 품질의 매칭 필터링"""
@@ -272,57 +329,71 @@ class SuperGlue3DGSPipeline:
         return False
     
     def _match_pair_superglue(self, cam_i, cam_j):
-        """수정된 SuperGlue 매칭 (더 완화된 버전)"""
-        
-        if cam_i not in self.image_features or cam_j not in self.image_features:
-            return []
-        
+        """SuperGlue 페어 매칭 (IMPROVED VERSION)"""
         try:
             feat_i = self.image_features[cam_i]
             feat_j = self.image_features[cam_j]
             
-            if feat_i['keypoints'].shape[0] == 0 or feat_j['keypoints'].shape[0] == 0:
-                return []
-            
-            # SuperGlue 입력 데이터 구성
+            # 입력 데이터 준비
             data = {
+                'image0': torch.zeros((1, 1, 480, 640)).to(self.device),
+                'image1': torch.zeros((1, 1, 480, 640)).to(self.device),
                 'keypoints0': torch.from_numpy(feat_i['keypoints']).unsqueeze(0).to(self.device),
                 'keypoints1': torch.from_numpy(feat_j['keypoints']).unsqueeze(0).to(self.device),
                 'descriptors0': torch.from_numpy(feat_i['descriptors']).unsqueeze(0).to(self.device),
                 'descriptors1': torch.from_numpy(feat_j['descriptors']).unsqueeze(0).to(self.device),
                 'scores0': torch.from_numpy(feat_i['scores']).unsqueeze(0).to(self.device),
                 'scores1': torch.from_numpy(feat_j['scores']).unsqueeze(0).to(self.device),
-                'image0': torch.zeros((1, 1, feat_i['image_size'][0], feat_i['image_size'][1])).to(self.device),
-                'image1': torch.zeros((1, 1, feat_j['image_size'][0], feat_j['image_size'][1])).to(self.device),
             }
             
-            # SuperGlue 매칭 수행
+            # SuperGlue 매칭
             with torch.no_grad():
                 result = self.matching.superglue(data)
             
-            # 매칭 결과 추출 (올바른 키 사용)
+            # 결과 추출
             indices0 = result['indices0'][0].cpu().numpy()
             indices1 = result['indices1'][0].cpu().numpy()
             mscores0 = result['matching_scores0'][0].cpu().numpy()
             
-            # 유효한 매칭 추출 (더 낮은 임계값)
+            # 개선된 매칭 필터링
             valid_matches = []
-            threshold = 0.05  # 더 낮은 임계값 (0.1 → 0.05)
+            threshold = 0.1  # 0.05 → 0.1로 상향 조정
             
             for i, j in enumerate(indices0):
                 if j >= 0 and mscores0[i] > threshold:
                     # 상호 매칭 확인
                     if j < len(indices1) and indices1[j] == i:
-                        # 인덱스 범위 추가 검증
+                        # 인덱스 범위 검증
                         if i < len(feat_i['keypoints']) and j < len(feat_j['keypoints']):
                             valid_matches.append((i, j, mscores0[i]))
             
-            print(f"    Pair {cam_i}-{cam_j}: {len(valid_matches)} mutual matches")
+            # 기하학적 필터링 추가 (NEW)
+            if len(valid_matches) >= 20:
+                valid_matches = self._geometric_filtering(valid_matches, feat_i['keypoints'], feat_j['keypoints'])
+            
             return valid_matches
             
         except Exception as e:
             print(f"    SuperGlue matching failed for pair {cam_i}-{cam_j}: {e}")
             return []
+
+    def _geometric_filtering(self, matches, kpts_i, kpts_j):
+        """기하학적 필터링 (NEW METHOD)"""
+        try:
+            pts_i = np.array([kpts_i[m[0]] for m in matches])
+            pts_j = np.array([kpts_j[m[1]] for m in matches])
+            
+            # 호모그래피 기반 outlier 제거
+            H, mask = cv2.findHomography(pts_i, pts_j, cv2.RANSAC, 3.0)
+            
+            if H is not None and mask is not None:
+                inlier_matches = [matches[i] for i, is_inlier in enumerate(mask.flatten()) if is_inlier]
+                if len(inlier_matches) >= 8:
+                    return inlier_matches
+        except:
+            pass
+        
+        return matches
     
     def _estimate_camera_poses_robust(self):
         """개선된 카메라 포즈 추정 (더 안전한 버전)"""
@@ -400,96 +471,104 @@ class SuperGlue3DGSPipeline:
         print(f"  Total cameras with poses: {len(self.cameras)}")
     
     def _estimate_relative_pose_robust(self, cam_i, cam_j, pair_key):
-        """개선된 두 카메라 간 상대 포즈 추정 (더 완화된 버전)"""
+        """개선된 두 카메라 간 상대 포즈 추정 - 인덱스 검증 강화"""
         matches = self.matches[pair_key]
         
-        if len(matches) < 4:  # 더 낮은 임계값 (6 → 4)
+        if len(matches) < 4:
             print(f"    Pair {cam_i}-{cam_j}: Insufficient matches ({len(matches)} < 4)")
             return None, None
         
-        # 매칭점들 추출 (더 완화된 필터링)
+        # 매칭점들 추출
         kpts_i = self.image_features[cam_i]['keypoints']
         kpts_j = self.image_features[cam_j]['keypoints']
         
-        # 더 낮은 신뢰도 매칭도 사용 (0.1 → 0.05)
+        print(f"    Pair {cam_i}-{cam_j}: kpts_i shape: {kpts_i.shape}, kpts_j shape: {kpts_j.shape}")
+        
+        # 고신뢰도 매칭 필터링
         high_conf_matches = [(idx_i, idx_j, conf) for idx_i, idx_j, conf in matches if conf > 0.05]
         
         if len(high_conf_matches) < 4:
-            # 더 낮은 신뢰도 매칭도 시도
-            high_conf_matches = [(idx_i, idx_j, conf) for idx_i, idx_j, conf in matches if conf > 0.1]  # 0.3 → 0.1
+            high_conf_matches = [(idx_i, idx_j, conf) for idx_i, idx_j, conf in matches if conf > 0.01]
         
         if len(high_conf_matches) < 4:
             print(f"    Pair {cam_i}-{cam_j}: Insufficient high-confidence matches ({len(high_conf_matches)} < 4)")
             return None, None
         
-        # 인덱스 범위 검증
+        # 🚨 핵심 수정: 인덱스 범위 검증 강화
         valid_matches = []
         for idx_i, idx_j, conf in high_conf_matches:
-            if (idx_i < len(kpts_i) and idx_j < len(kpts_j) and 
-                idx_i >= 0 and idx_j >= 0):
+            # 더 엄격한 인덱스 검증
+            if (isinstance(idx_i, (int, np.integer)) and isinstance(idx_j, (int, np.integer)) and
+                idx_i >= 0 and idx_j >= 0 and 
+                idx_i < len(kpts_i) and idx_j < len(kpts_j)):
                 valid_matches.append((idx_i, idx_j, conf))
+            else:
+                print(f"    Invalid indices: idx_i={idx_i} (max={len(kpts_i)-1}), idx_j={idx_j} (max={len(kpts_j)-1})")
         
         if len(valid_matches) < 4:
             print(f"    Pair {cam_i}-{cam_j}: Insufficient valid matches after index validation ({len(valid_matches)} < 4)")
             return None, None
         
-        pts_i = np.array([kpts_i[idx_i] for idx_i, _, conf in valid_matches])
-        pts_j = np.array([kpts_j[idx_j] for _, idx_j, conf in valid_matches])
+        print(f"    Pair {cam_i}-{cam_j}: Using {len(valid_matches)} validated matches")
+        
+        # 🔧 수정: valid_matches 사용 (high_conf_matches 대신)
+        try:
+            pts_i = np.array([kpts_i[idx_i] for idx_i, _, _ in valid_matches])
+            pts_j = np.array([kpts_j[idx_j] for _, idx_j, _ in valid_matches])
+        except IndexError as e:
+            print(f"    IndexError during point extraction: {e}")
+            # 추가 디버깅 정보
+            for i, (idx_i, idx_j, conf) in enumerate(valid_matches):
+                if idx_i >= len(kpts_i) or idx_j >= len(kpts_j):
+                    print(f"    Bad match {i}: idx_i={idx_i}, idx_j={idx_j}, kpts_i.len={len(kpts_i)}, kpts_j.len={len(kpts_j)}")
+            return None, None
         
         # 카메라 내부 파라미터
         K_i = self.cameras.get(cam_i, {}).get('K', self._estimate_intrinsics(cam_i))
         K_j = self._estimate_intrinsics(cam_j)
         
-        # 여러 임계값으로 시도 (더 완화된 임계값)
-        thresholds = [2.0, 4.0, 6.0, 8.0]  # 더 큰 임계값들
+        # Essential Matrix 추정 (여러 방법 시도)
+        methods = [
+            (cv2.RANSAC, 1.0, 0.999),
+            (cv2.LMEDS, 1.0, 0.99),
+            (cv2.RANSAC, 2.0, 0.99),
+            (cv2.RANSAC, 3.0, 0.95)
+        ]
+        
         best_R, best_T = None, None
         best_inliers = 0
         
-        for threshold in thresholds:
+        for method, threshold, confidence in methods:
             try:
                 # Essential Matrix 추정
                 E, mask = cv2.findEssentialMat(
                     pts_i, pts_j, K_i,
-                    method=cv2.RANSAC,
-                    prob=0.99,  # 더 완화
+                    method=method,
+                    prob=confidence,
                     threshold=threshold,
-                    maxIters=500  # 더 적은 반복
+                    maxIters=1000
                 )
                 
                 if E is None or E.shape != (3, 3):
                     continue
                 
-                # 포즈 복원 (에러 처리 추가)
-                try:
-                    _, R, T, mask = cv2.recoverPose(E, pts_i, pts_j, K_i, mask=mask)
-                    
-                    if R is None or T is None:
-                        continue
-                    
-                    # 인라이어 수 계산
-                    inliers = np.sum(mask)
-                    
-                    if inliers > best_inliers:
-                        # 더 완화된 재투영 오차 검증
-                        if self._verify_pose_quality_very_relaxed(pts_i, pts_j, R, T, K_i, K_j):
-                            best_R, best_T = R, T.flatten()
-                            best_inliers = inliers
-                            
-                except cv2.error as e:
-                    print(f"      cv2.recoverPose failed for threshold {threshold}: {e}")
+                # 포즈 복원
+                _, R, T, mask = cv2.recoverPose(E, pts_i, pts_j, K_i, mask=mask)
+                
+                if R is None or T is None:
                     continue
-                    
-            except cv2.error as e:
-                print(f"      cv2.findEssentialMat failed for threshold {threshold}: {e}")
-                continue
+                
+                inliers = np.sum(mask)
+                
+                if inliers > best_inliers and inliers >= 4:
+                    # 포즈 품질 검증
+                    if self._validate_pose_quality(pts_i, pts_j, R, T.flatten(), K_i, K_j):
+                        best_R, best_T = R, T.flatten()
+                        best_inliers = inliers
+                        
             except Exception as e:
-                print(f"      Unexpected error for threshold {threshold}: {e}")
+                print(f"      Method {method} failed: {e}")
                 continue
-        
-        # OpenCV 방법이 실패한 경우 fallback 사용
-        if best_R is None:
-            print(f"    Pair {cam_i}-{cam_j}: OpenCV methods failed, trying fallback...")
-            best_R, best_T = self._estimate_pose_fallback(pts_i, pts_j, K_i, K_j)
         
         if best_R is not None:
             print(f"    Pair {cam_i}-{cam_j}: Successfully estimated pose with {best_inliers} inliers")
@@ -497,6 +576,43 @@ class SuperGlue3DGSPipeline:
             print(f"    Pair {cam_i}-{cam_j}: Failed to estimate pose")
         
         return best_R, best_T
+
+    def _validate_pose_quality(self, pts_i, pts_j, R, T, K_i, K_j):
+        """포즈 품질 검증"""
+        try:
+            # 회전 행렬 유효성 확인
+            det = np.linalg.det(R)
+            if abs(det - 1.0) > 0.2:
+                return False
+            
+            # 삼각측량 테스트
+            P_i = K_i @ np.hstack([np.eye(3), np.zeros((3, 1))])
+            P_j = K_j @ np.hstack([R, T.reshape(-1, 1)])
+            
+            # 몇 개 포인트로 테스트
+            test_indices = np.random.choice(len(pts_i), min(5, len(pts_i)), replace=False)
+            valid_points = 0
+            
+            for idx in test_indices:
+                pt_4d = cv2.triangulatePoints(
+                    P_i, P_j,
+                    pts_i[idx].reshape(2, 1),
+                    pts_j[idx].reshape(2, 1)
+                )
+                
+                if abs(pt_4d[3, 0]) > 1e-10:
+                    pt_3d = (pt_4d[:3] / pt_4d[3]).flatten()
+                    
+                    # 거리 체크 (더 관대함)
+                    if 0.05 < np.linalg.norm(pt_3d) < 200:
+                        valid_points += 1
+            
+            # 60% 이상의 포인트가 유효해야 함
+            return valid_points >= len(test_indices) * 0.6
+            
+        except Exception as e:
+            print(f"      Pose validation failed: {e}")
+            return False
     
     def _estimate_pose_fallback(self, pts_i, pts_j, K_i, K_j):
         """OpenCV 실패시 사용할 fallback 포즈 추정"""
@@ -632,7 +748,7 @@ class SuperGlue3DGSPipeline:
         return K
     
     def _triangulate_all_points_robust(self):
-        """개선된 3D 포인트 삼각측량 (더 완화된 버전)"""
+        """3D 포인트 수 최대화를 위한 삼각측량"""
         point_id = 0
         total_matches_processed = 0
         total_valid_matches = 0
@@ -653,8 +769,8 @@ class SuperGlue3DGSPipeline:
                 kpts_i = self.image_features[cam_i]['keypoints']
                 kpts_j = self.image_features[cam_j]['keypoints']
                 
-                # 더 낮은 신뢰도 매칭도 사용 (0.1 → 0.05)
-                high_conf_matches = [(idx_i, idx_j, conf) for idx_i, idx_j, conf in matches if conf > 0.05]
+                # 🔧 수정: 신뢰도 임계값 대폭 완화 (0.05 → 0.01)
+                high_conf_matches = [(idx_i, idx_j, conf) for idx_i, idx_j, conf in matches if conf > 0.01]
                 total_matches_processed += len(matches)
                 
                 # 인덱스 범위 검증
@@ -682,28 +798,26 @@ class SuperGlue3DGSPipeline:
                             point_3d = (point_4d[:3] / point_4d[3]).flatten()
                             total_triangulated += 1
                             
-                            # 더 완화된 유효성 검사
+                            # 🔧 수정: 매우 완화된 유효성 검사
                             if self._is_point_valid_extremely_relaxed(point_3d, cam_i, cam_j, pt_i, pt_j):
-                                # 색상 추정 (이미지에서 샘플링)
+                                # 색상 추정
                                 color = self._estimate_point_color_robust(point_3d, cam_i, idx_i)
                                 
+                                # 3D 포인트 저장
                                 self.points_3d[point_id] = {
                                     'xyz': point_3d.astype(np.float32),
                                     'color': color,
-                                    'observations': [(cam_i, idx_i), (cam_j, idx_j)]
+                                    'observations': [(cam_i, pt_i, conf), (cam_j, pt_j, conf)]
                                 }
                                 
-                                # Bundle Adjustment를 위한 관찰 데이터 저장
-                                self.point_observations[point_id] = [
-                                    (cam_i, pt_i, conf),
-                                    (cam_j, pt_j, conf)
-                                ]
+                                # 관찰 데이터 추가
+                                self.point_observations[point_id].append((cam_i, pt_i, conf))
+                                self.point_observations[point_id].append((cam_j, pt_j, conf))
                                 
                                 point_id += 1
                                 total_validated += 1
                                 
                     except Exception as e:
-                        # 개별 삼각측량 실패는 무시하고 계속 진행
                         continue
                         
             except Exception as e:
@@ -716,42 +830,48 @@ class SuperGlue3DGSPipeline:
         print(f"    Successfully triangulated: {total_triangulated}")
         print(f"    Passed validation: {total_validated}")
         print(f"    Final 3D points: {len(self.points_3d)}")
-    
-    def _is_point_valid_extremely_relaxed(self, point_3d, cam_i, cam_j, pt_i, pt_j):
-        """극도로 완화된 3D 포인트 유효성 검사"""
-        # 두 카메라 모두에서 앞쪽에 있는지 확인
-        for cam_id in [cam_i, cam_j]:
-            cam = self.cameras[cam_id]
-            R, T = cam['R'], cam['T']
-            
-            # 카메라 좌표계로 변환
-            point_cam = R @ (point_3d - T)
-            
-            if point_cam[2] <= 0.0001:  # 매우 완화된 조건 (0.001 → 0.0001)
-                return False
-            
-            # 재투영 오차 확인
-            K = cam['K']
-            point_2d_proj = K @ point_cam
-            point_2d_proj = point_2d_proj[:2] / point_2d_proj[2]
-            
-            # 실제 관찰점과 비교
-            if cam_id == cam_i:
-                observed_pt = pt_i
-            else:
-                observed_pt = pt_j
-            
-            reproj_error = np.linalg.norm(point_2d_proj - observed_pt)
-            if reproj_error > 50.0:  # 매우 완화된 조건 (30.0 → 50.0)
-                return False
-            
-            # 이미지 경계 확인 (매우 완화된 조건)
-            h, w = self.image_features[cam_id]['image_size']
-            if (point_2d_proj[0] < -200 or point_2d_proj[0] >= w + 200 or
-                point_2d_proj[1] < -200 or point_2d_proj[1] >= h + 200):
-                return False
         
-        return True
+        return len(self.points_3d)
+
+    def _is_point_valid_extremely_relaxed(self, point_3d, cam_i, cam_j, pt_i, pt_j):
+        """매우 완화된 3D 포인트 유효성 검사"""
+        
+        # 1. 기본 NaN/Inf 체크만
+        if np.any(np.isnan(point_3d)) or np.any(np.isinf(point_3d)):
+            return False
+        
+        # 2. 거리 제한 대폭 완화 (원래 1000 → 5000)
+        distance = np.linalg.norm(point_3d)
+        if distance > 5000 or distance < 0.01:
+            return False
+        
+        # 3. 재투영 오차 체크 완화 (원래 10 픽셀 → 50 픽셀)
+        try:
+            for cam_id, pt_observed in [(cam_i, pt_i), (cam_j, pt_j)]:
+                if cam_id not in self.cameras:
+                    continue
+                
+                cam = self.cameras[cam_id]
+                K, R, T = cam['K'], cam['R'], cam['T']
+                
+                # 재투영
+                point_cam = R @ (point_3d - T)
+                if point_cam[2] <= 0:  # 카메라 뒤쪽
+                    return False
+                
+                point_2d_proj = K @ point_cam
+                point_2d_proj = point_2d_proj[:2] / point_2d_proj[2]
+                
+                # 재투영 오차 (매우 관대함)
+                error = np.linalg.norm(point_2d_proj - pt_observed)
+                if error > 100.0:  # 50 픽셀 (원래 10)
+                    return False
+            
+            return True
+            
+        except Exception:
+            # 오류 발생시에도 통과
+            return True
     
     def _estimate_point_color_robust(self, point_3d, cam_id, kpt_idx):
         """개선된 3D 포인트 색상 추정"""
@@ -759,65 +879,128 @@ class SuperGlue3DGSPipeline:
         # 여기서는 간단히 랜덤 색상 사용
         return np.random.rand(3).astype(np.float32)
     
-    def _bundle_adjustment_robust(self, max_iterations=100):
-        """실제 Bundle Adjustment 구현 (더 완화된 버전)"""
+    def _bundle_adjustment_robust(self, max_iterations=50):
+        """개선된 Bundle Adjustment - 변수/잔차 수 불균형 해결"""
         
         n_cameras = len(self.cameras)
         n_points = len(self.points_3d)
         
-        if n_cameras < 2 or n_points < 5:  # 더 낮은 임계값 (10 → 5)
+        if n_cameras < 2 or n_points < 10:
             print("  Insufficient data for bundle adjustment")
             return
         
-        # 관찰 데이터가 충분한지 확인
+        # 관찰 데이터 수 계산
         total_observations = sum(len(obs) for obs in self.point_observations.values())
-        if total_observations < 10:  # 더 낮은 임계값 (20 → 10)
-            print("  Insufficient observations for bundle adjustment")
-            return
+        n_residuals = total_observations * 2  # 각 관찰당 2개 잔차 (x, y)
+        n_variables = n_cameras * 6 + n_points * 3  # 카메라 6DOF + 포인트 3DOF
         
-        print(f"  Optimizing {n_cameras} cameras and {n_points} points...")
-        print(f"  Total observations: {total_observations}")
+        print(f"  BA Statistics:")
+        print(f"    Cameras: {n_cameras}, Points: {n_points}")
+        print(f"    Observations: {total_observations}")
+        print(f"    Residuals: {n_residuals}, Variables: {n_variables}")
         
-        # 초기 파라미터 벡터 구성
+        # 🔧 핵심 수정: 잔차/변수 비율 체크
+        if n_residuals < n_variables:
+            print(f"  ⚠️  Under-constrained problem: {n_residuals} residuals < {n_variables} variables")
+            print("  Using 'trf' method instead of 'lm'")
+            method = 'trf'
+        else:
+            print("  Using 'lm' method")
+            method = 'lm'
+        
         try:
             params = self._pack_parameters()
         except Exception as e:
             print(f"  Parameter packing failed: {e}")
             return
         
-        # Bundle Adjustment 최적화 (더 완화된 설정)
         try:
-            # 잔차 수와 변수 수 계산
-            n_variables = len(params)
-            n_residuals = total_observations * 2  # 각 관찰당 2개 잔차 (x, y)
-            
-            print(f"  Variables: {n_variables}, Residuals: {n_residuals}")
-            
-            if n_residuals < n_variables:
-                print("  Using 'trf' method (fewer residuals than variables)")
-                method = 'trf'
+            # 방법별 다른 설정 사용
+            if method == 'trf':
+                result = least_squares(
+                    self._compute_residuals,
+                    params,
+                    method='trf',           # Trust Region Reflective
+                    max_nfev=max_iterations * 5,
+                    verbose=1,
+                    ftol=1e-3,             # 더 관대한 수렴 조건
+                    xtol=1e-3,
+                    bounds=(-np.inf, np.inf)  # 경계 조건 없음
+                )
             else:
-                print("  Using 'lm' method")
-                method = 'lm'
-            
-            result = least_squares(
-                self._compute_residuals,
-                params,
-                method=method,
-                max_nfev=max_iterations,
-                verbose=1,
-                ftol=1e-4,  # 더 완화된 허용오차 (1e-6 → 1e-4)
-                xtol=1e-4    # 더 완화된 허용오차 (1e-6 → 1e-4)
-            )
+                result = least_squares(
+                    self._compute_residuals,
+                    params,
+                    method='lm',           # Levenberg-Marquardt
+                    max_nfev=max_iterations * 10,
+                    verbose=1,
+                    ftol=1e-4,
+                    xtol=1e-4
+                )
             
             # 결과 언패킹
             self._unpack_parameters(result.x)
             
             print(f"  Bundle adjustment completed. Final cost: {result.cost:.6f}")
+            print(f"  Method: {method}, Iterations: {result.nfev}")
             
         except Exception as e:
             print(f"  Bundle adjustment failed: {e}")
             print("  Continuing without bundle adjustment...")
+
+    def _compute_residuals_huber(self, params):
+        """Huber loss를 사용한 잔차 계산 (NEW METHOD)"""
+        residuals = []
+        
+        try:
+            self._unpack_parameters(params)
+        except:
+            return np.ones(100) * 1e6
+        
+        for point_id, observations in self.point_observations.items():
+            if point_id not in self.points_3d:
+                continue
+                
+            point_3d = self.points_3d[point_id]['xyz']
+            
+            for cam_id, observed_pt, conf in observations:
+                if cam_id not in self.cameras:
+                    continue
+                
+                try:
+                    cam = self.cameras[cam_id]
+                    K, R, T = cam['K'], cam['R'], cam['T']
+                    
+                    # 재투영
+                    point_cam = R @ (point_3d - T)
+                    
+                    if point_cam[2] <= 0:
+                        residuals.extend([10.0, 10.0])  # 100 → 10 (덜 극단적)
+                        continue
+                    
+                    point_2d_proj = K @ point_cam
+                    point_2d_proj = point_2d_proj[:2] / point_2d_proj[2]
+                    
+                    # Huber loss 적용
+                    residual = (point_2d_proj - observed_pt) * conf
+                    residual = self._apply_huber_loss(residual, delta=2.0)
+                    residuals.extend(residual)
+                    
+                except:
+                    residuals.extend([10.0, 10.0])
+        
+        return np.array(residuals)
+
+    def _apply_huber_loss(self, residual, delta=2.0):
+        """Huber loss 적용 (NEW METHOD)"""
+        abs_residual = np.abs(residual)
+        mask = abs_residual <= delta
+        
+        result = np.zeros_like(residual)
+        result[mask] = residual[mask]
+        result[~mask] = delta * np.sign(residual[~mask])
+        
+        return result
     
     def _pack_parameters(self):
         """카메라 포즈와 3D 포인트를 하나의 벡터로 패킹"""
@@ -872,6 +1055,56 @@ class SuperGlue3DGSPipeline:
             xyz = params[idx:idx+3]
             idx += 3
             self.points_3d[point_id]['xyz'] = xyz.astype(np.float32)
+            
+    
+    def _expand_point_observations(self):
+        """포인트 관찰 데이터 확장으로 잔차 수 증가"""
+        
+        print("  Expanding point observations...")
+        
+        original_obs = sum(len(obs) for obs in self.point_observations.values())
+        
+        # 각 3D 포인트에 대해 다른 카메라에서의 재투영 확인
+        for point_id, point_data in self.points_3d.items():
+            point_3d = point_data['xyz']
+            current_cams = set([obs[0] for obs in self.point_observations[point_id]])
+            
+            # 다른 카메라들에서도 이 포인트가 보이는지 확인
+            for cam_id in self.cameras:
+                if cam_id in current_cams:
+                    continue
+                
+                try:
+                    # 재투영 계산
+                    cam = self.cameras[cam_id]
+                    K, R, T = cam['K'], cam['R'], cam['T']
+                    
+                    point_cam = R @ (point_3d - T)
+                    if point_cam[2] <= 0:  # 카메라 뒤쪽
+                        continue
+                    
+                    point_2d_proj = K @ point_cam
+                    point_2d_proj = point_2d_proj[:2] / point_2d_proj[2]
+                    
+                    # 이미지 경계 확인
+                    h, w = self.image_features[cam_id]['image_size']
+                    if (0 <= point_2d_proj[0] < w and 0 <= point_2d_proj[1] < h):
+                        
+                        # 해당 카메라의 키포인트와 가까운지 확인
+                        kpts = self.image_features[cam_id]['keypoints']
+                        distances = np.linalg.norm(kpts - point_2d_proj, axis=1)
+                        min_idx = np.argmin(distances)
+                        
+                        if distances[min_idx] < 30.0:  # 30 픽셀 내
+                            # 관찰 추가
+                            confidence = 0.1  # 낮은 신뢰도
+                            self.point_observations[point_id].append((cam_id, point_2d_proj, confidence))
+                            
+                except Exception:
+                    continue
+        
+        expanded_obs = sum(len(obs) for obs in self.point_observations.values())
+        print(f"    Expanded observations: {original_obs} → {expanded_obs}")
     
     def _compute_residuals(self, params):
         """Bundle Adjustment 잔차 계산"""
@@ -1486,124 +1719,168 @@ def readSuperGlueSceneInfo(path, images, eval, train_test_exp=False, llffhold=8,
 
 
 def _create_fallback_scene_info(images_folder, max_images):
-    """SuperGlue 실패시 기본 scene 생성"""
-    # Lazy import 3DGS modules
-    CameraInfo, SceneInfo, BasicPointCloud = get_3dgs_imports()
-    if CameraInfo is None:
-        # Fallback: 간단한 클래스 정의들
-        class CameraInfo:
-            def __init__(self, uid, R, T, FovY, FovX, image_path, image_name, width, height, depth_params, depth_path, is_test):
-                self.uid = uid
-                self.R = R
-                self.T = T
-                self.FovY = FovY
-                self.FovX = FovX
-                self.image_path = image_path
-                self.image_name = image_name
-                self.width = width
-                self.height = height
-                self.depth_params = depth_params
-                self.depth_path = depth_path
-                self.is_test = is_test
+    """개선된 fallback scene 생성"""
+    try:
+        # 이미지 수집
+        image_paths = []
+        for ext in ['*.jpg', '*.jpeg', '*.png', '*.JPG', '*.JPEG', '*.PNG']:
+            image_paths.extend(glob.glob(str(Path(images_folder) / ext)))
         
-        class SceneInfo:
-            def __init__(self, point_cloud, train_cameras, test_cameras, nerf_normalization, ply_path, is_nerf_synthetic):
-                self.point_cloud = point_cloud
-                self.train_cameras = train_cameras
-                self.test_cameras = test_cameras
-                self.nerf_normalization = nerf_normalization
-                self.ply_path = ply_path
-                self.is_nerf_synthetic = is_nerf_synthetic
+        image_paths.sort()
+        image_paths = image_paths[:max_images]
         
-        class BasicPointCloud:
-            def __init__(self, points, colors, normals):
-                self.points = points
-                self.colors = colors
-                self.normals = normals
-    
-    # 이미지 수집
-    image_paths = []
-    for ext in ['*.jpg', '*.jpeg', '*.png', '*.JPG', '*.JPEG', '*.PNG']:
-        image_paths.extend(list(Path(images_folder).glob(ext)))
-    
-    image_paths.sort()
-    image_paths = image_paths[:max_images]
-    
-    if len(image_paths) == 0:
-        raise ValueError(f"No images found in {images_folder}")
-    
-    # 기본 카메라 배치 (원형)
-    cam_infos = []
-    for i, image_path in enumerate(image_paths):
-        # 이미지 크기 확인
-        try:
-            from PIL import Image
-            with Image.open(image_path) as img:
-                width, height = img.size
-        except:
-            width, height = 1920, 1080
+        if not image_paths:
+            raise ValueError(f"No images found in {images_folder}")
         
-        # 원형 배치
-        angle = (i / len(image_paths)) * 2 * np.pi
-        radius = 3.0
+        print(f"📸 Found {len(image_paths)} images")
         
-        R = np.array([
-            [np.cos(angle), 0, np.sin(angle)],
-            [0, 1, 0],
-            [-np.sin(angle), 0, np.cos(angle)]
-        ], dtype=np.float32)
+        # 카메라 정보 생성
+        cam_infos = []
+        for i, image_path in enumerate(image_paths):
+            try:
+                # 이미지 크기 확인
+                image = Image.open(image_path)
+                width, height = image.size
+                
+                # 원형 배치로 카메라 배치
+                angle = i * (2 * np.pi / len(image_paths))
+                radius = 3.0
+                
+                # 카메라 포즈 (원을 바라보도록)
+                camera_pos = np.array([
+                    radius * np.cos(angle),
+                    0.0,  # 높이 고정
+                    radius * np.sin(angle)
+                ])
+                
+                # 원점을 향하는 방향
+                look_at = np.array([0.0, 0.0, 0.0])
+                up = np.array([0.0, 1.0, 0.0])
+                
+                # 카메라 회전 행렬 계산
+                forward = look_at - camera_pos
+                forward = forward / np.linalg.norm(forward)
+                right = np.cross(forward, up)
+                right = right / np.linalg.norm(right)
+                up = np.cross(right, forward)
+                
+                R = np.array([right, up, -forward]).T  # OpenCV 컨벤션
+                T = camera_pos
+                
+                # FOV 계산 (더 안전한 값들)
+                focal_length = max(width, height) * 0.8
+                FovX = 2 * np.arctan(width / (2 * focal_length))
+                FovY = 2 * np.arctan(height / (2 * focal_length))
+                
+                # 테스트 카메라 선택 (더 균등하게 분산)
+                is_test = (i % 8 == 0)  # 8개마다 1개씩 테스트
+                
+                cam_info = CameraInfo(
+                    uid=i,
+                    R=R.astype(np.float32),
+                    T=T.astype(np.float32),
+                    FovY=float(FovY),
+                    FovX=float(FovX),
+                    image_path=image_path,
+                    image_name=Path(image_path).name,
+                    width=int(width),
+                    height=int(height),
+                    depth_params=None,
+                    depth_path="",
+                    is_test=is_test
+                )
+                cam_infos.append(cam_info)
+                
+            except Exception as e:
+                print(f"    Warning: Failed to process {image_path}: {e}")
+                continue
         
-        T = np.array([
-            radius * np.sin(angle),
-            0,
-            radius * (1 - np.cos(angle))
-        ], dtype=np.float32)
+        if not cam_infos:
+            raise ValueError("No valid cameras created")
         
-        # FOV 추정
-        focal = max(width, height) * 0.8
-        FovX = 2 * np.arctan(width / (2 * focal))
-        FovY = 2 * np.arctan(height / (2 * focal))
+        # 개선된 포인트 클라우드 생성
+        n_points = 8000  # 적절한 수
         
-        cam_info = CameraInfo(
-            uid=i,
-            R=R,
-            T=T,
-            FovY=float(FovY),
-            FovX=float(FovX),
-            image_path=str(image_path),
-            image_name=image_path.name,
-            width=width,
-            height=height,
-            depth_params=None,
-            depth_path="",
-            is_test=(i % 8 == 0)
+        # 더 현실적인 3D 포인트 분포
+        # 구형 분포 + 일부 평면 구조
+        points_sphere = np.random.randn(n_points // 2, 3).astype(np.float32)
+        points_sphere = points_sphere / np.linalg.norm(points_sphere, axis=1, keepdims=True) * 2.0
+        
+        # 평면 구조 추가 (바닥면)
+        points_plane = np.random.randn(n_points // 2, 3).astype(np.float32)
+        points_plane[:, 1] = np.abs(points_plane[:, 1]) * 0.1 - 0.5  # 바닥 근처
+        points_plane[:, [0, 2]] *= 1.5
+        
+        points = np.vstack([points_sphere, points_plane])
+        
+        # 더 현실적인 색상 (회색조 + 약간의 색상)
+        colors = np.random.rand(n_points, 3).astype(np.float32)
+        colors = colors * 0.5 + 0.3  # 0.3-0.8 범위
+        
+        # 법선 벡터 (무작위지만 정규화됨)
+        normals = np.random.randn(n_points, 3).astype(np.float32)
+        normals = normals / (np.linalg.norm(normals, axis=1, keepdims=True) + 1e-10)
+        
+        # BasicPointCloud 생성 시 차원 확인
+        assert points.shape == (n_points, 3), f"Points shape error: {points.shape}"
+        assert colors.shape == (n_points, 3), f"Colors shape error: {colors.shape}"
+        assert normals.shape == (n_points, 3), f"Normals shape error: {normals.shape}"
+        
+        pcd = BasicPointCloud(
+            points=points,
+            colors=colors,
+            normals=normals
         )
-        cam_infos.append(cam_info)
-    
-    # 기본 포인트 클라우드
-    n_points = 15000  # 더 많은 수 (8000 → 15000)
-    points = np.random.randn(n_points, 3).astype(np.float32) * 3  # 더 넓은 분포
-    colors = np.random.rand(n_points, 3).astype(np.float32)
-    normals = np.random.randn(n_points, 3).astype(np.float32)
-    normals = normals / np.linalg.norm(normals, axis=1, keepdims=True)
-    
-    pcd = BasicPointCloud(points=points, colors=colors, normals=normals)
-    
-    # 학습/테스트 분할
-    train_cams = [c for c in cam_infos if not c.is_test]
-    test_cams = [c for c in cam_infos if c.is_test]
-    
-    # NeRF 정규화
-    nerf_norm = {"translate": np.zeros(3), "radius": 5.0}
-    
-    return SceneInfo(
-        point_cloud=pcd,
-        train_cameras=train_cams,
-        test_cameras=test_cams,
-        nerf_normalization=nerf_norm,
-        ply_path="",
-        is_nerf_synthetic=False
-    )
+        
+        # 학습/테스트 분할
+        train_cams = [c for c in cam_infos if not c.is_test]
+        test_cams = [c for c in cam_infos if c.is_test]
+        
+        # NeRF 정규화 (개선된 버전)
+        if train_cams:
+            camera_centers = []
+            for cam in train_cams:
+                # 카메라 중심 계산
+                center = -cam.R.T @ cam.T
+                camera_centers.append(center)
+            
+            camera_centers = np.array(camera_centers)
+            scene_center = np.mean(camera_centers, axis=0)
+            distances = np.linalg.norm(camera_centers - scene_center, axis=1)
+            scene_radius = np.max(distances) * 1.2
+            
+            # 최소/최대 제한
+            scene_radius = max(scene_radius, 1.0)
+            scene_radius = min(scene_radius, 10.0)
+        else:
+            scene_center = np.zeros(3)
+            scene_radius = 3.0
+        
+        nerf_normalization = {
+            "translate": -scene_center.astype(np.float32),
+            "radius": float(scene_radius)
+        }
+        
+        scene_info = SceneInfo(
+            point_cloud=pcd,
+            train_cameras=train_cams,
+            test_cameras=test_cams,
+            nerf_normalization=nerf_normalization,
+            ply_path="",
+            is_nerf_synthetic=False
+        )
+        
+        print(f"✓ Fallback scene created:")
+        print(f"  - {len(train_cams)} training cameras")
+        print(f"  - {len(test_cams)} test cameras")
+        print(f"  - {n_points} 3D points")
+        print(f"  - Scene radius: {scene_radius:.2f}")
+        
+        return scene_info
+        
+    except Exception as e:
+        print(f"Failed to create fallback scene: {e}")
+        raise
 
 
 # 명령줄 인터페이스

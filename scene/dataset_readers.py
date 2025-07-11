@@ -182,15 +182,15 @@ def readSuperGlueSceneInfo(path, images="images", eval=False, train_test_exp=Fal
             # SuperGlue 설정
             config = {
                 'superpoint': {
-                    'nms_radius': 3,
-                    'keypoint_threshold': 0.003,
-                    'max_keypoints': 4096
-                },
-                'superglue': {
-                    'weights': superglue_config,
-                    'sinkhorn_iterations': 30,
-                    'match_threshold': 0.15,
-                }
+            'nms_radius': 2,                # 3 → 2 (더 밀집된 특징점)
+            'keypoint_threshold': 0.001,    # 0.003 → 0.001 (더 많은 특징점)
+            'max_keypoints': 6144           # 4096 → 6144 (더 많은 특징점)
+            },
+            'superglue': {
+            'weights': superglue_config,    # 그대로 유지
+            'sinkhorn_iterations': 50,      # 30 → 50 (더 정교한 매칭)
+            'match_threshold': 0.1,         # 0.15 → 0.1 (더 관대한 매칭)
+            }
             }
             
             # 출력 디렉토리
