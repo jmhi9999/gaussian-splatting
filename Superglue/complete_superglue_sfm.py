@@ -150,12 +150,14 @@ class SuperGlue3DGSPipeline:
             
         print(f"  Extracted features from {len(self.image_features)} images")
     
-    def _intelligent_matching(self, max_pairs=1500):
-        """지능적 이미지 매칭 (IMPROVED VERSION)"""
+    def _intelligent_matching(self, max_pairs=3000):
+        """지능적 이미지 매칭 (대폭 개선된 버전)"""
         n_images = len(self.image_features)
         
-        # 전역 descriptors 계산 (NEW)
+        # 전역 descriptors 계산
         self._compute_global_descriptors()
+        
+        print(f"  Starting intelligent matching for {n_images} images...")
         
         # 1. 순차적 매칭 - 모든 이미지를 한 바퀴 돌기
         sequential_count = 0
@@ -164,7 +166,7 @@ class SuperGlue3DGSPipeline:
             next_i = (i + 1) % n_images
             
             matches = self._match_pair_superglue(i, next_i)
-            if len(matches) > 8:  # 12 → 8로 완화
+            if len(matches) > 6:  # 8 → 6으로 완화
                 self.matches[(i, next_i)] = matches
                 self.camera_graph[i].append(next_i)
                 self.camera_graph[next_i].append(i)
@@ -172,15 +174,197 @@ class SuperGlue3DGSPipeline:
         
         print(f"    Sequential pairs: {sequential_count}")
         
-        # 2. 유사도 기반 매칭 (NEW)
-        similarity_count = self._similarity_based_matching(max_pairs)
+        # 2. 유사도 기반 매칭 (더 적극적으로)
+        similarity_count = self._similarity_based_matching_improved(max_pairs)
         print(f"    Similarity pairs: {similarity_count}")
         
-        # 3. Loop closure 매칭 (NEW)
-        loop_count = self._loop_closure_matching()
+        # 3. Loop closure 매칭 (더 적극적으로)
+        loop_count = self._loop_closure_matching_improved()
         print(f"    Loop closure pairs: {loop_count}")
         
+        # 4. 🔧 NEW: 그리드 기반 매칭 (연속된 이미지들 간의 연결)
+        grid_count = self._grid_based_matching()
+        print(f"    Grid-based pairs: {grid_count}")
+        
+        # 5. 🔧 NEW: 랜덤 샘플링 매칭 (연결되지 않은 카메라들을 위한 fallback)
+        random_count = self._random_sampling_matching(max_pairs)
+        print(f"    Random sampling pairs: {random_count}")
+        
         print(f"  Total matching pairs: {len(self.matches)}")
+        
+        # 🔧 NEW: 연결성 분석 및 개선
+        self._analyze_and_improve_connectivity()
+
+    def _similarity_based_matching_improved(self, max_pairs):
+        """개선된 유사도 기반 매칭"""
+        # 유사도 행렬 계산
+        n_images = len(self.global_descriptors)
+        similarity_matrix = np.zeros((n_images, n_images))
+        
+        for i in range(n_images):
+            for j in range(i+1, n_images):
+                if i in self.global_descriptors and j in self.global_descriptors:
+                    sim = np.dot(self.global_descriptors[i], self.global_descriptors[j])
+                    similarity_matrix[i, j] = sim
+                    similarity_matrix[j, i] = sim
+        
+        # 유사한 이미지들 매칭 (더 적극적으로)
+        similarity_count = 0
+        for cam_id in range(n_images):
+            # 유사도 높은 상위 20개 선택 (12 → 20으로 증가)
+            similarities = similarity_matrix[cam_id]
+            candidates = np.argsort(similarities)[::-1]
+            candidates = [c for c in candidates if c != cam_id and similarities[c] > 0.1][:20]  # 0.2 → 0.1, 12 → 20
+            
+            for candidate in candidates:
+                pair_key = (min(cam_id, candidate), max(cam_id, candidate))
+                if pair_key in self.matches:
+                    continue
+                
+                matches = self._match_pair_superglue(cam_id, candidate)
+                if len(matches) > 6:  # 10 → 6으로 완화
+                    self.matches[pair_key] = matches
+                    self.camera_graph[cam_id].append(candidate)
+                    self.camera_graph[candidate].append(cam_id)
+                    similarity_count += 1
+                
+                if len(self.matches) >= max_pairs:
+                    return similarity_count
+        
+        return similarity_count
+
+    def _loop_closure_matching_improved(self):
+        """개선된 Loop closure 매칭"""
+        n_images = len(self.image_features)
+        loop_count = 0
+        
+        # 더 넓은 범위에서 loop closure 시도
+        for i in range(min(15, n_images//4)):  # 8 → 15로 증가
+            for j in range(max(n_images-15, 3*n_images//4), n_images):  # 8 → 15로 증가
+                if i >= j:
+                    continue
+                
+                pair_key = (i, j)
+                if pair_key in self.matches:
+                    continue
+                
+                # 전역 유사도 체크 (더 완화된 조건)
+                if hasattr(self, 'global_descriptors') and i in self.global_descriptors and j in self.global_descriptors:
+                    sim = np.dot(self.global_descriptors[i], self.global_descriptors[j])
+                    if sim > 0.2:  # 0.3 → 0.2로 완화
+                        matches = self._match_pair_superglue(i, j)
+                        if len(matches) > 8:  # 15 → 8로 완화
+                            self.matches[pair_key] = matches
+                            self.camera_graph[i].append(j)
+                            self.camera_graph[j].append(i)
+                            loop_count += 1
+        
+        return loop_count
+
+    def _grid_based_matching(self):
+        """그리드 기반 매칭 (NEW METHOD)"""
+        n_images = len(self.image_features)
+        grid_count = 0
+        
+        # 연속된 이미지들 간의 추가 연결
+        for i in range(n_images - 1):
+            # 인접한 이미지들
+            for offset in [1, 2, 3]:  # 1, 2, 3칸 떨어진 이미지들
+                j = i + offset
+                if j >= n_images:
+                    continue
+                
+                pair_key = (i, j)
+                if pair_key in self.matches:
+                    continue
+                
+                matches = self._match_pair_superglue(i, j)
+                if len(matches) > 4:  # 더 낮은 임계값
+                    self.matches[pair_key] = matches
+                    self.camera_graph[i].append(j)
+                    self.camera_graph[j].append(i)
+                    grid_count += 1
+        
+        return grid_count
+
+    def _random_sampling_matching(self, max_pairs):
+        """랜덤 샘플링 매칭 (NEW METHOD)"""
+        n_images = len(self.image_features)
+        random_count = 0
+        
+        # 연결되지 않은 카메라들을 찾기
+        unconnected_cameras = []
+        for cam_id in range(n_images):
+            if len(self.camera_graph[cam_id]) == 0:
+                unconnected_cameras.append(cam_id)
+        
+        print(f"    Found {len(unconnected_cameras)} unconnected cameras")
+        
+        # 연결되지 않은 카메라들에 대해 랜덤 매칭 시도
+        for cam_id in unconnected_cameras:
+            # 다른 모든 카메라와 매칭 시도
+            for other_cam in range(n_images):
+                if cam_id == other_cam:
+                    continue
+                
+                pair_key = (min(cam_id, other_cam), max(cam_id, other_cam))
+                if pair_key in self.matches:
+                    continue
+                
+                matches = self._match_pair_superglue(cam_id, other_cam)
+                if len(matches) > 4:  # 매우 낮은 임계값
+                    self.matches[pair_key] = matches
+                    self.camera_graph[cam_id].append(other_cam)
+                    self.camera_graph[other_cam].append(cam_id)
+                    random_count += 1
+                    break  # 하나라도 연결되면 다음 카메라로
+        
+        return random_count
+
+    def _analyze_and_improve_connectivity(self):
+        """연결성 분석 및 개선 (NEW METHOD)"""
+        n_images = len(self.image_features)
+        
+        # 연결성 분석
+        connected_cameras = []
+        isolated_cameras = []
+        
+        for cam_id in range(n_images):
+            if len(self.camera_graph[cam_id]) > 0:
+                connected_cameras.append(cam_id)
+            else:
+                isolated_cameras.append(cam_id)
+        
+        print(f"    Connectivity analysis:")
+        print(f"      Connected cameras: {len(connected_cameras)}")
+        print(f"      Isolated cameras: {len(isolated_cameras)}")
+        
+        # 연결되지 않은 카메라들을 연결된 카메라와 연결 시도
+        if len(connected_cameras) > 0 and len(isolated_cameras) > 0:
+            print(f"    Attempting to connect {len(isolated_cameras)} isolated cameras...")
+            
+            for isolated_cam in isolated_cameras:
+                # 가장 가까운 연결된 카메라 찾기
+                best_connection = None
+                best_similarity = -1
+                
+                for connected_cam in connected_cameras:
+                    if hasattr(self, 'global_descriptors'):
+                        if isolated_cam in self.global_descriptors and connected_cam in self.global_descriptors:
+                            sim = np.dot(self.global_descriptors[isolated_cam], self.global_descriptors[connected_cam])
+                            if sim > best_similarity:
+                                best_similarity = sim
+                                best_connection = connected_cam
+                
+                if best_connection is not None:
+                    # 매칭 시도
+                    matches = self._match_pair_superglue(isolated_cam, best_connection)
+                    if len(matches) > 3:  # 매우 낮은 임계값
+                        pair_key = (min(isolated_cam, best_connection), max(isolated_cam, best_connection))
+                        self.matches[pair_key] = matches
+                        self.camera_graph[isolated_cam].append(best_connection)
+                        self.camera_graph[best_connection].append(isolated_cam)
+                        print(f"      Connected camera {isolated_cam} to {best_connection}")
 
     def _compute_global_descriptors(self):
         """전역 이미지 descriptor 계산 (NEW METHOD)"""
@@ -342,7 +526,7 @@ class SuperGlue3DGSPipeline:
         return False
     
     def _match_pair_superglue(self, cam_i, cam_j):
-        """SuperGlue 페어 매칭 (IMPROVED VERSION)"""
+        """SuperGlue 페어 매칭 (더 완화된 버전)"""
         try:
             feat_i = self.image_features[cam_i]
             feat_j = self.image_features[cam_j]
@@ -368,9 +552,9 @@ class SuperGlue3DGSPipeline:
             indices1 = result['indices1'][0].cpu().numpy()
             mscores0 = result['matching_scores0'][0].cpu().numpy()
             
-            # 개선된 매칭 필터링
+            # 🔧 더 완화된 매칭 필터링
             valid_matches = []
-            threshold = 0.001  # 0.01 → 0.001로 대폭 완화
+            threshold = 0.0001  # 0.001 → 0.0001로 대폭 완화
             
             for i, j in enumerate(indices0):
                 if j >= 0 and mscores0[i] > threshold:
@@ -380,9 +564,9 @@ class SuperGlue3DGSPipeline:
                         if i < len(feat_i['keypoints']) and j < len(feat_j['keypoints']):
                             valid_matches.append((i, j, mscores0[i]))
             
-            # 기하학적 필터링 추가 (NEW)
-            if len(valid_matches) >= 1:  # 3 → 1로 대폭 완화
-                valid_matches = self._geometric_filtering(valid_matches, feat_i['keypoints'], feat_j['keypoints'])
+            # 🔧 더 완화된 기하학적 필터링
+            if len(valid_matches) >= 1:  # 1개 이상이면 필터링 시도
+                valid_matches = self._geometric_filtering_relaxed(valid_matches, feat_i['keypoints'], feat_j['keypoints'])
             
             return valid_matches
             
@@ -390,18 +574,18 @@ class SuperGlue3DGSPipeline:
             print(f"    SuperGlue matching failed for pair {cam_i}-{cam_j}: {e}")
             return []
 
-    def _geometric_filtering(self, matches, kpts_i, kpts_j):
-        """기하학적 필터링 (NEW METHOD)"""
+    def _geometric_filtering_relaxed(self, matches, kpts_i, kpts_j):
+        """완화된 기하학적 필터링 (NEW METHOD)"""
         try:
             pts_i = np.array([kpts_i[m[0]] for m in matches])
             pts_j = np.array([kpts_j[m[1]] for m in matches])
             
-            # 호모그래피 기반 outlier 제거
-            H, mask = cv2.findHomography(pts_i, pts_j, cv2.RANSAC, 20.0)  # 10.0 → 20.0으로 더 완화
+            # 호모그래피 기반 outlier 제거 (더 완화된 조건)
+            H, mask = cv2.findHomography(pts_i, pts_j, cv2.RANSAC, 50.0)  # 20.0 → 50.0으로 더 완화
             
             if H is not None and mask is not None:
                 inlier_matches = [matches[i] for i, is_inlier in enumerate(mask.flatten()) if is_inlier]
-                if len(inlier_matches) >= 1:  # 4 → 1로 대폭 완화
+                if len(inlier_matches) >= 1:  # 1개 이상이면 통과
                     return inlier_matches
         except:
             pass
@@ -409,7 +593,7 @@ class SuperGlue3DGSPipeline:
         return matches
     
     def _estimate_camera_poses_robust(self):
-        """개선된 카메라 포즈 추정 (더 안전한 버전)"""
+        """개선된 카메라 포즈 추정 - 더 강력한 연결성"""
         
         # 첫 번째 카메라를 원점으로 설정
         self.cameras[0] = {
@@ -420,10 +604,11 @@ class SuperGlue3DGSPipeline:
         
         print(f"  Camera 0: Origin (reference)")
         
-        # 1단계: 연결된 카메라들만 포즈 추정
+        # 🔧 개선된 포즈 추정 전략
         estimated_cameras = {0}
         queue = [0]
         
+        # 1단계: 연결된 카메라들만 포즈 추정
         while queue:
             current_cam = queue.pop(0)
             
@@ -464,23 +649,79 @@ class SuperGlue3DGSPipeline:
                 else:
                     print(f"  Camera {neighbor_cam}: Pose estimation failed, will use default pose")
         
-        # 2단계: 연결되지 않은 카메라들에 대한 기본 포즈 설정
+        # 2단계: 연결되지 않은 카메라들에 대한 개선된 기본 포즈 설정
+        unconnected_count = 0
         for cam_id in range(len(self.image_features)):
             if cam_id not in estimated_cameras:
-                print(f"  Camera {cam_id}: Using default pose (not connected)")
-                # 기본 원형 배치
-                angle = cam_id * (2 * np.pi / len(self.image_features))
-                radius = 3.0
+                unconnected_count += 1
+                print(f"  Camera {cam_id}: Using improved default pose (not connected)")
+                
+                # 🔧 개선된 기본 포즈 설정
+                if len(estimated_cameras) > 0:
+                    # 연결된 카메라들의 평균 위치 계산
+                    connected_positions = []
+                    for est_cam in estimated_cameras:
+                        R, T = self.cameras[est_cam]['R'], self.cameras[est_cam]['T']
+                        # 카메라 중심 계산
+                        center = -R.T @ T
+                        connected_positions.append(center)
+                    
+                    if connected_positions:
+                        # 연결된 카메라들의 중심 주변에 배치
+                        avg_position = np.mean(connected_positions, axis=0)
+                        position_std = np.std(connected_positions, axis=0)
+                        
+                        # 카메라 ID에 따른 위치 변화
+                        angle = cam_id * (2 * np.pi / len(self.image_features))
+                        radius = 2.0 + np.random.normal(0, 0.5)  # 약간의 랜덤성
+                        
+                        # 원형 배치 + 중심으로부터의 오프셋
+                        camera_pos = avg_position + np.array([
+                            radius * np.cos(angle),
+                            0.5 * np.sin(angle),  # 높이 변화
+                            radius * np.sin(angle)
+                        ])
+                        
+                        # 중심을 향하는 방향
+                        look_at = avg_position
+                        up = np.array([0.0, 1.0, 0.0])
+                        
+                        # 카메라 회전 행렬 계산
+                        forward = look_at - camera_pos
+                        forward = forward / (np.linalg.norm(forward) + 1e-10)
+                        right = np.cross(forward, up)
+                        right = right / (np.linalg.norm(right) + 1e-10)
+                        up = np.cross(right, forward)
+                        
+                        R = np.array([right, up, -forward]).T
+                        T = camera_pos
+                    else:
+                        # 기본 원형 배치
+                        angle = cam_id * (2 * np.pi / len(self.image_features))
+                        radius = 3.0
+                        
+                        R = np.array([[np.cos(angle), 0, np.sin(angle)],
+                                     [0, 1, 0],
+                                     [-np.sin(angle), 0, np.cos(angle)]], dtype=np.float32)
+                        T = np.array([radius * np.sin(angle), 0, radius * (1 - np.cos(angle))], dtype=np.float32)
+                else:
+                    # 기본 원형 배치
+                    angle = cam_id * (2 * np.pi / len(self.image_features))
+                    radius = 3.0
+                    
+                    R = np.array([[np.cos(angle), 0, np.sin(angle)],
+                                 [0, 1, 0],
+                                 [-np.sin(angle), 0, np.cos(angle)]], dtype=np.float32)
+                    T = np.array([radius * np.sin(angle), 0, radius * (1 - np.cos(angle))], dtype=np.float32)
                 
                 self.cameras[cam_id] = {
-                    'R': np.array([[np.cos(angle), 0, np.sin(angle)],
-                                   [0, 1, 0],
-                                   [-np.sin(angle), 0, np.cos(angle)]], dtype=np.float32),
-                    'T': np.array([radius * np.sin(angle), 0, radius * (1 - np.cos(angle))], dtype=np.float32),
+                    'R': R.astype(np.float32),
+                    'T': T.astype(np.float32),
                     'K': self._estimate_intrinsics(cam_id)
                 }
         
         print(f"  Estimated poses for {len(estimated_cameras)} cameras")
+        print(f"  Used default poses for {unconnected_count} cameras")
         print(f"  Total cameras with poses: {len(self.cameras)}")
     
     def _estimate_relative_pose_robust(self, cam_i, cam_j, pair_key):
@@ -892,7 +1133,7 @@ class SuperGlue3DGSPipeline:
             return None
     
     def _triangulate_all_points_robust(self):
-        """개선된 삼각측량 - 품질 기반 필터링 강화"""
+        """개선된 삼각측량 - 더 많은 포인트 생성"""
         point_id = 0
         total_matches_processed = 0
         total_valid_matches = 0
@@ -913,8 +1154,8 @@ class SuperGlue3DGSPipeline:
                 kpts_i = self.image_features[cam_i]['keypoints']
                 kpts_j = self.image_features[cam_j]['keypoints']
                 
-                # 🔧 개선된 신뢰도 임계값
-                high_conf_matches = [(idx_i, idx_j, conf) for idx_i, idx_j, conf in matches if conf > 0.2]  # 0.0001 → 0.2로 개선
+                # 🔧 더 완화된 신뢰도 임계값
+                high_conf_matches = [(idx_i, idx_j, conf) for idx_i, idx_j, conf in matches if conf > 0.05]  # 0.2 → 0.05로 완화
                 total_matches_processed += len(matches)
                 
                 # 인덱스 범위 검증
@@ -926,9 +1167,9 @@ class SuperGlue3DGSPipeline:
                 
                 total_valid_matches += len(valid_matches)
                 
-                # 🔧 개선된 배치 삼각측량
-                if len(valid_matches) > 10:
-                    batch_size = min(50, len(valid_matches))  # 배치 크기 줄임
+                # 🔧 더 적극적인 삼각측량
+                if len(valid_matches) > 5:  # 10 → 5로 완화
+                    batch_size = min(100, len(valid_matches))  # 배치 크기 증가
                     for batch_start in range(0, len(valid_matches), batch_size):
                         batch_end = min(batch_start + batch_size, len(valid_matches))
                         batch_matches = valid_matches[batch_start:batch_end]
@@ -941,7 +1182,7 @@ class SuperGlue3DGSPipeline:
                             # OpenCV 배치 삼각측량
                             points_4d = cv2.triangulatePoints(P_i, P_j, pts_i_batch.T, pts_j_batch.T)
                             
-                            # 4D에서 3D로 변환 (개선된 검증)
+                            # 4D에서 3D로 변환 (더 완화된 검증)
                             for i in range(points_4d.shape[1]):
                                 point_4d = points_4d[:, i]
                                 
@@ -951,8 +1192,8 @@ class SuperGlue3DGSPipeline:
                                 point_3d = (point_4d[:3] / point_4d[3]).flatten()
                                 total_triangulated += 1
                                 
-                                # 🔧 개선된 유효성 검사
-                                if self._is_point_valid_improved(point_3d, cam_i, cam_j, pts_i_batch[i], pts_j_batch[i]):
+                                # 🔧 더 완화된 유효성 검사
+                                if self._is_point_valid_relaxed(point_3d, cam_i, cam_j, pts_i_batch[i], pts_j_batch[i]):
                                     # 색상 추정
                                     color = self._estimate_point_color_robust(point_3d, cam_i, batch_matches[i][0])
                                     
@@ -990,8 +1231,8 @@ class SuperGlue3DGSPipeline:
                             point_3d = (point_4d[:3] / point_4d[3]).flatten()
                             total_triangulated += 1
                             
-                            # 🔧 개선된 유효성 검사
-                            if self._is_point_valid_improved(point_3d, cam_i, cam_j, pt_i, pt_j):
+                            # 🔧 더 완화된 유효성 검사
+                            if self._is_point_valid_relaxed(point_3d, cam_i, cam_j, pt_i, pt_j):
                                 # 색상 추정
                                 color = self._estimate_point_color_robust(point_3d, cam_i, idx_i)
                                 
@@ -1025,19 +1266,19 @@ class SuperGlue3DGSPipeline:
         
         return len(self.points_3d)
 
-    def _is_point_valid_improved(self, point_3d, cam_i, cam_j, pt_i, pt_j):
-        """개선된 3D 포인트 유효성 검사"""
+    def _is_point_valid_relaxed(self, point_3d, cam_i, cam_j, pt_i, pt_j):
+        """완화된 3D 포인트 유효성 검사"""
         
         # 1. 기본 NaN/Inf 체크
         if np.any(np.isnan(point_3d)) or np.any(np.isinf(point_3d)):
             return False
         
-        # 2. 거리 제한 (더 현실적인 범위)
+        # 2. 거리 제한 (더 관대한 범위)
         distance = np.linalg.norm(point_3d)
-        if distance > 100 or distance < 0.01:  # 1000 → 100, 0.001 → 0.01로 개선
+        if distance > 500 or distance < 0.001:  # 100 → 500, 0.01 → 0.001로 완화
             return False
         
-        # 3. 개선된 재투영 오차 체크
+        # 3. 완화된 재투영 오차 체크
         try:
             max_reprojection_error = 0.0
             
@@ -1051,8 +1292,8 @@ class SuperGlue3DGSPipeline:
                 # 카메라 좌표계로 변환
                 point_cam = R @ (point_3d - T)
                 
-                # 깊이 체크 (카메라 앞쪽에 있어야 함)
-                if point_cam[2] <= 0.01:  # 0.001 → 0.01로 개선
+                # 깊이 체크 (더 완화된 조건)
+                if point_cam[2] <= 0.001:  # 0.01 → 0.001로 완화
                     return False
                 
                 # 재투영
@@ -1067,8 +1308,8 @@ class SuperGlue3DGSPipeline:
                 error = np.linalg.norm(point_2d_proj - pt_observed)
                 max_reprojection_error = max(max_reprojection_error, error)
             
-            # 재투영 오차 임계값 (더 엄격하게)
-            if max_reprojection_error > 10.0:  # 100 → 10으로 개선
+            # 재투영 오차 임계값 (더 관대하게)
+            if max_reprojection_error > 50.0:  # 10 → 50으로 완화
                 return False
             
             return True
@@ -1083,12 +1324,12 @@ class SuperGlue3DGSPipeline:
         return np.random.rand(3).astype(np.float32)
     
     def _bundle_adjustment_robust(self, max_iterations=50):
-        """개선된 Bundle Adjustment - 더 강력한 최적화"""
+        """개선된 Bundle Adjustment - 더 완화된 조건"""
         
         n_cameras = len(self.cameras)
         n_points = len(self.points_3d)
         
-        if n_cameras < 2 or n_points < 20:  # 10 → 20으로 증가
+        if n_cameras < 2 or n_points < 5:  # 20 → 5로 대폭 완화
             print("  Insufficient data for bundle adjustment")
             return
         
@@ -1102,10 +1343,10 @@ class SuperGlue3DGSPipeline:
         print(f"    Observations: {total_observations}")
         print(f"    Residuals: {n_residuals}, Variables: {n_variables}")
         
-        # 🔧 개선된 방법 선택
-        if n_residuals < n_variables * 2:  # 2배 이상의 잔차가 필요
-            print(f"  ⚠️  Under-constrained problem: {n_residuals} residuals < {n_variables * 2} (2x variables)")
-            print("  Using 'trf' method with conservative settings")
+        # 🔧 더 완화된 방법 선택
+        if n_residuals < n_variables:  # 2배 조건 제거
+            print(f"  ⚠️  Under-constrained problem: {n_residuals} residuals < {n_variables} variables")
+            print("  Using 'trf' method with very conservative settings")
             method = 'trf'
         else:
             print("  Using 'lm' method")
@@ -1118,16 +1359,16 @@ class SuperGlue3DGSPipeline:
             return
         
         try:
-            # 🔧 개선된 BA 설정
+            # 🔧 더 완화된 BA 설정
             if method == 'trf':
                 result = least_squares(
                     self._compute_residuals_improved,
                     params,
                     method='trf',
-                    max_nfev=max_iterations * 2,
+                    max_nfev=max_iterations,  # 반복 횟수 줄임
                     verbose=1,
-                    ftol=1e-6,  # 더 엄격한 수렴 조건
-                    xtol=1e-6,
+                    ftol=1e-3,  # 더 완화된 수렴 조건
+                    xtol=1e-3,
                     bounds=(-np.inf, np.inf)
                 )
             else:
@@ -1135,10 +1376,10 @@ class SuperGlue3DGSPipeline:
                     self._compute_residuals_improved,
                     params,
                     method='lm',
-                    max_nfev=max_iterations * 3,
+                    max_nfev=max_iterations * 2,  # 반복 횟수 줄임
                     verbose=1,
-                    ftol=1e-7,  # 더 엄격한 수렴 조건
-                    xtol=1e-7
+                    ftol=1e-4,  # 더 완화된 수렴 조건
+                    xtol=1e-4
                 )
             
             # 결과 언패킹
@@ -1147,11 +1388,11 @@ class SuperGlue3DGSPipeline:
             print(f"  Bundle adjustment completed. Final cost: {result.cost:.6f}")
             print(f"  Method: {method}, Iterations: {result.nfev}")
             
-            # 🔧 개선된 cost 평가
-            if result.cost > 500:
+            # 🔧 더 완화된 cost 평가
+            if result.cost > 1000:
                 print(f"  ⚠️  높은 BA cost: {result.cost:.2f}")
                 print("  포인트 클라우드 품질이 낮을 수 있습니다")
-            elif result.cost > 50:
+            elif result.cost > 100:
                 print(f"  ⚠️  중간 BA cost: {result.cost:.2f}")
             else:
                 print(f"  ✅ 좋은 BA cost: {result.cost:.2f}")
@@ -1161,7 +1402,7 @@ class SuperGlue3DGSPipeline:
             print("  Continuing without bundle adjustment...")
 
     def _compute_residuals_improved(self, params):
-        """개선된 Bundle Adjustment 잔차 계산"""
+        """개선된 Bundle Adjustment 잔차 계산 (더 완화된 버전)"""
         residuals = []
         
         # 파라미터 언패킹
@@ -1191,34 +1432,34 @@ class SuperGlue3DGSPipeline:
                     # 카메라 좌표계로 변환
                     point_cam = R @ (point_3d - T)
                     
-                    # 깊이 체크
+                    # 깊이 체크 (더 완화된 조건)
                     if point_cam[2] <= 0:
-                        residuals.extend([20.0, 20.0])  # 카메라 뒤쪽 (더 작은 페널티)
+                        residuals.extend([10.0, 10.0])  # 더 작은 페널티
                         continue
                     
                     # 재투영
                     point_2d_proj = K @ point_cam
                     if abs(point_2d_proj[2]) < 1e-10:
-                        residuals.extend([20.0, 20.0])
+                        residuals.extend([10.0, 10.0])
                         continue
                     point_2d_proj = point_2d_proj[:2] / point_2d_proj[2]
                     
-                    # 🔧 개선된 잔차 계산
+                    # 🔧 더 완화된 잔차 계산
                     residual = point_2d_proj - observed_pt
                     
-                    # 🔧 Huber loss 적용 (이상치에 강함)
-                    residual = self._apply_huber_loss_improved(residual, delta=3.0)
+                    # 🔧 더 완화된 Huber loss
+                    residual = self._apply_huber_loss_improved(residual, delta=10.0)  # 3.0 → 10.0으로 완화
                     
-                    # 🔧 신뢰도 가중치 (더 현실적인 가중치)
-                    weight = np.clip(conf, 0.1, 1.0)
+                    # 🔧 더 완화된 신뢰도 가중치
+                    weight = np.clip(conf, 0.05, 1.0)  # 0.1 → 0.05로 완화
                     
-                    # 🔧 스케일링 (픽셀 단위를 적절한 스케일로)
-                    residual = residual * weight * 0.05  # 스케일링 팩터 조정
+                    # 🔧 더 완화된 스케일링
+                    residual = residual * weight * 0.01  # 0.05 → 0.01로 완화
                     
                     residuals.extend(residual)
                     
                 except Exception as e:
-                    residuals.extend([5.0, 5.0])  # 더 작은 기본 오차
+                    residuals.extend([2.0, 2.0])  # 더 작은 기본 오차
         
         if len(residuals) == 0:
             return np.ones(100) * 1e6
