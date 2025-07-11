@@ -360,7 +360,7 @@ class SuperGlue3DGSPipeline:
             
             # 개선된 매칭 필터링
             valid_matches = []
-            threshold = 0.05  # 0.1 → 0.05로 완화
+            threshold = 0.01  # 0.05 → 0.01로 완화
             
             for i, j in enumerate(indices0):
                 if j >= 0 and mscores0[i] > threshold:
@@ -371,7 +371,7 @@ class SuperGlue3DGSPipeline:
                             valid_matches.append((i, j, mscores0[i]))
             
             # 기하학적 필터링 추가 (NEW)
-            if len(valid_matches) >= 15:  # 20 → 15로 완화
+            if len(valid_matches) >= 10:  # 15 → 10으로 완화
                 valid_matches = self._geometric_filtering(valid_matches, feat_i['keypoints'], feat_j['keypoints'])
             
             return valid_matches
@@ -387,11 +387,11 @@ class SuperGlue3DGSPipeline:
             pts_j = np.array([kpts_j[m[1]] for m in matches])
             
             # 호모그래피 기반 outlier 제거
-            H, mask = cv2.findHomography(pts_i, pts_j, cv2.RANSAC, 5.0)  # 3.0 → 5.0으로 완화
+            H, mask = cv2.findHomography(pts_i, pts_j, cv2.RANSAC, 10.0)  # 5.0 → 10.0으로 완화
             
             if H is not None and mask is not None:
                 inlier_matches = [matches[i] for i, is_inlier in enumerate(mask.flatten()) if is_inlier]
-                if len(inlier_matches) >= 6:  # 8 → 6으로 완화
+                if len(inlier_matches) >= 4:  # 6 → 4로 완화
                     return inlier_matches
         except:
             pass
@@ -772,8 +772,8 @@ class SuperGlue3DGSPipeline:
                 kpts_i = self.image_features[cam_i]['keypoints']
                 kpts_j = self.image_features[cam_j]['keypoints']
                 
-                # 🔧 대폭 완화된 신뢰도 임계값 (0.01 → 0.001)
-                high_conf_matches = [(idx_i, idx_j, conf) for idx_i, idx_j, conf in matches if conf > 0.001]
+                # 🔧 대폭 완화된 신뢰도 임계값 (0.001 → 0.0001)
+                high_conf_matches = [(idx_i, idx_j, conf) for idx_i, idx_j, conf in matches if conf > 0.0001]
                 total_matches_processed += len(matches)
                 
                 # 인덱스 범위 검증
@@ -893,12 +893,12 @@ class SuperGlue3DGSPipeline:
         if np.any(np.isnan(point_3d)) or np.any(np.isinf(point_3d)):
             return False
         
-        # 2. 거리 제한 대폭 완화 (원래 5000 → 10000)
+        # 2. 거리 제한 대폭 완화 (10000 → 50000)
         distance = np.linalg.norm(point_3d)
-        if distance > 10000 or distance < 0.001:  # 0.01 → 0.001
+        if distance > 50000 or distance < 0.0001:  # 0.001 → 0.0001
             return False
         
-        # 3. 재투영 오차 체크 대폭 완화 (원래 100 픽셀 → 200 픽셀)
+        # 3. 재투영 오차 체크 대폭 완화 (200 픽셀 → 500 픽셀)
         try:
             for cam_id, pt_observed in [(cam_i, pt_i), (cam_j, pt_j)]:
                 if cam_id not in self.cameras:
@@ -917,7 +917,7 @@ class SuperGlue3DGSPipeline:
                 
                 # 재투영 오차 (매우 관대함)
                 error = np.linalg.norm(point_2d_proj - pt_observed)
-                if error > 200.0:  # 100 픽셀 → 200 픽셀
+                if error > 500.0:  # 200 픽셀 → 500 픽셀
                     return False
             
             return True
