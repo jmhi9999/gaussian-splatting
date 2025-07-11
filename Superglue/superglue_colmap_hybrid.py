@@ -1016,7 +1016,7 @@ class SuperGlueCOLMAPHybrid:
             print(f"  ✗ COLMAP 매칭 오류: {e}")
 
     def _run_colmap_mapper_fast(self, database_path, image_path, output_path):
-        """빠른 COLMAP 매퍼"""
+        """빠른 COLMAP 매퍼 - 결과 확인 개선"""
         print("  ⚡ 빠른 COLMAP 매퍼...")
         
         # 더 관대한 설정으로 COLMAP 매퍼 실행
@@ -1053,13 +1053,23 @@ class SuperGlueCOLMAPHybrid:
             if result.returncode == 0:
                 print("  ✅ COLMAP 매퍼 성공!")
                 
-                # 결과 확인
-                reconstruction_dirs = [d for d in output_path.iterdir() if d.is_dir()]
-                if reconstruction_dirs:
-                    print(f"    생성된 reconstruction: {len(reconstruction_dirs)}개")
-                    for recon_dir in reconstruction_dirs:
-                        bin_files = list(recon_dir.glob("*.bin"))
-                        print(f"      {recon_dir.name}: {len(bin_files)}개 파일")
+                # 결과 확인 - 개선된 버전
+                print("    📁 생성된 파일 확인...")
+                if output_path.exists():
+                    # 모든 하위 디렉토리와 파일 확인
+                    all_items = []
+                    for root, dirs, files in os.walk(output_path):
+                        for dir_name in dirs:
+                            all_items.append(f"📁 {Path(root).name}/{dir_name}")
+                        for file_name in files:
+                            if file_name.endswith('.bin'):
+                                all_items.append(f"📄 {Path(root).name}/{file_name}")
+                    
+                    print(f"    발견된 항목: {len(all_items)}개")
+                    for item in all_items[:10]:  # 처음 10개만 출력
+                        print(f"      {item}")
+                    if len(all_items) > 10:
+                        print(f"      ... 및 {len(all_items) - 10}개 더")
                 
                 return True
             else:
@@ -1636,13 +1646,24 @@ class SuperGlueCOLMAPHybrid:
             
             # sparse 디렉토리 확인
             sparse_dir = output_path / "sparse"
-            reconstruction_dirs = [d for d in sparse_dir.iterdir() if d.is_dir()]
             
-            if reconstruction_dirs:
-                # COLMAP reconstruction이 있는 경우
-                reconstruction_path = reconstruction_dirs[0]  # 첫 번째 reconstruction 사용
-                print(f"    COLMAP reconstruction 발견: {reconstruction_path}")
-                
+            # 하위 디렉토리 포함하여 reconstruction 찾기
+            reconstruction_path = None
+            if sparse_dir.exists():
+                # 모든 하위 디렉토리 확인
+                all_dirs = [d for d in sparse_dir.iterdir() if d.is_dir()]
+                if all_dirs:
+                    # 첫 번째 디렉토리 사용
+                    reconstruction_path = all_dirs[0]
+                    print(f"    COLMAP reconstruction 발견: {reconstruction_path}")
+                else:
+                    # sparse_dir 자체가 reconstruction일 수 있음
+                    bin_files = list(sparse_dir.glob("*.bin"))
+                    if bin_files:
+                        reconstruction_path = sparse_dir
+                        print(f"    COLMAP reconstruction 발견: {reconstruction_path}")
+            
+            if reconstruction_path:
                 # 실제 COLMAP 결과 사용 시도
                 try:
                     return self._parse_colmap_reconstruction(reconstruction_path, image_paths, output_path)
@@ -1809,38 +1830,44 @@ class SuperGlueCOLMAPHybrid:
             raise RuntimeError(f"COLMAP reconstruction 파싱 실패: {e}")
 
     def _verify_reconstruction(self, sparse_dir):
-        """COLMAP reconstruction 결과 검증 - 더 관대한 버전"""
+        """COLMAP reconstruction 결과 검증 - 하위 디렉토리 포함"""
         print("  🔍 COLMAP reconstruction 결과 검증...")
         
         try:
             # 생성된 reconstruction 폴더 확인
             if not sparse_dir.exists():
-                print("  ⚠️  COLMAP reconstruction 없음")
+                print("  ⚠️  COLMAP reconstruction 디렉토리 없음")
                 print("  💡 하지만 계속 진행합니다...")
                 return True  # 실패하지 않고 계속 진행
             
-            # 생성된 모델 파일 확인
-            model_files = list(sparse_dir.glob("*.bin"))
-            if not model_files:
+            # 하위 디렉토리 포함하여 모든 .bin 파일 찾기
+            all_bin_files = []
+            for root, dirs, files in os.walk(sparse_dir):
+                for file in files:
+                    if file.endswith('.bin'):
+                        all_bin_files.append(Path(root) / file)
+            
+            print(f"    전체 .bin 파일: {len(all_bin_files)}개")
+            for bin_file in all_bin_files:
+                print(f"      {bin_file.relative_to(sparse_dir)}")
+            
+            if not all_bin_files:
                 print("  ⚠️  COLMAP reconstruction 파일 없음")
                 print("  💡 하지만 계속 진행합니다...")
                 return True  # 실패하지 않고 계속 진행
             
-            print(f"    생성된 모델 파일: {len(model_files)}개")
+            # 필수 파일 확인 (cameras.bin, images.bin, points3D.bin)
+            required_files = ['cameras.bin', 'images.bin', 'points3D.bin']
+            found_files = [f.name for f in all_bin_files]
             
-            # 모델 파일 검증 (더 관대하게)
-            missing_files = []
-            for model_file in model_files:
-                print(f"      {model_file.name}")
-                if not model_file.exists():
-                    missing_files.append(model_file.name)
-            
-            if missing_files:
-                print(f"    ⚠️  일부 파일 누락: {missing_files}")
+            missing_required = [f for f in required_files if f not in found_files]
+            if missing_required:
+                print(f"    ⚠️  필수 파일 누락: {missing_required}")
                 print("    💡 하지만 계속 진행합니다...")
                 return True  # 일부 파일이 없어도 계속 진행
             
             print("    ✅ COLMAP reconstruction 검증 통과")
+            print(f"    📁 reconstruction 위치: {sparse_dir}")
             return True
             
         except Exception as e:
