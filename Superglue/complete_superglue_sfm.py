@@ -932,8 +932,8 @@ class SuperGlue3DGSPipeline:
         # 여기서는 간단히 랜덤 색상 사용
         return np.random.rand(3).astype(np.float32)
     
-    def _bundle_adjustment_robust(self, max_iterations=50):
-        """개선된 Bundle Adjustment - 변수/잔차 수 불균형 해결"""
+    def _bundle_adjustment_robust(self, max_iterations=30):
+        """개선된 Bundle Adjustment - cost 최적화"""
         
         n_cameras = len(self.cameras)
         n_points = len(self.points_3d)
@@ -968,16 +968,16 @@ class SuperGlue3DGSPipeline:
             return
         
         try:
-            # 방법별 다른 설정 사용
+            # 🔧 더 보수적인 BA 설정
             if method == 'trf':
                 result = least_squares(
                     self._compute_residuals,
                     params,
                     method='trf',           # Trust Region Reflective
-                    max_nfev=max_iterations * 5,
+                    max_nfev=max_iterations * 3,  # 반복 횟수 줄임
                     verbose=1,
-                    ftol=1e-3,             # 더 관대한 수렴 조건
-                    xtol=1e-3,
+                    ftol=1e-4,             # 더 엄격한 수렴 조건
+                    xtol=1e-4,
                     bounds=(-np.inf, np.inf)  # 경계 조건 없음
                 )
             else:
@@ -985,10 +985,10 @@ class SuperGlue3DGSPipeline:
                     self._compute_residuals,
                     params,
                     method='lm',           # Levenberg-Marquardt
-                    max_nfev=max_iterations * 10,
+                    max_nfev=max_iterations * 5,  # 반복 횟수 줄임
                     verbose=1,
-                    ftol=1e-4,
-                    xtol=1e-4
+                    ftol=1e-5,            # 더 엄격한 수렴 조건
+                    xtol=1e-5
                 )
             
             # 결과 언패킹
@@ -997,19 +997,31 @@ class SuperGlue3DGSPipeline:
             print(f"  Bundle adjustment completed. Final cost: {result.cost:.6f}")
             print(f"  Method: {method}, Iterations: {result.nfev}")
             
+            # 🔧 cost 평가
+            if result.cost > 1000:
+                print(f"  ⚠️  높은 BA cost: {result.cost:.2f}")
+                print("  포인트 클라우드 품질이 낮을 수 있습니다")
+            elif result.cost > 100:
+                print(f"  ⚠️  중간 BA cost: {result.cost:.2f}")
+            else:
+                print(f"  ✅ 좋은 BA cost: {result.cost:.2f}")
+            
         except Exception as e:
             print(f"  Bundle adjustment failed: {e}")
             print("  Continuing without bundle adjustment...")
 
-    def _compute_residuals_huber(self, params):
-        """Huber loss를 사용한 잔차 계산 (NEW METHOD)"""
+    def _compute_residuals(self, params):
+        """Bundle Adjustment 잔차 계산 (개선된 버전)"""
         residuals = []
         
+        # 파라미터 언패킹
         try:
             self._unpack_parameters(params)
-        except:
-            return np.ones(100) * 1e6
+        except Exception as e:
+            print(f"    Warning: Parameter unpacking failed: {e}")
+            return np.ones(100) * 1e6  # 큰 잔차 반환
         
+        # 각 관찰에 대한 재투영 오차 계산
         for point_id, observations in self.point_observations.items():
             if point_id not in self.points_3d:
                 continue
@@ -1022,28 +1034,61 @@ class SuperGlue3DGSPipeline:
                 
                 try:
                     cam = self.cameras[cam_id]
-                    K, R, T = cam['K'], cam['R'], cam['T']
+                    K = cam['K']
+                    R = cam['R']
+                    T = cam['T']
                     
-                    # 재투영
+                    # 카메라 좌표계로 변환
                     point_cam = R @ (point_3d - T)
                     
+                    # 깊이 체크
                     if point_cam[2] <= 0:
-                        residuals.extend([10.0, 10.0])  # 100 → 10 (덜 극단적)
+                        residuals.extend([50.0, 50.0])  # 카메라 뒤쪽
                         continue
                     
+                    # 재투영
                     point_2d_proj = K @ point_cam
+                    if abs(point_2d_proj[2]) < 1e-10:  # 0으로 나누기 방지
+                        residuals.extend([50.0, 50.0])
+                        continue
                     point_2d_proj = point_2d_proj[:2] / point_2d_proj[2]
                     
-                    # Huber loss 적용
-                    residual = (point_2d_proj - observed_pt) * conf
-                    residual = self._apply_huber_loss(residual, delta=2.0)
+                    # 🔧 개선된 잔차 계산
+                    residual = point_2d_proj - observed_pt
+                    
+                    # 🔧 이상치 제거 (너무 큰 잔차는 제한)
+                    residual = np.clip(residual, -50.0, 50.0)
+                    
+                    # 🔧 신뢰도 가중치 조정 (너무 낮은 신뢰도는 제한)
+                    weight = max(conf, 0.1)  # 최소 0.1
+                    
+                    # 🔧 스케일링 (픽셀 단위를 적절한 스케일로)
+                    residual = residual * weight * 0.1  # 스케일링 팩터
+                    
                     residuals.extend(residual)
                     
-                except:
+                except Exception as e:
+                    # 개별 관찰에서 오류가 발생해도 계속 진행
                     residuals.extend([10.0, 10.0])
         
-        return np.array(residuals)
-
+        if len(residuals) == 0:
+            return np.ones(100) * 1e6  # 빈 잔차 방지
+        
+        residuals = np.array(residuals)
+        
+        # NaN이나 무한대 값 체크
+        if np.any(np.isnan(residuals)) or np.any(np.isinf(residuals)):
+            return np.ones(len(residuals)) * 1e6
+        
+        # 🔧 추가: 잔차 통계 출력 (디버깅용)
+        if len(residuals) > 0:
+            mean_residual = np.mean(np.abs(residuals))
+            max_residual = np.max(np.abs(residuals))
+            if mean_residual > 10.0 or max_residual > 100.0:
+                print(f"    ⚠️  높은 잔차 감지: mean={mean_residual:.2f}, max={max_residual:.2f}")
+        
+        return residuals
+    
     def _apply_huber_loss(self, residual, delta=2.0):
         """Huber loss 적용 (NEW METHOD)"""
         abs_residual = np.abs(residual)
@@ -1158,62 +1203,6 @@ class SuperGlue3DGSPipeline:
         
         expanded_obs = sum(len(obs) for obs in self.point_observations.values())
         print(f"    Expanded observations: {original_obs} → {expanded_obs}")
-    
-    def _compute_residuals(self, params):
-        """Bundle Adjustment 잔차 계산"""
-        residuals = []
-        
-        # 파라미터 언패킹
-        try:
-            self._unpack_parameters(params)
-        except Exception as e:
-            print(f"    Warning: Parameter unpacking failed: {e}")
-            return np.ones(100) * 1e6  # 큰 잔차 반환
-        
-        # 각 관찰에 대한 재투영 오차 계산
-        for point_id, observations in self.point_observations.items():
-            if point_id not in self.points_3d:
-                continue
-                
-            point_3d = self.points_3d[point_id]['xyz']
-            
-            for cam_id, observed_pt, conf in observations:
-                if cam_id not in self.cameras:
-                    continue
-                
-                try:
-                    cam = self.cameras[cam_id]
-                    K = cam['K']
-                    R = cam['R']
-                    T = cam['T']
-                    
-                    # 카메라 좌표계로 변환
-                    point_cam = R @ (point_3d - T)
-                    
-                    # 재투영
-                    point_2d_proj = K @ point_cam
-                    if abs(point_2d_proj[2]) < 1e-10:  # 0으로 나누기 방지
-                        continue
-                    point_2d_proj = point_2d_proj[:2] / point_2d_proj[2]
-                    
-                    # 잔차 계산 (신뢰도로 가중치)
-                    residual = (point_2d_proj - observed_pt) * conf
-                    residuals.extend(residual)
-                    
-                except Exception as e:
-                    # 개별 관찰에서 오류가 발생해도 계속 진행
-                    continue
-        
-        if len(residuals) == 0:
-            return np.ones(100) * 1e6  # 빈 잔차 방지
-        
-        residuals = np.array(residuals)
-        
-        # NaN이나 무한대 값 체크
-        if np.any(np.isnan(residuals)) or np.any(np.isinf(residuals)):
-            return np.ones(len(residuals)) * 1e6
-        
-        return residuals
     
     def _rotation_matrix_to_angle_axis(self, R):
         """회전 행렬을 로드리게스 벡터로 변환"""
