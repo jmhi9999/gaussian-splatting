@@ -550,7 +550,6 @@ class SuperGlueCOLMAPHybrid:
     def _match_single_pair(self, image_path1, image_path2):
         """두 이미지 간 SuperGlue 매칭 수행"""
         try:
-            print(f"        🔍 SuperGlue 매칭: {image_path1.name} ↔ {image_path2.name}")
             
             # 이미지 로드 및 전처리
             img1 = self._load_and_preprocess_image(image_path1)
@@ -572,7 +571,7 @@ class SuperGlueCOLMAPHybrid:
             matches = self._run_superglue_matching_on_pair(pred1, pred2)
             
             if matches is not None and len(matches) > 0:
-                print(f"        ✅ {len(matches)}개 매칭 발견")
+                
                 return matches
             else:
                 print(f"        ❌ 매칭 실패")
@@ -652,9 +651,6 @@ class SuperGlueCOLMAPHybrid:
     def _run_superglue_matching_on_pair(self, pred1, pred2):
         """SuperGlue를 사용한 두 이미지 간 매칭"""
         try:
-            print(f"        SuperGlue 입력 데이터 준비 중...")
-            print(f"        pred1: keypoints={pred1['keypoints'].shape}, scores={pred1['scores'].shape}, descriptors={pred1['descriptors'].shape}")
-            print(f"        pred2: keypoints={pred2['keypoints'].shape}, scores={pred2['scores'].shape}, descriptors={pred2['descriptors'].shape}")
             
             # SuperGlue가 기대하는 형태로 데이터 변환
             # SuperGlue는 (B, D, N) 형태를 기대
@@ -699,10 +695,10 @@ class SuperGlueCOLMAPHybrid:
                         valid_matches.append([i, match_idx])
             
             if len(valid_matches) > 0:
-                print(f"        ✅ SuperGlue 매칭: {len(valid_matches)}개 (임계값: {self.superglue_config['match_threshold']})")
+                
                 return np.array(valid_matches, dtype=np.int32)
             else:
-                print(f"        ⚠️  SuperGlue 매칭 부족, fallback 시도...")
+
                 # SuperGlue 실패시 간단한 descriptor 매칭으로 fallback
                 return self._fallback_descriptor_matching(pred1, pred2)
                 
@@ -780,7 +776,7 @@ class SuperGlueCOLMAPHybrid:
                 for j in range(i + 1, min(i + 5, len(image_paths))):  # 인접한 5장씩만
                     total_pairs += 1
                     
-                    print(f"      매칭 {i}-{j}...")
+            
                     matches = self._match_single_pair_superpoint_only(image_paths[i], image_paths[j])
                     
                     if matches is not None and len(matches) >= 10:
@@ -792,7 +788,7 @@ class SuperGlueCOLMAPHybrid:
                                 (pair_id, len(matches), 2, matches.tobytes())
                             )
                             
-                            print(f"        ✅ {len(matches)}개 매칭 저장 (SuperPoint-only)")
+                            
                             successful_matches += 1
                         else:
                             print(f"        ❌ 이미지 ID 매핑 실패")
@@ -840,7 +836,7 @@ class SuperGlueCOLMAPHybrid:
             matches = self._fallback_descriptor_matching(pred1, pred2)
             
             if matches is not None and len(matches) > 0:
-                print(f"        ✅ {len(matches)}개 매칭 발견 (SuperPoint-only)")
+                
                 return matches
             else:
                 print(f"        ❌ SuperPoint-only 매칭 실패")
@@ -1547,7 +1543,6 @@ class SuperGlueCOLMAPHybrid:
                 # COLMAP이 사용하는 이름 형식: image_0000.jpg, image_0001.jpg, ...
                 colmap_name = f"image_{i:04d}.jpg"
                 image_name_to_path[colmap_name] = path
-                print(f"      매핑: {colmap_name} -> {path.name}")
             
             for image_id, image in images.items():
                 # 이미지 파일 경로 찾기
