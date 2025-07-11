@@ -1984,60 +1984,39 @@ class SuperGlue3DGSPipeline:
                     # 실패시 복사
                     shutil.copy2(src_path, dst_path)
     
+    def _calculate_adaptive_resize(self, image_path, max_dim=1600):
+        """SuperGlue 권장 해상도(최대 max_dim)로 비율 유지 리사이즈 계산"""
+        try:
+            img = cv2.imread(str(image_path))
+            if img is None:
+                return [1024, 768]  # 기본값
+            h, w = img.shape[:2]
+            largest = max(h, w)
+            if largest <= max_dim:
+                return None  # 원본 크기 유지
+            scale = max_dim / largest
+            return [int(w * scale), int(h * scale)]
+        except:
+            return [1024, 768]  # 기본값
+
     def _load_image(self, image_path, resize=None):
-        """이미지 로드 및 전처리 - 적응형 resize 적용"""
+        """이미지 로드 및 SuperGlue 권장 해상도 적용"""
         try:
             image = cv2.imread(str(image_path), cv2.IMREAD_GRAYSCALE)
             if image is None:
                 print(f"    Warning: Failed to load {image_path}")
                 return None
-            
-            # 적응형 resize 계산
+
+            # SuperGlue 권장 해상도 적용 (최대 1600px)
             if resize is None:
-                resize = self._calculate_adaptive_resize(image_path)
-            
-            # 크기 조정 (SuperGlue 처리용)
-            if resize is None:
-                pass  # 원본 크기 유지
-            elif len(resize) == 2:
-                image = cv2.resize(image, resize)
-            elif len(resize) == 1 and resize[0] > 0:
-                h, w = image.shape
-                scale = resize[0] / max(h, w)
-                new_h, new_w = int(h * scale), int(w * scale)
-                image = cv2.resize(image, (new_w, new_h))
-            
+                resize = self._calculate_adaptive_resize(image_path, max_dim=1600)
+            if resize is not None:
+                image = cv2.resize(image, tuple(resize))
             return image.astype(np.float32)
-        
         except Exception as e:
             print(f"    Error loading {image_path}: {e}")
             return None
     
-    def _calculate_adaptive_resize(self, image_path):
-        """이미지 해상도에 따른 적응형 resize 계산"""
-        try:
-            img = cv2.imread(str(image_path))
-            if img is None:
-                return [1024, 768]  # 기본값
-            
-            h, w = img.shape[:2]
-            max_dim = max(h, w)
-            
-            # 적응형 resize 규칙
-            if max_dim <= 1024:
-                # 작은 이미지는 원본 크기 유지
-                return None
-            elif max_dim <= 2048:
-                # 중간 크기는 1024로 resize
-                scale = 1024 / max_dim
-                return [int(w * scale), int(h * scale)]
-            else:
-                # 큰 이미지는 1536로 resize
-                scale = 1536 / max_dim
-                return [int(w * scale), int(h * scale)]
-        except:
-            return [1024, 768]  # 기본값
-
     def _pack_parameters(self):
         """카메라 포즈와 3D 포인트를 하나의 벡터로 패킹"""
         params = []
