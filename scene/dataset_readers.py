@@ -112,6 +112,43 @@ SUPERGLUE_PIPELINE_AVAILABLE = (SuperGlue3DGSPipeline is not None)
 SuperGlueCOLMAPHybrid = import_superglue_colmap_hybrid()
 SUPERGLUE_COLMAP_HYBRID_AVAILABLE = (SuperGlueCOLMAPHybrid is not None)
 
+# Hloc 파이프라인 import 시도
+def import_hloc_pipeline():
+    """Hloc 파이프라인 동적 import"""
+    try:
+        # 현재 디렉토리에서 SuperGlue 경로 찾기
+        current_dir = Path(__file__).parent.parent  # gaussian-splatting 루트
+        
+        # SuperGlue 경로들
+        superglue_paths = [
+            current_dir / "Superglue",
+            current_dir / "SuperGlue", 
+            current_dir
+        ]
+        
+        for path in superglue_paths:
+            hloc_file = path / "hloc_pipeline.py"
+            if hloc_file.exists():
+                # 해당 경로를 sys.path에 추가
+                sys.path.insert(0, str(path))
+                
+                # 모듈 import
+                from hloc_pipeline import readHlocSceneInfo
+                print(f"✓ Hloc pipeline imported from {path}")
+                return readHlocSceneInfo
+        
+        print("✗ Hloc pipeline not found")
+        return None
+        
+    except ImportError as e:
+        print(f"✗ Hloc import failed: {e}")
+        return None
+
+# Hloc 파이프라인 import 시도
+readHlocSceneInfo = import_hloc_pipeline()
+HLOC_PIPELINE_AVAILABLE = (readHlocSceneInfo is not None)
+
+
 def readSuperGlueSceneInfo(path, images="images", eval=False, train_test_exp=False, 
                           llffhold=8, superglue_config="outdoor", max_images=100):
     """SuperGlue 완전 파이프라인으로 SceneInfo 생성"""
@@ -145,14 +182,14 @@ def readSuperGlueSceneInfo(path, images="images", eval=False, train_test_exp=Fal
             # SuperGlue 설정
             config = {
                 'superpoint': {
-                    'nms_radius': 4,
-                    'keypoint_threshold': 0.005,
-                    'max_keypoints': 2048
+                    'nms_radius': 3,
+                    'keypoint_threshold': 0.003,
+                    'max_keypoints': 4096
                 },
                 'superglue': {
                     'weights': superglue_config,
-                    'sinkhorn_iterations': 20,
-                    'match_threshold': 0.2,
+                    'sinkhorn_iterations': 30,
+                    'match_threshold': 0.15,
                 }
             }
             
@@ -873,7 +910,8 @@ class SimpleSuperGluePipeline:
 
 sceneLoadTypeCallbacks = {
     "SuperGlue": readSuperGlueSceneInfo,
-    "SuperGlueCOLMAPHybrid": readSuperGlueCOLMAPHybridSceneInfo
+    "SuperGlueCOLMAPHybrid": readSuperGlueCOLMAPHybridSceneInfo,
+    "Hloc": readHlocSceneInfo,
 }
 
 # sceneLoadTypeCallbacks에 추가
@@ -881,11 +919,8 @@ sceneLoadTypeCallbacks["SuperGlue"] = readSuperGlueSceneInfo
 sceneLoadTypeCallbacks["SuperGlueCOLMAPHybrid"] = readSuperGlueCOLMAPHybridSceneInfo
 
 # Colmap과 Blender 로더도 추가 (기존 함수들이 있다면)
-try:
-    from scene.colmap_loader import readColmapSceneInfo
-    sceneLoadTypeCallbacks["Colmap"] = readColmapSceneInfo
-except ImportError:
-    print("Warning: Colmap loader not available")
+# readColmapSceneInfo는 존재하지 않으므로 제거
+print("Warning: Colmap loader not available - using custom implementation")
 
 try:
     from scene.blender_loader import readBlenderSceneInfo
