@@ -46,14 +46,14 @@ class SuperGlue3DGSPipeline:
         if config is None:
             config = {
                 'superpoint': {
-                    'nms_radius': 4,
-                    'keypoint_threshold': 0.005,  # 더 낮은 임계값으로 더 많은 특징점
-                    'max_keypoints': 4096  # 특징점 수 증가 (2048 → 4096)
+                    'nms_radius': 3,  # 4 → 3으로 완화
+                    'keypoint_threshold': 0.001,  # 0.005 → 0.001로 대폭 완화
+                    'max_keypoints': 8192  # 4096 → 8192로 증가
                 },
                 'superglue': {
                     'weights': 'outdoor',
-                    'sinkhorn_iterations': 20,
-                    'match_threshold': 0.1,  # 더 낮은 매칭 임계값 (0.3 → 0.1)
+                    'sinkhorn_iterations': 15,  # 20 → 15로 완화
+                    'match_threshold': 0.05,  # 0.1 → 0.05로 완화
                 }
             }
         
@@ -147,14 +147,17 @@ class SuperGlue3DGSPipeline:
         # 전역 descriptors 계산 (NEW)
         self._compute_global_descriptors()
         
-        # 1. 순차적 매칭 - 임계값 상향 조정
+        # 1. 순차적 매칭 - 모든 이미지를 한 바퀴 돌기
         sequential_count = 0
-        for i in range(n_images - 1):
-            matches = self._match_pair_superglue(i, i+1)
-            if len(matches) > 12:  # 5 → 12로 상향 조정
-                self.matches[(i, i+1)] = matches
-                self.camera_graph[i].append(i+1)
-                self.camera_graph[i+1].append(i)
+        for i in range(n_images):
+            # 다음 이미지 (마지막 이미지는 첫 번째와 연결)
+            next_i = (i + 1) % n_images
+            
+            matches = self._match_pair_superglue(i, next_i)
+            if len(matches) > 8:  # 12 → 8로 완화
+                self.matches[(i, next_i)] = matches
+                self.camera_graph[i].append(next_i)
+                self.camera_graph[next_i].append(i)
                 sequential_count += 1
         
         print(f"    Sequential pairs: {sequential_count}")
@@ -202,10 +205,10 @@ class SuperGlue3DGSPipeline:
         # 유사한 이미지들 매칭
         similarity_count = 0
         for cam_id in range(n_images):
-            # 유사도 높은 상위 8개 선택
+            # 유사도 높은 상위 12개 선택 (8 → 12로 증가)
             similarities = similarity_matrix[cam_id]
             candidates = np.argsort(similarities)[::-1]
-            candidates = [c for c in candidates if c != cam_id and similarities[c] > 0.3][:8]
+            candidates = [c for c in candidates if c != cam_id and similarities[c] > 0.2][:12]  # 0.3 → 0.2, 8 → 12
             
             for candidate in candidates:
                 pair_key = (min(cam_id, candidate), max(cam_id, candidate))
@@ -213,7 +216,7 @@ class SuperGlue3DGSPipeline:
                     continue
                 
                 matches = self._match_pair_superglue(cam_id, candidate)
-                if len(matches) > 15:  # 비순차적 매칭은 더 높은 임계값
+                if len(matches) > 10:  # 15 → 10으로 완화
                     self.matches[pair_key] = matches
                     self.camera_graph[cam_id].append(candidate)
                     self.camera_graph[candidate].append(cam_id)
@@ -230,8 +233,8 @@ class SuperGlue3DGSPipeline:
         loop_count = 0
         
         # 첫 번째와 마지막 몇 개 이미지 간 매칭
-        for i in range(min(5, n_images//4)):
-            for j in range(max(n_images-5, 3*n_images//4), n_images):
+        for i in range(min(8, n_images//3)):  # 5 → 8로 증가
+            for j in range(max(n_images-8, 2*n_images//3), n_images):  # 5 → 8로 증가
                 if i >= j:
                     continue
                 
@@ -242,9 +245,9 @@ class SuperGlue3DGSPipeline:
                 # 전역 유사도 체크
                 if hasattr(self, 'global_descriptors') and i in self.global_descriptors and j in self.global_descriptors:
                     sim = np.dot(self.global_descriptors[i], self.global_descriptors[j])
-                    if sim > 0.4:  # 높은 임계값
+                    if sim > 0.3:  # 0.4 → 0.3으로 완화
                         matches = self._match_pair_superglue(i, j)
-                        if len(matches) > 20:  # 매우 높은 임계값
+                        if len(matches) > 15:  # 20 → 15로 완화
                             self.matches[pair_key] = matches
                             self.camera_graph[i].append(j)
                             self.camera_graph[j].append(i)
@@ -357,7 +360,7 @@ class SuperGlue3DGSPipeline:
             
             # 개선된 매칭 필터링
             valid_matches = []
-            threshold = 0.1  # 0.05 → 0.1로 상향 조정
+            threshold = 0.05  # 0.1 → 0.05로 완화
             
             for i, j in enumerate(indices0):
                 if j >= 0 and mscores0[i] > threshold:
@@ -368,7 +371,7 @@ class SuperGlue3DGSPipeline:
                             valid_matches.append((i, j, mscores0[i]))
             
             # 기하학적 필터링 추가 (NEW)
-            if len(valid_matches) >= 20:
+            if len(valid_matches) >= 15:  # 20 → 15로 완화
                 valid_matches = self._geometric_filtering(valid_matches, feat_i['keypoints'], feat_j['keypoints'])
             
             return valid_matches
@@ -384,11 +387,11 @@ class SuperGlue3DGSPipeline:
             pts_j = np.array([kpts_j[m[1]] for m in matches])
             
             # 호모그래피 기반 outlier 제거
-            H, mask = cv2.findHomography(pts_i, pts_j, cv2.RANSAC, 3.0)
+            H, mask = cv2.findHomography(pts_i, pts_j, cv2.RANSAC, 5.0)  # 3.0 → 5.0으로 완화
             
             if H is not None and mask is not None:
                 inlier_matches = [matches[i] for i, is_inlier in enumerate(mask.flatten()) if is_inlier]
-                if len(inlier_matches) >= 8:
+                if len(inlier_matches) >= 6:  # 8 → 6으로 완화
                     return inlier_matches
         except:
             pass
@@ -748,7 +751,7 @@ class SuperGlue3DGSPipeline:
         return K
     
     def _triangulate_all_points_robust(self):
-        """3D 포인트 수 최대화를 위한 삼각측량"""
+        """3D 포인트 수 최대화를 위한 삼각측량 (대폭 개선된 버전)"""
         point_id = 0
         total_matches_processed = 0
         total_valid_matches = 0
@@ -769,8 +772,8 @@ class SuperGlue3DGSPipeline:
                 kpts_i = self.image_features[cam_i]['keypoints']
                 kpts_j = self.image_features[cam_j]['keypoints']
                 
-                # 🔧 수정: 신뢰도 임계값 대폭 완화 (0.05 → 0.01)
-                high_conf_matches = [(idx_i, idx_j, conf) for idx_i, idx_j, conf in matches if conf > 0.01]
+                # 🔧 대폭 완화된 신뢰도 임계값 (0.01 → 0.001)
+                high_conf_matches = [(idx_i, idx_j, conf) for idx_i, idx_j, conf in matches if conf > 0.001]
                 total_matches_processed += len(matches)
                 
                 # 인덱스 범위 검증
@@ -782,43 +785,93 @@ class SuperGlue3DGSPipeline:
                 
                 total_valid_matches += len(valid_matches)
                 
-                for idx_i, idx_j, conf in valid_matches:
-                    try:
-                        # 삼각측량
-                        pt_i = kpts_i[idx_i].astype(np.float32)
-                        pt_j = kpts_j[idx_j].astype(np.float32)
+                # 🔧 배치 삼각측량으로 성능 향상
+                if len(valid_matches) > 10:
+                    batch_size = min(100, len(valid_matches))
+                    for batch_start in range(0, len(valid_matches), batch_size):
+                        batch_end = min(batch_start + batch_size, len(valid_matches))
+                        batch_matches = valid_matches[batch_start:batch_end]
                         
-                        point_4d = cv2.triangulatePoints(
-                            P_i, P_j,
-                            pt_i.reshape(2, 1),
-                            pt_j.reshape(2, 1)
-                        )
+                        # 배치 삼각측량
+                        pts_i_batch = np.array([kpts_i[idx_i] for idx_i, _, _ in batch_matches])
+                        pts_j_batch = np.array([kpts_j[idx_j] for _, idx_j, _ in batch_matches])
                         
-                        if abs(point_4d[3, 0]) > 1e-10:
-                            point_3d = (point_4d[:3] / point_4d[3]).flatten()
-                            total_triangulated += 1
+                        try:
+                            # OpenCV 배치 삼각측량
+                            points_4d = cv2.triangulatePoints(
+                                P_i, P_j,
+                                pts_i_batch.T,
+                                pts_j_batch.T
+                            )
                             
-                            # 🔧 수정: 매우 완화된 유효성 검사
-                            if self._is_point_valid_extremely_relaxed(point_3d, cam_i, cam_j, pt_i, pt_j):
-                                # 색상 추정
-                                color = self._estimate_point_color_robust(point_3d, cam_i, idx_i)
+                            # 4D에서 3D로 변환
+                            points_3d_batch = (points_4d[:3] / points_4d[3]).T
+                            
+                            for i, (idx_i, idx_j, conf) in enumerate(batch_matches):
+                                point_3d = points_3d_batch[i]
+                                total_triangulated += 1
                                 
-                                # 3D 포인트 저장
-                                self.points_3d[point_id] = {
-                                    'xyz': point_3d.astype(np.float32),
-                                    'color': color,
-                                    'observations': [(cam_i, pt_i, conf), (cam_j, pt_j, conf)]
-                                }
+                                # 🔧 매우 완화된 유효성 검사
+                                if self._is_point_valid_ultra_relaxed(point_3d, cam_i, cam_j, pts_i_batch[i], pts_j_batch[i]):
+                                    # 색상 추정
+                                    color = self._estimate_point_color_robust(point_3d, cam_i, idx_i)
+                                    
+                                    # 3D 포인트 저장
+                                    self.points_3d[point_id] = {
+                                        'xyz': point_3d.astype(np.float32),
+                                        'color': color,
+                                        'observations': [(cam_i, pts_i_batch[i], conf), (cam_j, pts_j_batch[i], conf)]
+                                    }
+                                    
+                                    # 관찰 데이터 추가
+                                    self.point_observations[point_id].append((cam_i, pts_i_batch[i], conf))
+                                    self.point_observations[point_id].append((cam_j, pts_j_batch[i], conf))
+                                    
+                                    point_id += 1
+                                    total_validated += 1
+                                    
+                        except Exception as e:
+                            print(f"    Batch triangulation failed for pair {cam_i}-{cam_j}: {e}")
+                            continue
+                else:
+                    # 개별 삼각측량 (기존 방식)
+                    for idx_i, idx_j, conf in valid_matches:
+                        try:
+                            # 삼각측량
+                            pt_i = kpts_i[idx_i].astype(np.float32)
+                            pt_j = kpts_j[idx_j].astype(np.float32)
+                            
+                            point_4d = cv2.triangulatePoints(
+                                P_i, P_j,
+                                pt_i.reshape(2, 1),
+                                pt_j.reshape(2, 1)
+                            )
+                            
+                            if abs(point_4d[3, 0]) > 1e-10:
+                                point_3d = (point_4d[:3] / point_4d[3]).flatten()
+                                total_triangulated += 1
                                 
-                                # 관찰 데이터 추가
-                                self.point_observations[point_id].append((cam_i, pt_i, conf))
-                                self.point_observations[point_id].append((cam_j, pt_j, conf))
-                                
-                                point_id += 1
-                                total_validated += 1
-                                
-                    except Exception as e:
-                        continue
+                                # 🔧 매우 완화된 유효성 검사
+                                if self._is_point_valid_ultra_relaxed(point_3d, cam_i, cam_j, pt_i, pt_j):
+                                    # 색상 추정
+                                    color = self._estimate_point_color_robust(point_3d, cam_i, idx_i)
+                                    
+                                    # 3D 포인트 저장
+                                    self.points_3d[point_id] = {
+                                        'xyz': point_3d.astype(np.float32),
+                                        'color': color,
+                                        'observations': [(cam_i, pt_i, conf), (cam_j, pt_j, conf)]
+                                    }
+                                    
+                                    # 관찰 데이터 추가
+                                    self.point_observations[point_id].append((cam_i, pt_i, conf))
+                                    self.point_observations[point_id].append((cam_j, pt_j, conf))
+                                    
+                                    point_id += 1
+                                    total_validated += 1
+                                    
+                        except Exception as e:
+                            continue
                         
             except Exception as e:
                 print(f"    Error processing pair {cam_i}-{cam_j}: {e}")
@@ -833,19 +886,19 @@ class SuperGlue3DGSPipeline:
         
         return len(self.points_3d)
 
-    def _is_point_valid_extremely_relaxed(self, point_3d, cam_i, cam_j, pt_i, pt_j):
-        """매우 완화된 3D 포인트 유효성 검사"""
+    def _is_point_valid_ultra_relaxed(self, point_3d, cam_i, cam_j, pt_i, pt_j):
+        """초완화된 3D 포인트 유효성 검사 (최대한 많은 포인트 허용)"""
         
         # 1. 기본 NaN/Inf 체크만
         if np.any(np.isnan(point_3d)) or np.any(np.isinf(point_3d)):
             return False
         
-        # 2. 거리 제한 대폭 완화 (원래 1000 → 5000)
+        # 2. 거리 제한 대폭 완화 (원래 5000 → 10000)
         distance = np.linalg.norm(point_3d)
-        if distance > 5000 or distance < 0.01:
+        if distance > 10000 or distance < 0.001:  # 0.01 → 0.001
             return False
         
-        # 3. 재투영 오차 체크 완화 (원래 10 픽셀 → 50 픽셀)
+        # 3. 재투영 오차 체크 대폭 완화 (원래 100 픽셀 → 200 픽셀)
         try:
             for cam_id, pt_observed in [(cam_i, pt_i), (cam_j, pt_j)]:
                 if cam_id not in self.cameras:
@@ -864,7 +917,7 @@ class SuperGlue3DGSPipeline:
                 
                 # 재투영 오차 (매우 관대함)
                 error = np.linalg.norm(point_2d_proj - pt_observed)
-                if error > 100.0:  # 50 픽셀 (원래 10)
+                if error > 200.0:  # 100 픽셀 → 200 픽셀
                     return False
             
             return True
@@ -1211,7 +1264,7 @@ class SuperGlue3DGSPipeline:
                     continue
                 
                 dist = np.linalg.norm(point1['xyz'] - point2['xyz'])
-                if dist < 0.001:  # 더 작은 중복 임계값 (0.01 → 0.001)
+                if dist < 0.0001:  # 0.001 → 0.0001로 더 엄격하게
                     points_to_remove.add(id2)
         
         # 중복 포인트 제거
@@ -1284,9 +1337,9 @@ class SuperGlue3DGSPipeline:
             
             pcd = BasicPointCloud(points=points, colors=colors, normals=normals)
         else:
-            # 기본 포인트 클라우드
-            n_points = 15000  # 더 많은 수 (8000 → 15000)
-            points = np.random.randn(n_points, 3).astype(np.float32) * 3  # 더 넓은 분포
+            # 기본 포인트 클라우드 (더 많은 수)
+            n_points = 25000  # 15000 → 25000로 증가
+            points = np.random.randn(n_points, 3).astype(np.float32) * 4  # 3 → 4로 증가
             colors = np.random.rand(n_points, 3).astype(np.float32)
             normals = np.random.randn(n_points, 3).astype(np.float32)
             normals = normals / np.linalg.norm(normals, axis=1, keepdims=True)
@@ -1679,14 +1732,14 @@ def readSuperGlueSceneInfo(path, images, eval, train_test_exp=False, llffhold=8,
     # SuperGlue 설정 (더 완화된 설정)
     config = {
         'superpoint': {
-            'nms_radius': 4,
-            'keypoint_threshold': 0.005,  # 더 낮은 임계값
-            'max_keypoints': 4096  # 더 많은 특징점
+            'nms_radius': 3,  # 4 → 3으로 완화
+            'keypoint_threshold': 0.001,  # 0.005 → 0.001로 대폭 완화
+            'max_keypoints': 8192  # 4096 → 8192로 증가
         },
         'superglue': {
             'weights': superglue_config,  # 'indoor' 또는 'outdoor'
-            'sinkhorn_iterations': 20,
-            'match_threshold': 0.1,  # 더 낮은 매칭 임계값
+            'sinkhorn_iterations': 15,  # 20 → 15로 완화
+            'match_threshold': 0.05,  # 0.1 → 0.05로 완화
         }
     }
     
@@ -1799,17 +1852,17 @@ def _create_fallback_scene_info(images_folder, max_images):
             raise ValueError("No valid cameras created")
         
         # 개선된 포인트 클라우드 생성
-        n_points = 8000  # 적절한 수
+        n_points = 12000  # 8000 → 12000로 증가
         
         # 더 현실적인 3D 포인트 분포
         # 구형 분포 + 일부 평면 구조
         points_sphere = np.random.randn(n_points // 2, 3).astype(np.float32)
-        points_sphere = points_sphere / np.linalg.norm(points_sphere, axis=1, keepdims=True) * 2.0
+        points_sphere = points_sphere / np.linalg.norm(points_sphere, axis=1, keepdims=True) * 3.0  # 2.0 → 3.0
         
         # 평면 구조 추가 (바닥면)
         points_plane = np.random.randn(n_points // 2, 3).astype(np.float32)
-        points_plane[:, 1] = np.abs(points_plane[:, 1]) * 0.1 - 0.5  # 바닥 근처
-        points_plane[:, [0, 2]] *= 1.5
+        points_plane[:, 1] = np.abs(points_plane[:, 1]) * 0.2 - 1.0  # 바닥 근처 (0.1 → 0.2, -0.5 → -1.0)
+        points_plane[:, [0, 2]] *= 2.0  # 1.5 → 2.0
         
         points = np.vstack([points_sphere, points_plane])
         
@@ -1905,14 +1958,14 @@ def main():
     # SuperGlue 설정
     config = {
         'superpoint': {
-            'nms_radius': 4,
-            'keypoint_threshold': 0.005,  # 더 낮은 임계값
-            'max_keypoints': 4096  # 더 많은 특징점
+            'nms_radius': 3,  # 4 → 3으로 완화
+            'keypoint_threshold': 0.001,  # 0.005 → 0.001로 대폭 완화
+            'max_keypoints': 8192  # 4096 → 8192로 증가
         },
         'superglue': {
             'weights': args.config,
-            'sinkhorn_iterations': 20,
-            'match_threshold': 0.1,  # 더 낮은 매칭 임계값
+            'sinkhorn_iterations': 15,  # 20 → 15로 완화
+            'match_threshold': 0.05,  # 0.1 → 0.05로 완화
         }
     }
     

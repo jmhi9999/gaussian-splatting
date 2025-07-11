@@ -773,27 +773,29 @@ class SuperGlueCOLMAPHybrid:
             total_pairs = 0
             
             for i in range(len(image_paths)):
-                for j in range(i + 1, min(i + 5, len(image_paths))):  # 인접한 5장씩만
-                    total_pairs += 1
-                    
-            
-                    matches = self._match_single_pair_superpoint_only(image_paths[i], image_paths[j])
-                    
-                    if matches is not None and len(matches) >= 10:
-                        if i in image_id_map and j in image_id_map:
-                            pair_id = image_id_map[i] * 2147483647 + image_id_map[j]
-                            
-                            cursor.execute(
-                                "INSERT INTO matches (pair_id, rows, cols, data) VALUES (?, ?, ?, ?)",
-                                (pair_id, len(matches), 2, matches.tobytes())
-                            )
-                            
-                            
-                            successful_matches += 1
-                        else:
-                            print(f"        ❌ 이미지 ID 매핑 실패")
+                # 모든 이미지를 순차적으로 한 바퀴 돌기
+                next_i = (i + 1) % len(image_paths)
+                total_pairs += 1
+                
+                print(f"        🔍 SuperPoint-only 매칭: {image_paths[i].name} ↔ {image_paths[next_i].name}")
+                
+                matches = self._match_single_pair_superpoint_only(image_paths[i], image_paths[next_i])
+                
+                if matches is not None and len(matches) >= 10:
+                    if i in image_id_map and next_i in image_id_map:
+                        pair_id = image_id_map[i] * 2147483647 + image_id_map[next_i]
+                        
+                        cursor.execute(
+                            "INSERT INTO matches (pair_id, rows, cols, data) VALUES (?, ?, ?, ?)",
+                            (pair_id, len(matches), 2, matches.tobytes())
+                        )
+                        
+                        print(f"        ✅ {len(matches)}개 매칭 저장")
+                        successful_matches += 1
                     else:
-                        print(f"        ❌ 매칭 실패 또는 부족")
+                        print(f"        ❌ 이미지 ID 매핑 실패")
+                else:
+                    print(f"        ❌ 매칭 실패 또는 부족")
             
             conn.commit()
             conn.close()
@@ -1156,35 +1158,37 @@ class SuperGlueCOLMAPHybrid:
             
             # 매칭 수행
             for i in range(len(image_paths)):
-                for j in range(i + 1, min(i + 5, len(image_paths))):  # 인접한 5장씩만
-                    total_pairs += 1
-                    
-                    print(f"      매칭 {i}-{j}...")
-                    matches = self._match_single_pair(image_paths[i], image_paths[j])
-                    
-                    if matches is not None and len(matches) >= 10:  # 최소 10개 매칭
-                        # COLMAP DB에 저장
-                        if i in image_id_map and j in image_id_map:
-                            pair_id = image_id_map[i] * 2147483647 + image_id_map[j]  # COLMAP pair_id 형식
-                            
-                            # matches 테이블에 저장
-                            cursor.execute(
-                                "INSERT INTO matches (pair_id, rows, cols, data) VALUES (?, ?, ?, ?)",
-                                (pair_id, len(matches), 2, matches.tobytes())
-                            )
-                            
-                            # two_view_geometries 테이블에도 저장 (COLMAP 매퍼가 필요로 함)
-                            cursor.execute(
-                                "INSERT INTO two_view_geometries (pair_id, rows, cols, data, config) VALUES (?, ?, ?, ?, ?)",
-                                (pair_id, len(matches), 2, matches.tobytes(), 2)  # config=2는 기본값
-                            )
-                            
-                            print(f"        ✅ {len(matches)}개 매칭 저장 (pair_id: {pair_id})")
-                            successful_matches += 1
-                        else:
-                            print(f"        ❌ 이미지 ID 매핑 실패")
+                # 모든 이미지를 순차적으로 한 바퀴 돌기
+                next_i = (i + 1) % len(image_paths)
+                
+                total_pairs += 1
+                
+                print(f"      매칭 {i}-{next_i}...")
+                matches = self._match_single_pair(image_paths[i], image_paths[next_i])
+                
+                if matches is not None and len(matches) >= 10:  # 최소 10개 매칭
+                    # COLMAP DB에 저장
+                    if i in image_id_map and next_i in image_id_map:
+                        pair_id = image_id_map[i] * 2147483647 + image_id_map[next_i]  # COLMAP pair_id 형식
+                        
+                        # matches 테이블에 저장
+                        cursor.execute(
+                            "INSERT INTO matches (pair_id, rows, cols, data) VALUES (?, ?, ?, ?)",
+                            (pair_id, len(matches), 2, matches.tobytes())
+                        )
+                        
+                        # two_view_geometries 테이블에도 저장 (COLMAP 매퍼가 필요로 함)
+                        cursor.execute(
+                            "INSERT INTO two_view_geometries (pair_id, rows, cols, data, config) VALUES (?, ?, ?, ?, ?)",
+                            (pair_id, len(matches), 2, matches.tobytes(), 2)  # config=2는 기본값
+                        )
+                        
+                        print(f"        ✅ {len(matches)}개 매칭 저장 (pair_id: {pair_id})")
+                        successful_matches += 1
                     else:
-                        print(f"        ❌ 매칭 실패 또는 부족")
+                        print(f"        ❌ 이미지 ID 매핑 실패")
+                else:
+                    print(f"        ❌ 매칭 실패 또는 부족")
             
             conn.commit()
             conn.close()
