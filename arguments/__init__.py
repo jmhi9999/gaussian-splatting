@@ -78,16 +78,16 @@ class PipelineParams(ParamGroup):
 class OptimizationParams(ParamGroup):
     def __init__(self, parser):
         self.iterations = 30_000
-        self.position_lr_init = 0.00016
-        self.position_lr_final = 0.0000016
+        self.position_lr_init = 0.00008  # Reduced from 0.00016
+        self.position_lr_final = 0.0000008  # Reduced from 0.0000016
         self.position_lr_delay_mult = 0.01
         self.position_lr_max_steps = 30_000
-        self.feature_lr = 0.0025
-        self.opacity_lr = 0.025
-        self.scaling_lr = 0.005
-        self.rotation_lr = 0.001
-        self.exposure_lr_init = 0.01
-        self.exposure_lr_final = 0.001
+        self.feature_lr = 0.00125  # Reduced from 0.0025
+        self.opacity_lr = 0.0125  # Reduced from 0.025
+        self.scaling_lr = 0.0025  # Reduced from 0.005
+        self.rotation_lr = 0.0005  # Reduced from 0.001
+        self.exposure_lr_init = 0.005  # Reduced from 0.01
+        self.exposure_lr_final = 0.0005  # Reduced from 0.001
         self.exposure_lr_delay_steps = 0
         self.exposure_lr_delay_mult = 0.0
         self.percent_dense = 0.01
@@ -101,6 +101,15 @@ class OptimizationParams(ParamGroup):
         self.depth_l1_weight_final = 0.01
         self.random_background = False
         self.optimizer_type = "default"
+        
+        # Anti-overfitting parameters
+        self.weight_decay = 0.0  # Weight decay for regularization
+        self.dropout_rate = 0.0  # Dropout rate (if applicable)
+        self.gradient_clip = 1.0  # Gradient clipping threshold
+        self.early_stopping = True  # Enable early stopping
+        self.early_stop_patience = 3  # Patience for early stopping
+        self.early_stop_threshold = 0.5  # PSNR decrease threshold for early stopping
+        
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):
