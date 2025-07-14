@@ -283,7 +283,30 @@ if __name__ == "__main__":
 
     # Start GUI server, configure and run training
     if not args.disable_viewer:
-        network_gui.init(args.ip, args.port)
+        # 포트 충돌 해결을 위한 자동 포트 찾기
+        import socket
+        def find_free_port(start_port=6009, max_attempts=10):
+            for port in range(start_port, start_port + max_attempts):
+                try:
+                    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                        s.bind((args.ip, port))
+                        return port
+                except OSError:
+                    continue
+            return None
+        
+        # 사용 가능한 포트 찾기
+        free_port = find_free_port(args.port)
+        if free_port is None:
+            print(f"Warning: Could not find free port starting from {args.port}")
+            print("Disabling network GUI")
+            args.disable_viewer = True
+        else:
+            if free_port != args.port:
+                print(f"Port {args.port} is in use, using port {free_port} instead")
+            args.port = free_port
+            network_gui.init(args.ip, args.port)
+    
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
     training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from)
 
