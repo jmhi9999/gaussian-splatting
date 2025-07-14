@@ -2723,9 +2723,49 @@ class SuperGlue3DGSPipeline:
             print(f"    Created cameras.bin with {len(cameras)} cameras")
             
         except ImportError:
-            print(f"    Warning: COLMAP loader not available, skipping cameras.bin")
+            print(f"    Warning: COLMAP loader not available, creating simple cameras.bin")
+            self._write_cameras_bin_simple(cam_infos, output_path)
         except Exception as e:
             print(f"    Warning: Failed to create cameras.bin: {e}")
+            self._write_cameras_bin_simple(cam_infos, output_path)
+    
+    def _write_cameras_bin_simple(self, cam_infos, output_path):
+        """간단한 cameras.bin 생성 (COLMAP loader 없이)"""
+        try:
+            import struct
+            
+            with open(output_path, 'wb') as f:
+                # 카메라 수
+                f.write(struct.pack('<Q', len(cam_infos)))
+                
+                for cam in cam_infos:
+                    # PINHOLE 모델 사용
+                    focal_x = cam.width / (2 * np.tan(cam.FovX / 2))
+                    focal_y = cam.height / (2 * np.tan(cam.FovY / 2))
+                    cx, cy = cam.width / 2, cam.height / 2
+                    
+                    # 카메라 ID
+                    f.write(struct.pack('<Q', cam.uid))
+                    
+                    # 모델 이름 길이와 이름
+                    model_name = b'PINHOLE'
+                    f.write(struct.pack('<Q', len(model_name)))
+                    f.write(model_name)
+                    
+                    # 너비, 높이
+                    f.write(struct.pack('<Q', cam.width))
+                    f.write(struct.pack('<Q', cam.height))
+                    
+                    # 파라미터 수와 파라미터들
+                    params = [focal_x, focal_y, cx, cy]
+                    f.write(struct.pack('<Q', len(params)))
+                    for param in params:
+                        f.write(struct.pack('<d', param))
+            
+            print(f"    Created simple cameras.bin with {len(cam_infos)} cameras")
+            
+        except Exception as e:
+            print(f"    Error creating simple cameras.bin: {e}")
     
     def _write_images_bin(self, cam_infos, output_path):
         """COLMAP 형식 images.bin 생성"""
@@ -2772,9 +2812,70 @@ class SuperGlue3DGSPipeline:
             print(f"    Created images.bin with {len(images)} images")
             
         except ImportError:
-            print(f"    Warning: COLMAP loader not available, skipping images.bin")
+            print(f"    Warning: COLMAP loader not available, creating simple images.bin")
+            self._write_images_bin_simple(cam_infos, output_path)
         except Exception as e:
             print(f"    Warning: Failed to create images.bin: {e}")
+            self._write_images_bin_simple(cam_infos, output_path)
+    
+    def _write_images_bin_simple(self, cam_infos, output_path):
+        """간단한 images.bin 생성 (COLMAP loader 없이)"""
+        try:
+            import struct
+            
+            with open(output_path, 'wb') as f:
+                # 이미지 수
+                f.write(struct.pack('<Q', len(cam_infos)))
+                
+                for cam in cam_infos:
+                    # 회전 행렬을 쿼터니언으로 변환
+                    R = cam.R
+                    trace = np.trace(R)
+                    
+                    if trace > 0:
+                        s = np.sqrt(trace + 1.0) * 2
+                        qw = 0.25 * s
+                        qx = (R[2, 1] - R[1, 2]) / s
+                        qy = (R[0, 2] - R[2, 0]) / s
+                        qz = (R[1, 0] - R[0, 1]) / s
+                    else:
+                        qw = np.sqrt(1 + R[0,0] + R[1,1] + R[2,2]) / 2
+                        qx = (R[2,1] - R[1,2]) / (4 * qw) if qw != 0 else 0
+                        qy = (R[0,2] - R[2,0]) / (4 * qw) if qw != 0 else 0
+                        qz = (R[1,0] - R[0,1]) / (4 * qw) if qw != 0 else 0
+                    
+                    # 정규화
+                    q_norm = np.sqrt(qw*qw + qx*qx + qy*qy + qz*qz)
+                    if q_norm > 0:
+                        qw, qx, qy, qz = qw/q_norm, qx/q_norm, qy/q_norm, qz/q_norm
+                    
+                    # 이미지 ID
+                    f.write(struct.pack('<Q', cam.uid))
+                    
+                    # 쿼터니언 (qw, qx, qy, qz)
+                    f.write(struct.pack('<dddd', qw, qx, qy, qz))
+                    
+                    # 이동 벡터 (tx, ty, tz)
+                    f.write(struct.pack('<ddd', cam.T[0], cam.T[1], cam.T[2]))
+                    
+                    # 카메라 ID
+                    f.write(struct.pack('<Q', cam.uid))
+                    
+                    # 이미지 이름 길이와 이름
+                    name_bytes = cam.image_name.encode('utf-8')
+                    f.write(struct.pack('<Q', len(name_bytes)))
+                    f.write(name_bytes)
+                    
+                    # 특징점 수 (0개)
+                    f.write(struct.pack('<Q', 0))
+                    
+                    # 3D 포인트 ID 수 (0개)
+                    f.write(struct.pack('<Q', 0))
+            
+            print(f"    Created simple images.bin with {len(cam_infos)} images")
+            
+        except Exception as e:
+            print(f"    Error creating simple images.bin: {e}")
     
     def _write_points3d_bin(self, point_cloud, output_path):
         """COLMAP 형식 points3D.bin 생성"""
@@ -2801,9 +2902,45 @@ class SuperGlue3DGSPipeline:
             print(f"    Created points3D.bin with {len(points3d)} points")
             
         except ImportError:
-            print(f"    Warning: COLMAP loader not available, skipping points3D.bin")
+            print(f"    Warning: COLMAP loader not available, creating simple points3D.bin")
+            self._write_points3d_bin_simple(point_cloud, output_path)
         except Exception as e:
             print(f"    Warning: Failed to create points3D.bin: {e}")
+            self._write_points3d_bin_simple(point_cloud, output_path)
+    
+    def _write_points3d_bin_simple(self, point_cloud, output_path):
+        """간단한 points3D.bin 생성 (COLMAP loader 없이)"""
+        try:
+            import struct
+            
+            points = point_cloud.points
+            colors = point_cloud.colors
+            
+            with open(output_path, 'wb') as f:
+                # 포인트 수
+                f.write(struct.pack('<Q', len(points)))
+                
+                for i in range(len(points)):
+                    # 포인트 ID
+                    f.write(struct.pack('<Q', i))
+                    
+                    # 3D 좌표 (x, y, z)
+                    f.write(struct.pack('<ddd', points[i][0], points[i][1], points[i][2]))
+                    
+                    # RGB 색상 (0-255 범위로 변환)
+                    rgb = (colors[i] * 255).astype(np.uint8)
+                    f.write(struct.pack('<BBB', rgb[0], rgb[1], rgb[2]))
+                    
+                    # 오차 (0.0)
+                    f.write(struct.pack('<d', 0.0))
+                    
+                    # 트랙 길이 (0개)
+                    f.write(struct.pack('<Q', 0))
+            
+            print(f"    Created simple points3D.bin with {len(points)} points")
+            
+        except Exception as e:
+            print(f"    Error creating simple points3D.bin: {e}")
     
     def _write_images_txt(self, cam_infos, output_path):
         """COLMAP 형식 images.txt 생성"""

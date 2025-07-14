@@ -292,3 +292,49 @@ def read_colmap_bin_array(path):
         array = np.fromfile(fid, np.float32)
     array = array.reshape((width, height, channels), order="F")
     return np.transpose(array, (1, 0, 2)).squeeze()
+
+
+# =============================================================================
+# COLMAP Binary Write Functions
+# =============================================================================
+
+def write_intrinsics_binary(cameras, path_to_model_file):
+    """
+    Write cameras to binary file.
+    """
+    with open(path_to_model_file, "wb") as fid:
+        fid.write(struct.pack('<Q', len(cameras)))
+        for camera_id, camera in cameras.items():
+            model_id = CAMERA_MODEL_NAMES[camera.model].model_id
+            fid.write(struct.pack('<iiQQ', camera.id, model_id, camera.width, camera.height))
+            fid.write(struct.pack('<d' * len(camera.params), *camera.params))
+
+
+def write_extrinsics_binary(images, path_to_model_file):
+    """
+    Write images to binary file.
+    """
+    with open(path_to_model_file, "wb") as fid:
+        fid.write(struct.pack('<Q', len(images)))
+        for image_id, image in images.items():
+            fid.write(struct.pack('<idddddddi', image.id, *image.qvec, *image.tvec, image.camera_id))
+            fid.write(image.name.encode('utf-8') + b'\x00')
+            fid.write(struct.pack('<Q', len(image.xys)))
+            for xy, point3D_id in zip(image.xys, image.point3D_ids):
+                fid.write(struct.pack('<ddq', xy[0], xy[1], point3D_id))
+
+
+def write_points3D_binary(points3D, path_to_model_file):
+    """
+    Write points3D to binary file.
+    """
+    with open(path_to_model_file, "wb") as fid:
+        fid.write(struct.pack('<Q', len(points3D)))
+        for point3D_id, point3D in points3D.items():
+            fid.write(struct.pack('<Q', point3D.id))
+            fid.write(struct.pack('<ddd', *point3D.xyz))
+            fid.write(struct.pack('<BBB', *point3D.rgb))
+            fid.write(struct.pack('<d', point3D.error))
+            fid.write(struct.pack('<Q', len(point3D.image_ids)))
+            for image_id, point2D_idx in zip(point3D.image_ids, point3D.point2D_idxs):
+                fid.write(struct.pack('<ii', image_id, point2D_idx))
