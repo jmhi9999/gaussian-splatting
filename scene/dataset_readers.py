@@ -43,34 +43,48 @@ class SceneInfo(NamedTuple):
 
 # SuperGlue 모듈 경로 수정
 def import_superglue_pipeline():
-    """SuperGlue 파이프라인 동적 import"""
+    """SuperGlue 파이프라인 동적 import - 개선된 버전"""
     try:
         # 현재 디렉토리에서 SuperGlue 경로 찾기
         current_dir = Path(__file__).parent.parent  # gaussian-splatting 루트
         
-        # SuperGlue 경로들
+        # SuperGlue 경로들 (더 많은 경로 추가)
         superglue_paths = [
             current_dir / "Superglue",
             current_dir / "SuperGlue", 
-            current_dir
+            current_dir,
+            Path.cwd() / "Superglue",
+            Path.cwd() / "SuperGlue",
+            Path.cwd()
         ]
         
+        print("🔍 Searching for SuperGlue pipeline...")
         for path in superglue_paths:
             complete_sfm_file = path / "complete_superglue_sfm.py"
+            print(f"  Checking: {complete_sfm_file}")
+            
             if complete_sfm_file.exists():
-                # 해당 경로를 sys.path에 추가
-                sys.path.insert(0, str(path))
+                print(f"  ✓ Found SuperGlue pipeline at: {path}")
                 
-                # 모듈 import
-                from complete_superglue_sfm import SuperGlue3DGSPipeline
-                print(f"✓ SuperGlue pipeline imported from {path}")
-                return SuperGlue3DGSPipeline
+                # 해당 경로를 sys.path에 추가
+                if str(path) not in sys.path:
+                    sys.path.insert(0, str(path))
+                    print(f"  ✓ Added {path} to Python path")
+                
+                try:
+                    # 모듈 import 시도
+                    from complete_superglue_sfm import SuperGlue3DGSPipeline
+                    print(f"✓ SuperGlue pipeline imported successfully from {path}")
+                    return SuperGlue3DGSPipeline
+                except ImportError as e:
+                    print(f"  ✗ Import failed: {e}")
+                    continue
         
-        print("✗ SuperGlue pipeline not found")
+        print("✗ SuperGlue pipeline not found in any of the searched paths")
         return None
         
-    except ImportError as e:
-        print(f"✗ SuperGlue import failed: {e}")
+    except Exception as e:
+        print(f"✗ SuperGlue import failed with exception: {e}")
         return None
 
 def import_superglue_colmap_hybrid():
@@ -448,7 +462,7 @@ class SimpleSuperGluePipeline:
     def __init__(self, config=None, device='cuda'):
         self.device = torch.device(device if torch.cuda.is_available() else 'cpu')
         
-        if SUPERGLUE_AVAILABLE and Matching is not None:
+        if SUPERGLUE_PIPELINE_AVAILABLE and SuperGlue3DGSPipeline is not None:
             # SuperGlue 설정
             if config is None:
                 config = {
@@ -465,7 +479,7 @@ class SimpleSuperGluePipeline:
                 }
             
             try:
-                self.matching = Matching(config).eval().to(self.device)
+                self.matching = SuperGlue3DGSPipeline(config).eval().to(self.device)
                 self.superglue_ready = True
                 print(f"SuperGlue initialized on {self.device}")
             except Exception as e:

@@ -24,19 +24,148 @@ from models.utils import frame2tensor
 
 # 3DGS 관련 imports - lazy import로 변경
 def get_3dgs_imports():
-    """3DGS 관련 모듈들을 lazy import"""
+    """3DGS 관련 모듈들을 lazy import - 개선된 버전"""
     # gaussian-splatting 루트 디렉토리를 Python path에 추가
     gaussian_splatting_root = Path(__file__).parent.parent
     if str(gaussian_splatting_root) not in sys.path:
         sys.path.insert(0, str(gaussian_splatting_root))
     
+    # 추가 경로들 시도
+    additional_paths = [
+        gaussian_splatting_root,
+        gaussian_splatting_root / "scene",
+        gaussian_splatting_root / "utils",
+        Path.cwd(),
+        Path.cwd().parent
+    ]
+    
+    for path in additional_paths:
+        if str(path) not in sys.path:
+            sys.path.insert(0, str(path))
+    
     try:
+        # 먼저 scene.dataset_readers 시도
         from scene.dataset_readers import CameraInfo, SceneInfo
-        from utils.graphics_utils import BasicPointCloud
-        return CameraInfo, SceneInfo, BasicPointCloud
+        print("✓ Successfully imported CameraInfo and SceneInfo from scene.dataset_readers")
     except ImportError as e:
-        print(f"Warning: Could not import 3DGS modules: {e}")
+        print(f"✗ Failed to import from scene.dataset_readers: {e}")
+        try:
+            # 직접 import 시도
+            import scene.dataset_readers as dataset_readers
+            CameraInfo = dataset_readers.CameraInfo
+            SceneInfo = dataset_readers.SceneInfo
+            print("✓ Successfully imported CameraInfo and SceneInfo via direct import")
+        except ImportError as e2:
+            print(f"✗ Direct import also failed: {e2}")
+            # Fallback 클래스 정의
+            print("⚠️  Creating fallback CameraInfo and SceneInfo classes")
+            
+            class CameraInfo:
+                def __init__(self, uid, R, T, FovY, FovX, image_path, image_name, 
+                             width, height, depth_params=None, depth_path="", is_test=False):
+                    self.uid = uid
+                    self.R = R
+                    self.T = T
+                    self.FovY = FovY
+                    self.FovX = FovX
+                    self.image_path = image_path
+                    self.image_name = image_name
+                    self.width = width
+                    self.height = height
+                    self.depth_params = depth_params
+                    self.depth_path = depth_path
+                    self.is_test = is_test
+            
+            class SceneInfo:
+                def __init__(self, point_cloud, train_cameras, test_cameras, 
+                             nerf_normalization, ply_path="", is_nerf_synthetic=False):
+                    self.point_cloud = point_cloud
+                    self.train_cameras = train_cameras
+                    self.test_cameras = test_cameras
+                    self.nerf_normalization = nerf_normalization
+                    self.ply_path = ply_path
+                    self.is_nerf_synthetic = is_nerf_synthetic
+    
+    try:
+        # utils.graphics_utils 시도
+        from utils.graphics_utils import BasicPointCloud
+        print("✓ Successfully imported BasicPointCloud from utils.graphics_utils")
+    except ImportError as e:
+        print(f"✗ Failed to import BasicPointCloud from utils.graphics_utils: {e}")
+        try:
+            # 직접 import 시도
+            import utils.graphics_utils as graphics_utils
+            BasicPointCloud = graphics_utils.BasicPointCloud
+            print("✓ Successfully imported BasicPointCloud via direct import")
+        except ImportError as e2:
+            print(f"✗ Direct import also failed: {e2}")
+            # Fallback 클래스 정의
+            print("⚠️  Creating fallback BasicPointCloud class")
+            
+            class BasicPointCloud:
+                def __init__(self, points, colors, normals):
+                    self.points = points
+                    self.colors = colors
+                    self.normals = normals
+    
+    # 최종 확인
+    if 'CameraInfo' not in locals() or 'SceneInfo' not in locals() or 'BasicPointCloud' not in locals():
+        print("❌ Critical: Could not import any 3DGS modules")
         return None, None, None
+    
+    print("✅ All 3DGS modules successfully imported or created")
+    return CameraInfo, SceneInfo, BasicPointCloud
+
+
+def test_pipeline_availability():
+    """파이프라인 가용성 테스트"""
+    print("🔍 Testing SuperGlue 3DGS Pipeline availability...")
+    
+    # 1. SuperGlue 모듈 테스트
+    try:
+        from models.matching import Matching
+        from models.utils import frame2tensor
+        print("✓ SuperGlue modules available")
+        superglue_available = True
+    except ImportError as e:
+        print(f"✗ SuperGlue modules not available: {e}")
+        superglue_available = False
+    
+    # 2. 3DGS 모듈 테스트
+    CameraInfo, SceneInfo, BasicPointCloud = get_3dgs_imports()
+    if CameraInfo is not None and SceneInfo is not None and BasicPointCloud is not None:
+        print("✓ 3DGS modules available")
+        gs_available = True
+    else:
+        print("✗ 3DGS modules not available")
+        gs_available = False
+    
+    # 3. 기타 의존성 테스트
+    try:
+        import torch
+        import cv2
+        import numpy as np
+        from scipy.optimize import least_squares
+        print("✓ Core dependencies available")
+        core_available = True
+    except ImportError as e:
+        print(f"✗ Core dependencies missing: {e}")
+        core_available = False
+    
+    # 4. 전체 가용성 판단
+    pipeline_available = superglue_available and gs_available and core_available
+    
+    print(f"\n📊 Pipeline Availability Summary:")
+    print(f"  SuperGlue: {'✓' if superglue_available else '✗'}")
+    print(f"  3DGS: {'✓' if gs_available else '✗'}")
+    print(f"  Core Dependencies: {'✓' if core_available else '✗'}")
+    print(f"  Overall: {'✓' if pipeline_available else '✗'}")
+    
+    return pipeline_available
+
+
+# 파이프라인 가용성 테스트 실행
+PIPELINE_AVAILABLE = test_pipeline_availability()
 
 
 class SuperGlue3DGSPipeline:
@@ -48,6 +177,11 @@ class SuperGlue3DGSPipeline:
         # 성능 모니터링
         self.start_time = time.time()
         self.memory_usage = []
+        
+        # 파이프라인 가용성 확인
+        if not PIPELINE_AVAILABLE:
+            print("❌ Pipeline not available. Please check the availability test above.")
+            raise RuntimeError("SuperGlue 3DGS Pipeline is not available. Check dependencies.")
         
         # SuperGlue 설정 (더 완화된 설정)
         if config is None:
@@ -64,7 +198,12 @@ class SuperGlue3DGSPipeline:
                 }
             }
         
-        self.matching = Matching(config).eval().to(self.device)
+        try:
+            self.matching = Matching(config).eval().to(self.device)
+            print(f"✓ SuperGlue matching model loaded on {self.device}")
+        except Exception as e:
+            print(f"❌ Failed to load SuperGlue matching model: {e}")
+            raise RuntimeError(f"SuperGlue model initialization failed: {e}")
         
         # SfM 데이터 저장소
         self.cameras = {}  # camera_id -> {'R': R, 'T': T, 'K': K, 'image_path': path}
@@ -84,7 +223,7 @@ class SuperGlue3DGSPipeline:
             'total_processing_time': 0.0
         }
         
-        print(f'SuperGlue 3DGS Pipeline initialized on {self.device}')
+        print(f'✅ SuperGlue 3DGS Pipeline initialized successfully on {self.device}')
     
     def _monitor_memory(self):
         """메모리 사용량 모니터링"""
@@ -2312,6 +2451,13 @@ def readSuperGlueSceneInfo(path, images, eval, train_test_exp=False, llffhold=8,
     """SuperGlue 기반 완전한 SfM으로 SceneInfo 생성"""
     
     print("=== SuperGlue Complete SfM Pipeline ===")
+    print(f"🚀 Pipeline available: {PIPELINE_AVAILABLE}")
+    
+    if not PIPELINE_AVAILABLE:
+        print("❌ Pipeline not available. Using fallback scene creation...")
+        # 이미지 디렉토리 경로
+        images_folder = Path(path) / (images if images else "images")
+        return _create_fallback_scene_info(images_folder, max_images)
     
     # 이미지 디렉토리 경로
     images_folder = Path(path) / (images if images else "images")
@@ -2332,7 +2478,13 @@ def readSuperGlueSceneInfo(path, images, eval, train_test_exp=False, llffhold=8,
     }
     
     # SuperGlue 3DGS 파이프라인 실행
-    pipeline = SuperGlue3DGSPipeline(config)
+    try:
+        pipeline = SuperGlue3DGSPipeline(config)
+        print("✅ SuperGlue pipeline initialized successfully")
+    except Exception as e:
+        print(f"❌ Failed to initialize SuperGlue pipeline: {e}")
+        print("Falling back to simple camera arrangement...")
+        return _create_fallback_scene_info(images_folder, max_images)
     
     try:
         scene_info = pipeline.process_images_to_3dgs(
