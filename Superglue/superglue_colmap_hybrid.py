@@ -334,7 +334,6 @@ class SuperGlueCOLMAPHybrid:
             traceback.print_exc()
             return False
 
-
     def _run_colmap_feature_extraction_fast(self, database_path, image_path):
         """빠른 COLMAP SIFT 특징점 추출 (양으로 가는 설정)"""
         print("  ⚡ 빠른 COLMAP SIFT 특징점 추출 (양으로 가는 설정)...")
@@ -1025,8 +1024,8 @@ class SuperGlueCOLMAPHybrid:
             superpoint_success = self._extract_superpoint_features(image_paths, database_path, input_dir)
             
             if not superpoint_success:
-                print("  ⚠️  SuperPoint 추출 실패, COLMAP SIFT로 fallback...")
-                self._run_colmap_feature_extraction_fast(database_path, input_dir)
+                print("  ❌ SuperPoint 특징점 추출 실패. SIFT fallback은 비활성화됨.")
+                raise RuntimeError("SuperPoint 특징점 추출 실패")
             
             # ✅ 특징점 개수 검증
             if not self._verify_features_in_database(database_path):
@@ -1094,108 +1093,85 @@ class SuperGlueCOLMAPHybrid:
             return None
 
     def _run_colmap_matching_fast(self, database_path):
-        """빠른 COLMAP 매칭"""
-        print("  ⚡ 빠른 COLMAP 매칭...")
-        
+        """항상 exhaustive matcher 사용"""
+        print("  ⚡ COLMAP exhaustive 매칭 (ultra-permissive)...")
         base_cmd = [
             self.colmap_exe, "exhaustive_matcher",
             "--database_path", str(database_path),
-            "--SiftMatching.max_num_matches", "1000"  # 매칭 수 제한
+            "--SiftMatching.max_num_matches", "5000"  # 더 많은 매칭 허용
         ]
-        
         env = os.environ.copy()
         env["QT_QPA_PLATFORM"] = "offscreen"
         env["DISPLAY"] = ":0"
-        
         try:
             result = subprocess.run(base_cmd, capture_output=True, text=True, 
-                                 timeout=300, env=env)  # 5분 제한
+                                 timeout=600, env=env)  # 10분 제한
             if result.returncode == 0:
-                print("  ✓ COLMAP 매칭 완료")
+                print("  ✓ COLMAP exhaustive 매칭 완료")
             else:
-                print(f"  ✗ COLMAP 매칭 실패: {result.stderr}")
+                print(f"  ✗ COLMAP exhaustive 매칭 실패: {result.stderr}")
         except subprocess.TimeoutExpired:
-            print("  ⚠️  COLMAP 매칭 타임아웃")
+            print("  ⚠️  COLMAP exhaustive 매칭 타임아웃")
         except Exception as e:
-            print(f"  ✗ COLMAP 매칭 오류: {e}")
+            print(f"  ✗ COLMAP exhaustive 매칭 오류: {e}")
 
     def _run_colmap_mapper_fast(self, database_path, image_path, output_path):
-        """빠른 COLMAP 매퍼 - 공간 해석 개선"""
-        print("  ⚡ 빠른 COLMAP 매퍼 (공간 해석 개선)...")
-        
-        # 여러 reconstruction을 생성하는 COLMAP 매퍼 실행
+        """Ultra-permissive COLMAP 매퍼 (최대 포인트 클라우드)"""
+        print("  ⚡ Ultra-permissive COLMAP 매퍼 (최대 포인트 클라우드)...")
         base_cmd = [
             self.colmap_exe, "mapper",
             "--database_path", str(database_path),
             "--image_path", str(image_path),
             "--output_path", str(output_path),
-            
-            # 📉 더 엄격한 설정으로 변경 (공간 해석 개선)
-            "--Mapper.min_num_matches", "15",             # 1 → 15 (더 엄격한 매칭 요구)
-            "--Mapper.init_min_num_inliers", "10",        # 2 → 10 (더 엄격한 inlier 요구)
-            "--Mapper.abs_pose_min_num_inliers", "8",     # 1 → 8 (더 엄격한 절대 포즈 요구)
-            "--Mapper.filter_max_reproj_error", "4.0",    # 100.0 → 4.0 (더 엄격한 재투영 오차)
-            "--Mapper.ba_refine_focal_length", "1",       # 0 → 1 (초점거리 최적화)
-            "--Mapper.ba_refine_principal_point", "1",    # 0 → 1 (주점 최적화)
-            "--Mapper.ba_refine_extra_params", "1",       # 0 → 1 (추가 파라미터 최적화)
-            
-            # 🚀 공간 해석 개선
-            "--Mapper.max_num_models", "3",               # 5 → 3 (더 적은 모델로 집중)
-            "--Mapper.min_model_size", "5",               # 1 → 5 (최소 5장 이미지)
-            "--Mapper.max_model_overlap", "20",           # 모델 간 중복 제한
-            "--Mapper.init_max_reg_trials", "2",          # 초기화 시도 횟수 제한
+            "--Mapper.min_num_matches", "1",
+            "--Mapper.init_min_num_inliers", "1",
+            "--Mapper.abs_pose_min_num_inliers", "1",
+            "--Mapper.filter_max_reproj_error", "200.0",
+            "--Mapper.min_track_length", "2",
+            "--Mapper.tri_min_angle", "0.1",
+            "--Mapper.tri_max_angle", "179.9",
+            "--Mapper.max_num_models", "1",
+            "--Mapper.min_model_size", "1"
         ]
-        
         print(f"    명령: {' '.join(base_cmd)}")
-        
         env = os.environ.copy()
         env["QT_QPA_PLATFORM"] = "offscreen"
         env["DISPLAY"] = ":0"
-        
         try:
             result = subprocess.run(base_cmd, capture_output=True, text=True, 
-                                 timeout=600, env=env)  # 10분 제한
-            
+                                 timeout=1200, env=env)  # 20분 제한
             if result.returncode == 0:
-                print("  ✅ COLMAP 매퍼 성공!")
-                
-                # 결과 확인 - 개선된 버전
+                print("  ✅ Ultra-permissive COLMAP 매퍼 성공!")
+                # 결과 확인 - 기존 코드 유지
                 print("    📁 생성된 파일 확인...")
                 if output_path.exists():
-                    # 모든 하위 디렉토리와 파일 확인
                     all_items = []
                     reconstruction_count = 0
                     for root, dirs, files in os.walk(output_path):
                         for dir_name in dirs:
-                            if dir_name.isdigit():  # reconstruction 디렉토리
+                            if dir_name.isdigit():
                                 reconstruction_count += 1
                                 all_items.append(f"📁 {Path(root).name}/{dir_name}")
                         for file_name in files:
                             if file_name.endswith('.bin'):
                                 all_items.append(f"📄 {Path(root).name}/{file_name}")
-                    
                     print(f"    발견된 reconstruction: {reconstruction_count}개")
                     print(f"    발견된 항목: {len(all_items)}개")
-                    for item in all_items[:15]:  # 처음 15개만 출력
+                    for item in all_items[:15]:
                         print(f"      {item}")
                     if len(all_items) > 15:
                         print(f"      ... 및 {len(all_items) - 15}개 더")
-                
                 return True
             else:
-                print(f"  ❌ COLMAP 매퍼 실패:")
+                print(f"  ❌ Ultra-permissive COLMAP 매퍼 실패:")
                 print(f"    stdout: {result.stdout}")
                 print(f"    stderr: {result.stderr}")
-                
-                # 실패시 더 관대한 설정으로 재시도
-                print("  🔄 더 관대한 설정으로 재시도...")
-                return self._run_colmap_mapper_ultra_permissive(database_path, image_path, output_path)
-                
+                return False
         except subprocess.TimeoutExpired:
-            print("  ⚠️  COLMAP 매퍼 타임아웃")
+            print("  ⚠️  Ultra-permissive COLMAP 매퍼 타임아웃")
             return False
         except Exception as e:
-            print(f"  ❌ COLMAP 매퍼 오류: {e}")
+            print(f"  ❌ Ultra-permissive COLMAP 매퍼 오류: {e}")
             return False
 
     def _run_colmap_undistortion_fast(self, image_path, sparse_path, output_path):
@@ -1729,95 +1705,8 @@ class SuperGlueCOLMAPHybrid:
             print(f"      PLY 저장 실패: {e}")
 
     def _run_colmap_mapper_ultra_permissive(self, database_path, image_path, output_path):
-        """Ultra permissive COLMAP 매퍼 - 매우 관대한 설정"""
-        print("  🔥 Ultra permissive COLMAP 매퍼...")
-        
-        # 환경 변수 설정
-        env = os.environ.copy()
-        env["QT_QPA_PLATFORM"] = "offscreen"
-        env["DISPLAY"] = ":0"
-        env["XDG_RUNTIME_DIR"] = "/tmp/runtime-colmap"
-        
-        # Ultra permissive 매퍼 설정 (매우 관대한 설정 - 더 많은 포인트 생성)
-        base_cmd = [
-            self.colmap_exe, "mapper",
-            "--database_path", str(database_path),
-            "--image_path", str(image_path),
-            "--output_path", str(output_path),
-            
-            # 📉 Ultra permissive 설정 (매우 관대한 설정 - 더 많은 포인트 생성)
-            "--Mapper.min_num_matches", "1",              # 최소 1개 매칭
-            "--Mapper.init_min_num_inliers", "1",         # 최소 1개 inlier (더 관대)
-            "--Mapper.abs_pose_min_num_inliers", "1",     # 최소 1개 inlier
-            "--Mapper.filter_max_reproj_error", "200.0",  # 매우 큰 허용 오차 (더 관대)
-            "--Mapper.ba_refine_focal_length", "0",       # 초점거리 고정
-            "--Mapper.ba_refine_principal_point", "0",    # 주점 고정
-            "--Mapper.ba_refine_extra_params", "0",       # 추가 파라미터 고정
-            
-            # 🚀 더 많은 포인트 생성을 위한 설정
-            "--Mapper.min_track_length", "2",             # 더 짧은 트랙 허용
-            "--Mapper.max_track_length", "100",           # 더 긴 트랙 허용
-            "--Mapper.init_min_num_matches", "1",         # 더 적은 매치 허용
-            "--Mapper.abs_pose_min_inlier_ratio", "0.1",  # 더 낮은 인라이어 비율 허용
-            "--Mapper.filter_min_tri_angle", "0.1",       # 더 작은 삼각측량 각도 허용
-            "--Mapper.init_max_reg_trials", "10",         # 더 많은 초기화 시도
-            "--Mapper.tri_merge_max_reproj_error", "200.0",  # 더 큰 재투영 오차 허용
-            "--Mapper.tri_complete_max_reproj_error", "200.0",  # 더 큰 재투영 오차 허용
-            "--Mapper.tri_re_max_reproj_error", "200.0",  # 더 큰 재투영 오차 허용
-            "--Mapper.tri_re_min_track_length", "2",      # 더 짧은 트랙 허용
-            "--Mapper.tri_re_max_track_length", "100",    # 더 긴 트랙 허용
-            "--Mapper.tri_re_min_focal_length_ratio", "0.01",  # 더 넓은 초점 거리 비율 허용
-            "--Mapper.tri_re_max_focal_length_ratio", "100.0",  # 더 넓은 초점 거리 비율 허용
-            "--Mapper.tri_re_max_extra_param", "10.0",    # 더 큰 추가 파라미터 허용
-            "--Mapper.ba_global_images_ratio", "1.0",
-            "--Mapper.ba_global_points_ratio", "1.0",
-            "--Mapper.ba_global_images_freq", "50",       # 더 자주 BA 실행
-            "--Mapper.ba_global_points_freq", "50",       # 더 자주 BA 실행
-            "--Mapper.ba_global_max_num_iterations", "200",  # 더 많은 반복
-            "--Mapper.ba_global_max_refinements", "20",   # 더 많은 정제
-            "--Mapper.ba_global_functions_tolerance", "1e-4",  # 더 관대한 허용 오차
-            "--Mapper.ba_global_gradient_tolerance", "1e-6",  # 더 관대한 허용 오차
-            "--Mapper.ba_global_parameter_tolerance", "1e-5",  # 더 관대한 파라미터 허용 오차
-            "--Mapper.ba_global_loss_function", "Huber",
-            "--Mapper.ba_global_loss_scale", "5.0",       # 더 큰 손실 스케일
-            "--Mapper.tri_min_angle", "0.1",              # 더 작은 최소 각도 허용
-            "--Mapper.tri_max_angle", "179.9",            # 더 넓은 각도 범위 허용
-            
-            # 🚀 성능 개선
-            "--Mapper.max_num_models", "1",               # 단일 모델만
-            "--Mapper.min_model_size", "1",               # 최소 1장 이미지
-        ]
-        
-        print(f"    명령: {' '.join(base_cmd)}")
-        
-        try:
-            result = subprocess.run(base_cmd, capture_output=True, text=True, 
-                                timeout=600, env=env)
-            
-            if result.returncode == 0:
-                print("  ✅ Ultra permissive COLMAP 매퍼 성공!")
-                
-                # 결과 확인
-                reconstruction_dirs = [d for d in output_path.iterdir() if d.is_dir()]
-                if reconstruction_dirs:
-                    print(f"    생성된 reconstruction: {len(reconstruction_dirs)}개")
-                    for recon_dir in reconstruction_dirs:
-                        bin_files = list(recon_dir.glob("*.bin"))
-                        print(f"      {recon_dir.name}: {len(bin_files)}개 파일")
-                
-                return True
-            else:
-                print(f"  ❌ Ultra permissive COLMAP 매퍼도 실패:")
-                print(f"    stdout: {result.stdout}")
-                print(f"    stderr: {result.stderr}")
-                return False
-                
-        except subprocess.TimeoutExpired:
-            print("  ⚠️  Ultra permissive COLMAP 매퍼 타임아웃")
-            return False
-        except Exception as e:
-            print(f"  ❌ Ultra permissive COLMAP 매퍼 오류: {e}")
-            return False
+        """Ultra-permissive COLMAP 매퍼 (최대 포인트 클라우드) - 중복 정의 방지 위해 fast와 동일하게 유지"""
+        return self._run_colmap_mapper_fast(database_path, image_path, output_path)
 
     def _convert_to_3dgs_format(self, output_path, image_paths):
         """3DGS 형식으로 변환 - 가장 큰 reconstruction 우선 사용"""
