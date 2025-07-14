@@ -17,6 +17,7 @@ import time
 import gc
 # import psutil  # 제거 - 의존성 문제 해결
 from scipy.spatial.distance import cdist
+import concurrent.futures
 
 # SuperGlue 관련 imports
 from models.matching import Matching
@@ -204,41 +205,95 @@ def test_pipeline_availability():
 PIPELINE_AVAILABLE = test_pipeline_availability()
 
 
+class FeatureExtractor:
+    def __init__(self, config, device, matching=None):
+        self.config = config
+        self.device = device
+        self.matcher_type = config.get('matcher', 'superglue')
+        self.matching = matching
+
+    def extract(self, image):
+        if self.matcher_type == 'superglue' and self.matching is not None:
+            # SuperPoint 특징점 추출
+            from models.utils import frame2tensor
+            inp = frame2tensor(image, self.device)
+            with torch.no_grad():
+                pred = self.matching.superpoint({'image': inp})
+            return {
+                'keypoints': pred['keypoints'][0].cpu().numpy(),
+                'descriptors': pred['descriptors'][0].cpu().numpy(),
+                'scores': pred['scores'][0].cpu().numpy(),
+                'image_size': image.shape[:2]
+            }
+        else:
+            # Fallback: OpenCV SIFT
+            import cv2
+            sift = cv2.SIFT_create()
+            keypoints, descriptors = sift.detectAndCompute(image, None)
+            if keypoints is None or descriptors is None:
+                return None
+            kpts = np.array([[kp.pt[0], kp.pt[1]] for kp in keypoints])
+            scores = np.array([kp.response for kp in keypoints])
+            return {
+                'keypoints': kpts,
+                'descriptors': descriptors.T.astype(np.float32),
+                'scores': scores,
+                'image_size': image.shape[:2]
+            }
+
+class Matcher:
+    def __init__(self, config, device, matching=None):
+        self.config = config
+        self.device = device
+        self.matcher_type = config.get('matcher', 'superglue')
+        self.matching = matching
+
+    def match(self, features1, features2):
+        if self.matcher_type == 'superglue' and self.matching is not None:
+            # SuperGlue 매칭
+            data = {
+                'image0': torch.zeros((1, 1, 480, 640)).to(self.device),
+                'image1': torch.zeros((1, 1, 480, 640)).to(self.device),
+                'keypoints0': torch.from_numpy(features1['keypoints']).unsqueeze(0).to(self.device),
+                'keypoints1': torch.from_numpy(features2['keypoints']).unsqueeze(0).to(self.device),
+                'descriptors0': torch.from_numpy(features1['descriptors']).unsqueeze(0).to(self.device),
+                'descriptors1': torch.from_numpy(features2['descriptors']).unsqueeze(0).to(self.device),
+                'scores0': torch.from_numpy(features1['scores']).unsqueeze(0).to(self.device),
+                'scores1': torch.from_numpy(features2['scores']).unsqueeze(0).to(self.device),
+            }
+            with torch.no_grad():
+                result = self.matching.superglue(data)
+            indices0 = result['indices0'][0].cpu().numpy()
+            indices1 = result['indices1'][0].cpu().numpy()
+            mscores0 = result['matching_scores0'][0].cpu().numpy()
+            matches = []
+            for i, j in enumerate(indices0):
+                if j >= 0 and mscores0[i] > 0.00001:
+                    if j < len(indices1) and indices1[j] == i:
+                        matches.append((i, j, mscores0[i]))
+            return matches
+        else:
+            # Fallback: OpenCV BFMatcher
+            import cv2
+            bf = cv2.BFMatcher()
+            matches = bf.knnMatch(features1['descriptors'].T, features2['descriptors'].T, k=2)
+            good_matches = []
+            for m, n in matches:
+                if m.distance < 0.75 * n.distance:
+                    good_matches.append((m.queryIdx, m.trainIdx, 1.0 - m.distance / 1000.0))
+            return good_matches
+
 class SuperGlue3DGSPipeline:
-    """SuperGlue 기반 완전한 3DGS SfM 파이프라인"""
-    
+    """SuperGlue 기반 완전한 3DGS SfM 파이프라인 (구조화/리팩토링 버전)"""
     def __init__(self, config=None, device='cuda'):
         self.device = torch.device(device if torch.cuda.is_available() else 'cpu')
+        self.config = config or {}
         
-        # 성능 모니터링
-        self.start_time = time.time()
-        self.memory_usage = []
-        
-        # 파이프라인 가용성 확인 (더 관대하게)
-        if not PIPELINE_AVAILABLE:
-            print("⚠️  Pipeline not fully available, but will attempt to run in fallback mode")
-            print("   Some features may not work without proper dependencies")
-        
-        # SuperGlue 설정 (더 완화된 설정)
-        if config is None:
-            config = {
-                'superpoint': {
-                    'nms_radius': 2,  # 3 → 2로 더 완화
-                    'keypoint_threshold': 0.0005,  # 0.001 → 0.0005로 더 완화
-                    'max_keypoints': 10240  # 8192 → 10240로 증가
-                },
-                'superglue': {
-                    'weights': 'outdoor',
-                    'sinkhorn_iterations': 10,  # 15 → 10으로 완화
-                    'match_threshold': 0.01,  # 0.05 → 0.01로 대폭 완화
-                }
-            }
-        
-        # SuperGlue 모델 로드 시도
+        # SuperGlue 모델 로드
         self.superglue_available = False
         try:
             from models.matching import Matching
-            self.matching = Matching(config).eval().to(self.device)
+            self.matching = Matching(self.config).eval().to(self.device)
             self.superglue_available = True
             print(f"✓ SuperGlue matching model loaded on {self.device}")
         except Exception as e:
@@ -247,27 +302,80 @@ class SuperGlue3DGSPipeline:
             self.matching = None
             self.superglue_available = False
         
-        # SfM 데이터 저장소
-        self.cameras = {}  # camera_id -> {'R': R, 'T': T, 'K': K, 'image_path': path}
-        self.points_3d = {}  # point_id -> {'xyz': xyz, 'color': rgb, 'observations': [(cam_id, kpt_idx)]}
-        self.image_features = {}  # image_id -> SuperPoint features
-        self.matches = {}  # (img_i, img_j) -> SuperGlue matches
-        
-        # Bundle Adjustment를 위한 추가 데이터
-        self.camera_graph = defaultdict(list)  # 카메라 연결 그래프
-        self.point_observations = defaultdict(list)  # 포인트 관찰 데이터
-        
-        # 품질 메트릭
-        self.quality_metrics = {
-            'pose_estimation_success_rate': 0.0,
-            'average_matches_per_pair': 0.0,
-            'bundle_adjustment_cost': float('inf'),
-            'total_processing_time': 0.0
-        }
+        # 각 단계별 객체 생성
+        self.feature_extractor = FeatureExtractor(self.config, self.device, self.matching)
+        self.matcher = Matcher(self.config, self.device, self.matching)
+        self.adaptive_matcher = AdaptiveMatcher(self.config, self.device)
+        self.track_manager = TrackManager()
+        self.pose_graph_optimizer = PoseGraphOptimizer()
+        self.bundle_adjuster = BundleAdjuster(loss_type=self.config.get('ba_loss', 'huber'), max_iter=self.config.get('ba_max_iter', 50))
+        self.parallel_executor = ParallelExecutor(max_workers=self.config.get('max_workers', 4))
+        self.auto_tuner = AutoTuner(self.config)
+        # 기존 변수들 유지
+        self.cameras = {}
+        self.points_3d = {}
+        self.image_features = {}
+        self.matches = {}
+        self.camera_graph = defaultdict(list)
+        self.point_observations = defaultdict(list)
+        self.quality_metrics = {}
         
         print(f'✅ SuperGlue 3DGS Pipeline initialized on {self.device}')
         if not self.superglue_available:
             print('   Running in fallback mode (SuperGlue not available)')
+    
+    def process_images_to_3dgs(self, image_dir, output_dir, max_images=120):
+        """이미지들을 3DGS 형식으로 처리 (구조화/리팩토링 버전)"""
+        # 1. 이미지 수집
+        image_paths = self._collect_images(image_dir, max_images)
+        if not image_paths:
+            raise RuntimeError("No images found")
+        print(f"Found {len(image_paths)} images")
+
+        # 2. 특징점 추출 (병렬화 예시)
+        def extract_features_for_path(path):
+            img = self._load_image(path)
+            return self.feature_extractor.extract(img)
+        features_list = self.parallel_executor.parallel_map(extract_features_for_path, image_paths)
+        for i, feat in enumerate(features_list):
+            self.image_features[i] = feat
+
+        # 3. Adaptive Matching (global descriptor 기반 후보 쌍 선정)
+        global_descs = self.adaptive_matcher.compute_global_descriptors(image_paths)
+        candidate_pairs = self.adaptive_matcher.select_topk_pairs(global_descs)
+
+        # 4. 매칭 (병렬화 예시)
+        def match_pair(pair):
+            i, j = pair
+            return (pair, self.matcher.match(self.image_features[i], self.image_features[j]))
+        match_results = self.parallel_executor.parallel_map(match_pair, candidate_pairs)
+        for pair, matches in match_results:
+            self.matches[pair] = matches
+
+        # 5. Track 생성 및 Multi-view Triangulation
+        self.track_manager.build_tracks(self.matches, self.image_features)
+        self.track_manager.filter_tracks(min_views=3)
+        triangulated_points = self.track_manager.triangulate_tracks(self.cameras, self.image_features)
+        # triangulated_points를 self.points_3d에 반영 (실제 구현 필요)
+
+        # 6. Pose Graph Optimization
+        self.pose_graph_optimizer.build_pose_graph(self.matches, self.cameras)
+        self.pose_graph_optimizer.remove_outlier_edges(min_matches=10)
+        pose_tree = self.pose_graph_optimizer.get_spanning_tree()
+        # pose_tree를 이용해 global pose 초기화 (실제 구현 필요)
+
+        # 7. Bundle Adjustment
+        ba_result = self.bundle_adjuster.run(self.cameras, self.points_3d, self.point_observations, callback=self.bundle_adjuster.monitor_quality)
+
+        # 8. Auto-tuning (품질 메트릭 평가 및 파라미터 조정)
+        self.auto_tuner.evaluate_metrics(self.quality_metrics)
+        self.auto_tuner.adjust_parameters()
+
+        # 9. 결과 저장 및 마무리
+        scene_info = self._create_3dgs_scene_info(image_paths)
+        self._save_3dgs_format(scene_info, output_dir)
+        self._cleanup_memory()
+        return scene_info
     
     def _monitor_memory(self):
         """메모리 사용량 모니터링 (psutil 없이)"""
@@ -288,73 +396,6 @@ class SuperGlue3DGSPipeline:
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-    
-    def process_images_to_3dgs(self, image_dir, output_dir, max_images=120):
-        """이미지들을 3DGS 형식으로 처리 - COLMAP 하이브리드 지원"""
-        print(f"Processing images from {image_dir} to {output_dir}")
-        
-        try:
-            # output_dir 저장 (COLMAP intrinsics 읽기용)
-            self.output_dir = output_dir
-            
-            # 이미지 수집
-            image_paths = self._collect_images(image_dir, max_images)
-            if not image_paths:
-                raise RuntimeError("No images found")
-            
-            print(f"Found {len(image_paths)} images")
-            self._monitor_memory()
-            
-            # 🔧 NEW: COLMAP reconstruction 확인 및 활용
-            colmap_available = self._check_colmap_reconstruction(output_dir)
-            if colmap_available:
-                print("  ✓ COLMAP reconstruction found - using hybrid approach")
-                return self._process_with_colmap_hybrid(image_paths, output_dir)
-            else:
-                print("  ⚠️  COLMAP reconstruction not found - using SuperGlue only")
-            
-            # 특징점 추출
-            self._extract_all_features(image_paths)
-            self._monitor_memory()
-            
-            # 매칭
-            self._intelligent_matching()
-            self._monitor_memory()
-            
-            # 카메라 포즈 추정
-            self._estimate_camera_poses_robust()
-            self._monitor_memory()
-            
-            # 삼각측량
-            n_points = self._triangulate_all_points_robust()
-            self._monitor_memory()
-            
-            # Bundle Adjustment
-            self._bundle_adjustment_robust()
-            self._monitor_memory()
-            
-            # 품질 메트릭 계산
-            self._compute_quality_metrics()
-            
-            # 3DGS SceneInfo 생성
-            scene_info = self._create_3dgs_scene_info(image_paths)
-            
-            # 3DGS 형식으로 저장
-            self._save_3dgs_format(scene_info, output_dir)
-            
-            # 최종 메모리 정리
-            self._cleanup_memory()
-            
-            return scene_info
-            
-        except Exception as e:
-            print(f"Pipeline failed: {e}")
-            import traceback
-            traceback.print_exc()
-            
-            # 실패시 fallback
-            print("Falling back to simple camera arrangement...")
-            return self._create_fallback_scene_info(image_paths)
     
     def _check_colmap_reconstruction(self, output_dir):
         """COLMAP reconstruction 존재 여부 및 유효성 확인"""
@@ -3264,6 +3305,42 @@ class SuperGlue3DGSPipeline:
             idx += 3
             self.points_3d[point_id]['xyz'] = xyz.astype(np.float32)
 
+class AdaptiveMatcher:
+    """Adaptive Matching: CLIP 기반 global descriptor, cosine similarity, 상위 N개 쌍 선정"""
+    def __init__(self, config, device):
+        self.config = config
+        self.device = device
+        self.top_k = config.get('adaptive_top_k', 20)
+        self.model, self.preprocess = clip.load("ViT-B/32", device=self.device)
+
+    def compute_global_descriptors(self, image_paths):
+        global_descs = []
+        for path in image_paths:
+            img = PILImage.open(path).convert("RGB")
+            img_tensor = self.preprocess(img).unsqueeze(0).to(self.device)
+            with torch.no_grad():
+                desc = self.model.encode_image(img_tensor).cpu().numpy().flatten()
+                desc = desc / (np.linalg.norm(desc) + 1e-10)
+            global_descs.append(desc)
+        return global_descs
+
+    def select_topk_pairs(self, global_descs):
+        import numpy as np
+        n = len(global_descs)
+        sim_matrix = np.zeros((n, n))
+        for i in range(n):
+            for j in range(i+1, n):
+                sim = np.dot(global_descs[i], global_descs[j])
+                sim_matrix[i, j] = sim
+                sim_matrix[j, i] = sim
+        pairs = set()
+        for i in range(n):
+            topk = np.argsort(sim_matrix[i])[::-1][:self.top_k]
+            for j in topk:
+                if i != j:
+                    pairs.add(tuple(sorted((i, j))))
+        return list(pairs)
+
 def readSuperGlueSceneInfo(path, images, eval, train_test_exp=False, llffhold=8, 
                           superglue_config="outdoor", max_images=100):
     """SuperGlue 기반 완전한 SfM으로 SceneInfo 생성"""
@@ -3283,6 +3360,7 @@ def readSuperGlueSceneInfo(path, images, eval, train_test_exp=False, llffhold=8,
     
     # SuperGlue 설정 (더 완화된 설정)
     config = {
+        'matcher': 'superglue',  # 추가: matcher 타입(superglue, loftr, lightglue 등)
         'superpoint': {
             'nms_radius': 3,  # 4 → 3으로 완화
             'keypoint_threshold': 0.001,  # 0.005 → 0.001로 대폭 완화
@@ -3292,6 +3370,14 @@ def readSuperGlueSceneInfo(path, images, eval, train_test_exp=False, llffhold=8,
             'weights': superglue_config,  # 'indoor' 또는 'outdoor'
             'sinkhorn_iterations': 15,  # 20 → 15로 완화
             'match_threshold': 0.05,  # 0.1 → 0.05로 완화
+        },
+        'loftr': {
+            # LoFTR 관련 파라미터 예시 (실제 적용은 이후 단계)
+            'weights': 'outdoor',
+        },
+        'lightglue': {
+            # LightGlue 관련 파라미터 예시 (실제 적용은 이후 단계)
+            'weights': 'outdoor',
         }
     }
     
@@ -3515,6 +3601,7 @@ def main():
     
     # SuperGlue 설정
     config = {
+        'matcher': 'superglue',  # 추가: matcher 타입(superglue, loftr, lightglue 등)
         'superpoint': {
             'nms_radius': 3,  # 4 → 3으로 완화
             'keypoint_threshold': 0.001,  # 0.005 → 0.001로 대폭 완화
@@ -3524,6 +3611,14 @@ def main():
             'weights': args.config,
             'sinkhorn_iterations': 15,  # 20 → 15로 완화
             'match_threshold': 0.05,  # 0.1 → 0.05로 완화
+        },
+        'loftr': {
+            # LoFTR 관련 파라미터 예시 (실제 적용은 이후 단계)
+            'weights': 'outdoor',
+        },
+        'lightglue': {
+            # LightGlue 관련 파라미터 예시 (실제 적용은 이후 단계)
+            'weights': 'outdoor',
         }
     }
     
