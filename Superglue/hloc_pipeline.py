@@ -122,11 +122,11 @@ class HlocPipeline:
             # SuperPoint 사용 가능하면 SuperPoint, 아니면 SIFT
             if self.superpoint_available:
                 feature_conf = 'superpoint_aachen'
-                feature_file = 'feats-superpoint-n4096-r1024'
+                feature_file = 'feats-superpoint-n4096-r1024.h5'  # .h5 확장자 추가
                 print("Using SuperPoint extractor")
             else:
                 feature_conf = 'sift'
-                feature_file = 'feats-sift'
+                feature_file = 'feats-sift.h5'  # .h5 확장자 추가
                 print("Using SIFT extractor (SuperPoint not available)")
             
             extract_cmd = [
@@ -208,8 +208,8 @@ class HlocPipeline:
                 '--sfm_dir', str(sfm_dir),
                 '--image_dir', str(image_dir),
                 '--pairs', str(pairs_path),
-                '--features', str(output_path / feature_file),
-                '--matches', str(output_path / matcher_file),
+                '--features', str(output_path / feature_file),  # .h5 파일 경로
+                '--matches', str(output_path / matcher_file),   # .h5 파일 경로
                 '--camera_mode', 'SINGLE'
             ]
             
