@@ -19,19 +19,27 @@ class SuperGlueCOLMAPHybrid:
         self.device = device if torch.cuda.is_available() else "cpu"
         self.colmap_exe = colmap_exe
         
-        # SuperGlue 설정 - 더 관대한 임계값
+        # SuperGlue 설정 - 더 엄격한 임계값으로 변경
         self.superglue_config = {
             'outdoor': {
                 'weights': 'outdoor',
                 'sinkhorn_iterations': 20,
-                'match_threshold': 0.1,  # 0.2 → 0.1 (더 관대한 임계값)
+                'match_threshold': 0.2,  # 0.1 → 0.2 (더 엄격한 임계값)
             },
             'indoor': {
                 'weights': 'indoor', 
                 'sinkhorn_iterations': 20,
-                'match_threshold': 0.1,  # 0.2 → 0.1 (더 관대한 임계값)
+                'match_threshold': 0.2,  # 0.1 → 0.2 (더 엄격한 임계값)
             }
         }[superglue_config]
+        
+        # SuperPoint 설정 - 더 엄격한 설정으로 변경
+        self.superpoint_config = {
+            'nms_radius': 8,              # 4 → 8 (더 넓은 NMS로 중복 제거)
+            'keypoint_threshold': 0.01,   # 0.005 → 0.01 (더 엄격한 임계값)
+            'max_keypoints': 2048,        # 1024 → 2048 (더 많은 특징점)
+            'remove_borders': 8           # 4 → 8 (경계에서 더 멀리)
+        }
         
         self._load_models()
     
@@ -119,9 +127,10 @@ class SuperGlueCOLMAPHybrid:
             
             # 설정
             superpoint_config = {
-                'nms_radius': 4,
-                'keypoint_threshold': 0.005,
-                'max_keypoints': 1024
+                'nms_radius': 8,
+                'keypoint_threshold': 0.01,
+                'max_keypoints': 2048,
+                'remove_borders': 8
             }
             
             superglue_config = {
@@ -332,8 +341,8 @@ class SuperGlueCOLMAPHybrid:
 
 
     def _run_colmap_feature_extraction_fast(self, database_path, image_path):
-        """빠른 COLMAP SIFT 특징점 추출 (timeout 단축)"""
-        print("  ⚡ 빠른 COLMAP SIFT 특징점 추출...")
+        """빠른 COLMAP SIFT 특징점 추출 (품질 향상)"""
+        print("  ⚡ 빠른 COLMAP SIFT 특징점 추출 (품질 향상)...")
         
         base_cmd = [
             self.colmap_exe, "feature_extractor",
@@ -341,7 +350,12 @@ class SuperGlueCOLMAPHybrid:
             "--image_path", str(image_path),
             "--ImageReader.single_camera", "1",
             "--SiftExtraction.max_num_features", "2048",  # 증가
-            "--SiftExtraction.num_threads", "4"  # 멀티스레드
+            "--SiftExtraction.num_threads", "4",  # 멀티스레드
+            "--SiftExtraction.first_octave", "-1",  # 더 세밀한 스케일
+            "--SiftExtraction.num_octaves", "4",  # 옥타브 수 증가
+            "--SiftExtraction.octave_resolution", "3",  # 해상도 증가
+            "--SiftExtraction.peak_threshold", "0.01",  # 더 엄격한 피크 임계값
+            "--SiftExtraction.edge_threshold", "10",  # 엣지 임계값
         ]
         
         # 환경 변수 설정
@@ -398,7 +412,7 @@ class SuperGlueCOLMAPHybrid:
             print(f"  ❌ 관대한 COLMAP 오류: {e}")
 
     def _extract_single_superpoint_features(self, image_path):
-        """단일 이미지에서 SuperPoint 특징점 추출 - Shape 수정"""
+        """단일 이미지에서 SuperPoint 특징점 추출 - 중복 제거 및 품질 향상"""
         try:
             print(f"        이미지 로드: {image_path}")
             
@@ -434,7 +448,8 @@ class SuperGlueCOLMAPHybrid:
             with torch.no_grad():
                 pred = self.superpoint({'image': img_tensor})
                 keypoints = pred['keypoints'][0].cpu().numpy()  # (N, 2)
-                descriptors = pred['descriptors'][0].cpu().numpy()  # (256, N) ← 여기가 문제!
+                descriptors = pred['descriptors'][0].cpu().numpy()  # (256, N)
+                scores = pred['scores'][0].cpu().numpy()  # (N,)
             
             # ✅ 핵심 수정: descriptor shape 확인 및 수정
             print(f"        원본 출력: keypoints={keypoints.shape}, descriptors={descriptors.shape}")
@@ -450,6 +465,20 @@ class SuperGlueCOLMAPHybrid:
                     print(f"        ✅ Descriptor 형태 정상: {descriptors.shape}")
                 else:
                     print(f"        ⚠️  예상치 못한 descriptor 형태: {descriptors.shape}")
+            
+            # ✅ 중복 특징점 제거 로직 추가
+            if len(keypoints) > 0:
+                keypoints, descriptors, scores = self._remove_duplicate_keypoints(
+                    keypoints, descriptors, scores, distance_threshold=8.0
+                )
+                print(f"        중복 제거 후: {len(keypoints)}개 키포인트")
+            
+            # ✅ 특징점 품질 검증
+            if len(keypoints) > 0:
+                keypoints, descriptors, scores = self._filter_quality_keypoints(
+                    keypoints, descriptors, scores, min_score=0.01, min_distance=16.0
+                )
+                print(f"        품질 필터링 후: {len(keypoints)}개 키포인트")
             
             print(f"        최종 결과: {keypoints.shape[0]}개 키포인트, {descriptors.shape}")
             
@@ -468,6 +497,94 @@ class SuperGlueCOLMAPHybrid:
         except Exception as e:
             print(f"        ❌ SuperPoint 오류: {e}")
             return None, None
+
+    def _remove_duplicate_keypoints(self, keypoints, descriptors, scores, distance_threshold=8.0):
+        """중복 특징점 제거"""
+        if len(keypoints) == 0:
+            return keypoints, descriptors, scores
+        
+        # 거리 기반 중복 제거
+        from scipy.spatial.distance import pdist, squareform
+        
+        # 모든 쌍의 거리 계산
+        distances = squareform(pdist(keypoints))
+        
+        # 대각선을 무한대로 설정 (자기 자신과의 거리)
+        np.fill_diagonal(distances, np.inf)
+        
+        # 중복 제거할 인덱스 찾기
+        to_remove = set()
+        
+        for i in range(len(keypoints)):
+            if i in to_remove:
+                continue
+            
+            # i와 가까운 점들 찾기
+            close_indices = np.where(distances[i] < distance_threshold)[0]
+            
+            for j in close_indices:
+                if j > i and j not in to_remove:
+                    # 더 높은 점수를 가진 점을 유지
+                    if scores[i] >= scores[j]:
+                        to_remove.add(j)
+                    else:
+                        to_remove.add(i)
+                        break
+        
+        # 중복 제거
+        keep_indices = [i for i in range(len(keypoints)) if i not in to_remove]
+        
+        if len(keep_indices) == 0:
+            return np.array([]), np.array([]), np.array([])
+        
+        return (keypoints[keep_indices], 
+                descriptors[keep_indices], 
+                scores[keep_indices])
+
+    def _filter_quality_keypoints(self, keypoints, descriptors, scores, min_score=0.01, min_distance=16.0):
+        """품질이 낮은 특징점 필터링"""
+        if len(keypoints) == 0:
+            return keypoints, descriptors, scores
+        
+        # 점수 기반 필터링
+        score_mask = scores >= min_score
+        
+        # 거리 기반 필터링 (너무 가까운 점들 제거)
+        from scipy.spatial.distance import pdist, squareform
+        
+        if len(keypoints) > 1:
+            distances = squareform(pdist(keypoints))
+            np.fill_diagonal(distances, np.inf)
+            
+            # 너무 가까운 점들 제거
+            close_pairs = np.where(distances < min_distance)
+            if len(close_pairs[0]) > 0:
+                # 더 낮은 점수를 가진 점들을 제거
+                to_remove = set()
+                for i, j in zip(close_pairs[0], close_pairs[1]):
+                    if i < j:  # 중복 방지
+                        if scores[i] < scores[j]:
+                            to_remove.add(i)
+                        else:
+                            to_remove.add(j)
+                
+                # 거리 필터링 마스크
+                distance_mask = np.ones(len(keypoints), dtype=bool)
+                distance_mask[list(to_remove)] = False
+            else:
+                distance_mask = np.ones(len(keypoints), dtype=bool)
+        else:
+            distance_mask = np.ones(len(keypoints), dtype=bool)
+        
+        # 최종 마스크
+        final_mask = score_mask & distance_mask
+        
+        if not np.any(final_mask):
+            return np.array([]), np.array([]), np.array([])
+        
+        return (keypoints[final_mask], 
+                descriptors[final_mask], 
+                scores[final_mask])
 
     def _convert_descriptors_to_sift_format(self, descriptors):
         """SuperPoint descriptor를 COLMAP SIFT 형식으로 완전 변환 - 개선된 차원 축소"""
@@ -724,7 +841,7 @@ class SuperGlueCOLMAPHybrid:
             return self._fallback_descriptor_matching(pred1, pred2)
 
     def _fallback_descriptor_matching(self, pred1, pred2):
-        """간단한 descriptor 매칭 fallback - 더 관대한 설정"""
+        """간단한 descriptor 매칭 fallback - 더 엄격한 설정"""
         try:
             print(f"        🔄 Fallback descriptor 매칭 시도...")
             
@@ -741,15 +858,18 @@ class SuperGlueCOLMAPHybrid:
                 for j in range(desc2.shape[0]):
                     distances[i, j] = np.linalg.norm(desc1_norm[i] - desc2_norm[j])
             
-            # 최근접 이웃 매칭
+            # 최근접 이웃 매칭 (더 엄격한 조건)
             matches = []
             for i in range(desc1.shape[0]):
                 best_j = np.argmin(distances[i])
                 best_distance = distances[i, best_j]
                 
-                # 더 관대한 거리 임계값
-                if best_distance < 1.0:  # 0.8 → 1.0 (더 관대한 임계값)
-                    matches.append([i, best_j])
+                # 더 엄격한 거리 임계값
+                if best_distance < 0.6:  # 1.0 → 0.6 (더 엄격한 임계값)
+                    # 상호 최근접 이웃 확인 (Mutual Nearest Neighbor)
+                    reciprocal_best = np.argmin(distances[:, best_j])
+                    if reciprocal_best == i:
+                        matches.append([i, best_j])
             
             if len(matches) > 0:
                 print(f"        ✅ Fallback 매칭: {len(matches)}개")
@@ -1016,8 +1136,8 @@ class SuperGlueCOLMAPHybrid:
             print(f"  ✗ COLMAP 매칭 오류: {e}")
 
     def _run_colmap_mapper_fast(self, database_path, image_path, output_path):
-        """빠른 COLMAP 매퍼 - 여러 reconstruction 생성"""
-        print("  ⚡ 빠른 COLMAP 매퍼...")
+        """빠른 COLMAP 매퍼 - 공간 해석 개선"""
+        print("  ⚡ 빠른 COLMAP 매퍼 (공간 해석 개선)...")
         
         # 여러 reconstruction을 생성하는 COLMAP 매퍼 실행
         base_cmd = [
@@ -1026,18 +1146,21 @@ class SuperGlueCOLMAPHybrid:
             "--image_path", str(image_path),
             "--output_path", str(output_path),
             
-            # 📉 관대한 설정
-            "--Mapper.min_num_matches", "1",              # 최소 1개 매칭
-            "--Mapper.init_min_num_inliers", "2",         # 최소 2개 inlier
-            "--Mapper.abs_pose_min_num_inliers", "1",     # 최소 1개 inlier
-            "--Mapper.filter_max_reproj_error", "100.0",  # 매우 큰 허용 오차
-            "--Mapper.ba_refine_focal_length", "0",       # 초점거리 고정
-            "--Mapper.ba_refine_principal_point", "0",    # 주점 고정
-            "--Mapper.ba_refine_extra_params", "0",       # 추가 파라미터 고정
+            # 📉 더 엄격한 설정으로 변경 (공간 해석 개선)
+            "--Mapper.min_num_matches", "15",             # 1 → 15 (더 엄격한 매칭 요구)
+            "--Mapper.init_min_num_inliers", "10",        # 2 → 10 (더 엄격한 inlier 요구)
+            "--Mapper.abs_pose_min_num_inliers", "8",     # 1 → 8 (더 엄격한 절대 포즈 요구)
+            "--Mapper.filter_max_reproj_error", "4.0",    # 100.0 → 4.0 (더 엄격한 재투영 오차)
+            "--Mapper.ba_refine_focal_length", "1",       # 0 → 1 (초점거리 최적화)
+            "--Mapper.ba_refine_principal_point", "1",    # 0 → 1 (주점 최적화)
+            "--Mapper.ba_refine_extra_params", "1",       # 0 → 1 (추가 파라미터 최적화)
             
-            # 🚀 여러 reconstruction 생성
-            "--Mapper.max_num_models", "5",               # 1 → 5 (최대 5개 모델)
-            "--Mapper.min_model_size", "1",               # 최소 1장 이미지
+            # 🚀 공간 해석 개선
+            "--Mapper.max_num_models", "3",               # 5 → 3 (더 적은 모델로 집중)
+            "--Mapper.min_model_size", "5",               # 1 → 5 (최소 5장 이미지)
+            "--Mapper.max_model_overlap", "20",           # 모델 간 중복 제한
+            "--Mapper.init_min_track_length", "3",        # 최소 트랙 길이
+            "--Mapper.init_max_reg_trials", "2",          # 초기화 시도 횟수 제한
         ]
         
         print(f"    명령: {' '.join(base_cmd)}")
@@ -1275,7 +1398,7 @@ class SuperGlueCOLMAPHybrid:
             return True
 
     def _verify_matches_in_database(self, database_path):
-        """매칭 결과가 DB에 제대로 저장되었는지 확인 - 더 관대한 버전"""
+        """매칭 결과가 DB에 제대로 저장되었는지 확인 - 더 엄격한 버전"""
         try:
             import sqlite3
             
@@ -1290,6 +1413,10 @@ class SuperGlueCOLMAPHybrid:
             cursor.execute("SELECT COUNT(*) FROM images")
             image_count = cursor.fetchone()[0]
             
+            # 매칭 품질 확인 (각 매칭의 개수)
+            cursor.execute("SELECT rows FROM two_view_geometries")
+            match_sizes = cursor.fetchall()
+            
             conn.close()
             
             print(f"    🔍 매칭 검증: {match_count}개 매칭, {image_count}개 이미지")
@@ -1299,8 +1426,30 @@ class SuperGlueCOLMAPHybrid:
                 print("    💡 하지만 계속 진행합니다...")
                 return True  # 실패하지 않고 계속 진행
             
-            # 더 관대한 매칭 검증
-            min_expected_matches = max(1, image_count // 2)  # 이미지의 절반만 매칭되어도 OK
+            # 매칭 품질 분석
+            if match_sizes:
+                avg_matches = sum(size[0] for size in match_sizes) / len(match_sizes)
+                min_matches = min(size[0] for size in match_sizes)
+                max_matches = max(size[0] for size in match_sizes)
+                
+                print(f"    📊 매칭 품질:")
+                print(f"      평균 매칭 수: {avg_matches:.1f}")
+                print(f"      최소 매칭 수: {min_matches}")
+                print(f"      최대 매칭 수: {max_matches}")
+                
+                # 품질 기준 확인
+                if avg_matches < 20:  # 평균 20개 미만이면 경고
+                    print(f"    ⚠️  평균 매칭 수가 적습니다: {avg_matches:.1f}")
+                    print("    💡 하지만 계속 진행합니다...")
+                    return True
+                
+                if min_matches < 10:  # 최소 10개 미만이면 경고
+                    print(f"    ⚠️  일부 매칭이 부족합니다: 최소 {min_matches}개")
+                    print("    💡 하지만 계속 진행합니다...")
+                    return True
+            
+            # 더 엄격한 매칭 검증
+            min_expected_matches = max(3, image_count // 3)  # 이미지의 1/3만 매칭되어도 OK
             if match_count < min_expected_matches:
                 print(f"    ⚠️  매칭이 부족합니다: {match_count}개 (예상: {min_expected_matches}개)")
                 print("    💡 하지만 계속 진행합니다...")
@@ -1656,7 +1805,7 @@ class SuperGlueCOLMAPHybrid:
             return False
 
     def _convert_to_3dgs_format(self, output_path, image_paths):
-        """3DGS 형식으로 변환 - 여러 reconstruction 사용"""
+        """3DGS 형식으로 변환 - 가장 큰 reconstruction 우선 사용"""
         print("  🔧 3DGS SceneInfo 생성 중...")
         
         try:
@@ -1688,13 +1837,19 @@ class SuperGlueCOLMAPHybrid:
             if reconstruction_paths:
                 print(f"    총 {len(reconstruction_paths)}개의 reconstruction 발견")
                 
-                # 모든 reconstruction을 병합하여 사용
-                try:
-                    return self._parse_multiple_colmap_reconstructions(reconstruction_paths, image_paths, output_path)
-                except Exception as e:
-                    print(f"    여러 reconstruction 파싱 실패: {e}")
-                    # 첫 번째 reconstruction만 사용
-                    return self._parse_colmap_reconstruction(reconstruction_paths[0], image_paths, output_path)
+                # 가장 큰 reconstruction을 우선적으로 사용
+                best_reconstruction = self._select_best_reconstruction(reconstruction_paths)
+                if best_reconstruction:
+                    print(f"    🎯 최적 reconstruction 선택: {best_reconstruction}")
+                    return self._parse_colmap_reconstruction(best_reconstruction, image_paths, output_path)
+                else:
+                    # 병합 시도
+                    try:
+                        return self._parse_multiple_colmap_reconstructions(reconstruction_paths, image_paths, output_path)
+                    except Exception as e:
+                        print(f"    여러 reconstruction 파싱 실패: {e}")
+                        # 첫 번째 reconstruction만 사용
+                        return self._parse_colmap_reconstruction(reconstruction_paths[0], image_paths, output_path)
             else:
                 raise RuntimeError("COLMAP reconstruction 없음 - SceneInfo fallback 방지")
             
@@ -1703,6 +1858,51 @@ class SuperGlueCOLMAPHybrid:
             import traceback
             traceback.print_exc()
             raise RuntimeError("3DGS 변환 실패 - SceneInfo fallback 방지")
+
+    def _select_best_reconstruction(self, reconstruction_paths):
+        """가장 큰 reconstruction 선택"""
+        best_reconstruction = None
+        max_images = 0
+        max_points = 0
+        
+        for recon_path in reconstruction_paths:
+            try:
+                # 이미지 개수 확인
+                images_bin = recon_path / "images.bin"
+                points3d_bin = recon_path / "points3D.bin"
+                
+                if images_bin.exists() and points3d_bin.exists():
+                    from scene.colmap_loader import read_extrinsics_binary, read_points3D_binary
+                    
+                    # 이미지 개수
+                    images = read_extrinsics_binary(str(images_bin))
+                    image_count = len(images)
+                    
+                    # 포인트 개수
+                    xyzs, _, _ = read_points3D_binary(str(points3d_bin))
+                    point_count = len(xyzs)
+                    
+                    print(f"      {recon_path.name}: {image_count}개 이미지, {point_count}개 포인트")
+                    
+                    # 가장 많은 이미지를 가진 reconstruction 선택
+                    if image_count > max_images:
+                        max_images = image_count
+                        max_points = point_count
+                        best_reconstruction = recon_path
+                    elif image_count == max_images and point_count > max_points:
+                        # 이미지 개수가 같으면 포인트 개수로 결정
+                        max_points = point_count
+                        best_reconstruction = recon_path
+                        
+            except Exception as e:
+                print(f"      ⚠️  {recon_path} 분석 실패: {e}")
+                continue
+        
+        if best_reconstruction:
+            print(f"    🎯 선택된 reconstruction: {best_reconstruction.name}")
+            print(f"      이미지: {max_images}개, 포인트: {max_points}개")
+        
+        return best_reconstruction
 
     def _parse_colmap_reconstruction(self, reconstruction_path, image_paths, output_path):
         """COLMAP reconstruction 파싱 - 개선된 버전"""
@@ -1954,7 +2154,7 @@ class SuperGlueCOLMAPHybrid:
             return True  # 오류가 발생해도 계속 진행
 
     def _parse_multiple_colmap_reconstructions(self, reconstruction_paths, image_paths, output_path):
-        """여러 COLMAP reconstruction 병합"""
+        """여러 COLMAP reconstruction 병합 - 개선된 버전"""
         print(f"    여러 COLMAP reconstruction 병합: {len(reconstruction_paths)}개")
         
         try:
@@ -1962,51 +2162,91 @@ class SuperGlueCOLMAPHybrid:
             from utils.graphics_utils import BasicPointCloud
             from scene.dataset_readers import CameraInfo, SceneInfo
             
-            # 모든 reconstruction에서 데이터 수집
-            all_cameras = {}
-            all_images = {}
-            all_xyzs = []
-            all_rgbs = []
-            all_errors = []
+            # 가장 큰 reconstruction을 기준으로 사용
+            best_reconstruction = self._select_best_reconstruction(reconstruction_paths)
+            if not best_reconstruction:
+                raise RuntimeError("유효한 reconstruction이 없습니다")
+            
+            print(f"    🎯 기준 reconstruction: {best_reconstruction}")
+            
+            # 기준 reconstruction에서 데이터 읽기
+            cameras_bin = best_reconstruction / "cameras.bin"
+            images_bin = best_reconstruction / "images.bin"
+            points3d_bin = best_reconstruction / "points3D.bin"
+            
+            if not all([cameras_bin.exists(), images_bin.exists(), points3d_bin.exists()]):
+                raise RuntimeError("기준 reconstruction 파일 누락")
+            
+            # 기준 reconstruction 데이터 읽기
+            cameras = read_intrinsics_binary(str(cameras_bin))
+            images = read_extrinsics_binary(str(images_bin))
+            xyzs, rgbs, errors = read_points3D_binary(str(points3d_bin))
+            
+            print(f"    📊 기준 reconstruction:")
+            print(f"      카메라: {len(cameras)}개")
+            print(f"      이미지: {len(images)}개")
+            print(f"      3D 포인트: {len(xyzs)}개")
+            
+            # 다른 reconstruction에서 추가 데이터 수집 (ID 충돌 방지)
+            additional_images = {}
+            additional_xyzs = []
+            additional_rgbs = []
             
             for i, reconstruction_path in enumerate(reconstruction_paths):
-                print(f"      Reconstruction {i}: {reconstruction_path}")
+                if reconstruction_path == best_reconstruction:
+                    continue
+                
+                print(f"      추가 reconstruction {i}: {reconstruction_path}")
                 
                 # COLMAP reconstruction 파일들 확인
-                cameras_bin = reconstruction_path / "cameras.bin"
-                images_bin = reconstruction_path / "images.bin"
-                points3d_bin = reconstruction_path / "points3D.bin"
+                cameras_bin_other = reconstruction_path / "cameras.bin"
+                images_bin_other = reconstruction_path / "images.bin"
+                points3d_bin_other = reconstruction_path / "points3D.bin"
                 
-                if not all([cameras_bin.exists(), images_bin.exists(), points3d_bin.exists()]):
+                if not all([cameras_bin_other.exists(), images_bin_other.exists(), points3d_bin_other.exists()]):
                     print(f"        ⚠️  파일 누락, 건너뜀")
                     continue
                 
-                # 카메라 내부 파라미터 읽기
-                cameras = read_intrinsics_binary(str(cameras_bin))
-                print(f"        카메라 내부 파라미터: {len(cameras)}개")
-                
-                # 이미지 외부 파라미터 읽기
-                images = read_extrinsics_binary(str(images_bin))
-                print(f"        이미지 외부 파라미터: {len(images)}개")
-                
-                # 3D 포인트 읽기
-                xyzs, rgbs, errors = read_points3D_binary(str(points3d_bin))
-                print(f"        3D 포인트: {len(xyzs)}개")
-                
-                # 데이터 병합 (ID 충돌 방지)
-                offset = len(all_cameras)
-                for cam_id, camera in cameras.items():
-                    all_cameras[cam_id + offset] = camera
-                
-                for img_id, image in images.items():
-                    all_images[img_id + offset] = image
-                
-                all_xyzs.extend(xyzs)
-                all_rgbs.extend(rgbs)
-                all_errors.extend(errors)
+                try:
+                    # 추가 이미지 읽기
+                    images_other = read_extrinsics_binary(str(images_bin_other))
+                    xyzs_other, rgbs_other, _ = read_points3D_binary(str(points3d_bin_other))
+                    
+                    print(f"        추가 이미지: {len(images_other)}개")
+                    print(f"        추가 포인트: {len(xyzs_other)}개")
+                    
+                    # ID 충돌 방지를 위한 오프셋 계산
+                    max_image_id = max(images.keys()) if images else 0
+                    offset = max_image_id + 1000  # 충분한 간격
+                    
+                    # 추가 이미지 (ID 충돌 방지)
+                    for img_id, image in images_other.items():
+                        new_img_id = img_id + offset
+                        additional_images[new_img_id] = image
+                    
+                    # 추가 포인트 (좌표계 정규화)
+                    if len(xyzs_other) > 0:
+                        # 기준 reconstruction의 중심과 스케일 계산
+                        center = np.mean(xyzs, axis=0)
+                        scale = np.std(xyzs, axis=0).max()
+                        
+                        # 추가 포인트를 기준 좌표계로 정규화
+                        xyzs_normalized = (xyzs_other - np.mean(xyzs_other, axis=0)) / np.std(xyzs_other, axis=0).max()
+                        xyzs_scaled = xyzs_normalized * scale + center
+                        
+                        additional_xyzs.extend(xyzs_scaled)
+                        additional_rgbs.extend(rgbs_other)
+                        
+                except Exception as e:
+                    print(f"        ⚠️  추가 reconstruction 처리 실패: {e}")
+                    continue
             
-            print(f"    📊 병합 결과:")
-            print(f"      총 카메라: {len(all_cameras)}개")
+            # 모든 데이터 병합
+            all_images = {**images, **additional_images}
+            all_xyzs = list(xyzs) + additional_xyzs
+            all_rgbs = list(rgbs) + additional_rgbs
+            
+            print(f"    📊 최종 병합 결과:")
             print(f"      총 이미지: {len(all_images)}개")
             print(f"      총 3D 포인트: {len(all_xyzs)}개")
             
@@ -2035,8 +2275,8 @@ class SuperGlueCOLMAPHybrid:
                 
                 image_path = image_name_to_path[image_name]
                 
-                # 카메라 내부 파라미터
-                camera = all_cameras[image.camera_id]
+                # 카메라 내부 파라미터 (기준 reconstruction 사용)
+                camera = cameras[image.camera_id]
                 width, height = camera.width, camera.height
                 
                 # PINHOLE 모델 가정
@@ -2083,7 +2323,6 @@ class SuperGlueCOLMAPHybrid:
             if all_xyzs:
                 all_xyzs = np.array(all_xyzs)
                 all_rgbs = np.array(all_rgbs)
-                all_errors = np.array(all_errors)
                 
                 point_cloud = BasicPointCloud(
                     points=all_xyzs.astype(np.float32),
