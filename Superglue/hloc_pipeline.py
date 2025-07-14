@@ -172,11 +172,11 @@ class HlocPipeline:
             # SuperPoint면 SuperGlue, SIFT면 NN-mutual
             if self.superpoint_available:
                 matcher_conf = 'superglue'
-                matcher_file = 'matches-superglue.h5'
+                matcher_file = f'{feature_file}_matches-superglue_pairs.h5'  # Hloc의 실제 파일명 형식
                 print("Using SuperGlue matcher")
             else:
                 matcher_conf = 'NN-mutual'
-                matcher_file = 'matches-NN-mutual.h5'
+                matcher_file = f'{feature_file}_matches-NN-mutual_pairs.h5'  # Hloc의 실제 파일명 형식
                 print("Using NN-mutual matcher")
             
             # 매칭 명령어 수정 (경로 문제 해결)
@@ -209,7 +209,7 @@ class HlocPipeline:
                 '--image_dir', str(image_dir),
                 '--pairs', str(pairs_path),
                 '--features', str(output_path / (feature_file + '.h5')),  # .h5 확장자 추가
-                '--matches', str(output_path / matcher_file),   # .h5 파일 경로
+                '--matches', str(output_path / matcher_file),   # Hloc의 실제 파일명 형식
                 '--camera_mode', 'SINGLE'
             ]
             
