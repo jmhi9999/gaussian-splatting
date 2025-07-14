@@ -1016,28 +1016,28 @@ class SuperGlueCOLMAPHybrid:
             print(f"  ✗ COLMAP 매칭 오류: {e}")
 
     def _run_colmap_mapper_fast(self, database_path, image_path, output_path):
-        """빠른 COLMAP 매퍼 - 매우 관대한 설정"""
+        """빠른 COLMAP 매퍼 - 여러 reconstruction 생성"""
         print("  ⚡ 빠른 COLMAP 매퍼...")
         
-        # 매우 관대한 설정으로 COLMAP 매퍼 실행
+        # 여러 reconstruction을 생성하는 COLMAP 매퍼 실행
         base_cmd = [
             self.colmap_exe, "mapper",
             "--database_path", str(database_path),
             "--image_path", str(image_path),
             "--output_path", str(output_path),
             
-            # 📉 매우 관대한 설정
-            "--Mapper.min_num_matches", "1",              # 2 → 1 (최소 1개 매칭)
-            "--Mapper.init_min_num_inliers", "2",         # 3 → 2 (최소 2개 inlier)
-            "--Mapper.abs_pose_min_num_inliers", "1",     # 2 → 1 (최소 1개 inlier)
-            "--Mapper.filter_max_reproj_error", "100.0",  # 50.0 → 100.0 (매우 큰 허용 오차)
+            # 📉 관대한 설정
+            "--Mapper.min_num_matches", "1",              # 최소 1개 매칭
+            "--Mapper.init_min_num_inliers", "2",         # 최소 2개 inlier
+            "--Mapper.abs_pose_min_num_inliers", "1",     # 최소 1개 inlier
+            "--Mapper.filter_max_reproj_error", "100.0",  # 매우 큰 허용 오차
             "--Mapper.ba_refine_focal_length", "0",       # 초점거리 고정
             "--Mapper.ba_refine_principal_point", "0",    # 주점 고정
             "--Mapper.ba_refine_extra_params", "0",       # 추가 파라미터 고정
             
-            # 🚀 성능 개선
-            "--Mapper.max_num_models", "1",               # 단일 모델만
-            "--Mapper.min_model_size", "1",               # 2 → 1 (최소 1장 이미지)
+            # 🚀 여러 reconstruction 생성
+            "--Mapper.max_num_models", "5",               # 1 → 5 (최대 5개 모델)
+            "--Mapper.min_model_size", "1",               # 최소 1장 이미지
         ]
         
         print(f"    명령: {' '.join(base_cmd)}")
@@ -1058,18 +1058,22 @@ class SuperGlueCOLMAPHybrid:
                 if output_path.exists():
                     # 모든 하위 디렉토리와 파일 확인
                     all_items = []
+                    reconstruction_count = 0
                     for root, dirs, files in os.walk(output_path):
                         for dir_name in dirs:
-                            all_items.append(f"📁 {Path(root).name}/{dir_name}")
+                            if dir_name.isdigit():  # reconstruction 디렉토리
+                                reconstruction_count += 1
+                                all_items.append(f"📁 {Path(root).name}/{dir_name}")
                         for file_name in files:
                             if file_name.endswith('.bin'):
                                 all_items.append(f"📄 {Path(root).name}/{file_name}")
                     
+                    print(f"    발견된 reconstruction: {reconstruction_count}개")
                     print(f"    발견된 항목: {len(all_items)}개")
-                    for item in all_items[:10]:  # 처음 10개만 출력
+                    for item in all_items[:15]:  # 처음 15개만 출력
                         print(f"      {item}")
-                    if len(all_items) > 10:
-                        print(f"      ... 및 {len(all_items) - 10}개 더")
+                    if len(all_items) > 15:
+                        print(f"      ... 및 {len(all_items) - 15}개 더")
                 
                 return True
             else:
@@ -1652,7 +1656,7 @@ class SuperGlueCOLMAPHybrid:
             return False
 
     def _convert_to_3dgs_format(self, output_path, image_paths):
-        """3DGS 형식으로 변환 - COLMAP reconstruction 필수"""
+        """3DGS 형식으로 변환 - 여러 reconstruction 사용"""
         print("  🔧 3DGS SceneInfo 생성 중...")
         
         try:
@@ -1663,29 +1667,34 @@ class SuperGlueCOLMAPHybrid:
             # sparse 디렉토리 확인
             sparse_dir = output_path / "sparse"
             
-            # 하위 디렉토리 포함하여 reconstruction 찾기
-            reconstruction_path = None
+            # 모든 reconstruction 찾기
+            reconstruction_paths = []
             if sparse_dir.exists():
                 # 모든 하위 디렉토리 확인
                 all_dirs = [d for d in sparse_dir.iterdir() if d.is_dir()]
-                if all_dirs:
-                    # 첫 번째 디렉토리 사용
-                    reconstruction_path = all_dirs[0]
-                    print(f"    COLMAP reconstruction 발견: {reconstruction_path}")
-                else:
-                    # sparse_dir 자체가 reconstruction일 수 있음
+                for recon_dir in all_dirs:
+                    bin_files = list(recon_dir.glob("*.bin"))
+                    if len(bin_files) >= 3:  # cameras.bin, images.bin, points3D.bin
+                        reconstruction_paths.append(recon_dir)
+                        print(f"    COLMAP reconstruction 발견: {recon_dir}")
+                
+                # sparse_dir 자체도 reconstruction일 수 있음
+                if not reconstruction_paths:
                     bin_files = list(sparse_dir.glob("*.bin"))
-                    if bin_files:
-                        reconstruction_path = sparse_dir
-                        print(f"    COLMAP reconstruction 발견: {reconstruction_path}")
+                    if len(bin_files) >= 3:
+                        reconstruction_paths.append(sparse_dir)
+                        print(f"    COLMAP reconstruction 발견: {sparse_dir}")
             
-            if reconstruction_path:
-                # 실제 COLMAP 결과 사용 시도
+            if reconstruction_paths:
+                print(f"    총 {len(reconstruction_paths)}개의 reconstruction 발견")
+                
+                # 모든 reconstruction을 병합하여 사용
                 try:
-                    return self._parse_colmap_reconstruction(reconstruction_path, image_paths, output_path)
+                    return self._parse_multiple_colmap_reconstructions(reconstruction_paths, image_paths, output_path)
                 except Exception as e:
-                    print(f"    COLMAP reconstruction 파싱 실패: {e}")
-                    raise RuntimeError("COLMAP reconstruction 파싱 실패 - SceneInfo fallback 방지")
+                    print(f"    여러 reconstruction 파싱 실패: {e}")
+                    # 첫 번째 reconstruction만 사용
+                    return self._parse_colmap_reconstruction(reconstruction_paths[0], image_paths, output_path)
             else:
                 raise RuntimeError("COLMAP reconstruction 없음 - SceneInfo fallback 방지")
             
@@ -1943,6 +1952,208 @@ class SuperGlueCOLMAPHybrid:
             print(f"  ⚠️  SceneInfo 검증 오류: {e}")
             print("  💡 하지만 계속 진행합니다...")
             return True  # 오류가 발생해도 계속 진행
+
+    def _parse_multiple_colmap_reconstructions(self, reconstruction_paths, image_paths, output_path):
+        """여러 COLMAP reconstruction 병합"""
+        print(f"    여러 COLMAP reconstruction 병합: {len(reconstruction_paths)}개")
+        
+        try:
+            from scene.colmap_loader import read_intrinsics_binary, read_extrinsics_binary, read_points3D_binary
+            from utils.graphics_utils import BasicPointCloud
+            from scene.dataset_readers import CameraInfo, SceneInfo
+            
+            # 모든 reconstruction에서 데이터 수집
+            all_cameras = {}
+            all_images = {}
+            all_xyzs = []
+            all_rgbs = []
+            all_errors = []
+            
+            for i, reconstruction_path in enumerate(reconstruction_paths):
+                print(f"      Reconstruction {i}: {reconstruction_path}")
+                
+                # COLMAP reconstruction 파일들 확인
+                cameras_bin = reconstruction_path / "cameras.bin"
+                images_bin = reconstruction_path / "images.bin"
+                points3d_bin = reconstruction_path / "points3D.bin"
+                
+                if not all([cameras_bin.exists(), images_bin.exists(), points3d_bin.exists()]):
+                    print(f"        ⚠️  파일 누락, 건너뜀")
+                    continue
+                
+                # 카메라 내부 파라미터 읽기
+                cameras = read_intrinsics_binary(str(cameras_bin))
+                print(f"        카메라 내부 파라미터: {len(cameras)}개")
+                
+                # 이미지 외부 파라미터 읽기
+                images = read_extrinsics_binary(str(images_bin))
+                print(f"        이미지 외부 파라미터: {len(images)}개")
+                
+                # 3D 포인트 읽기
+                xyzs, rgbs, errors = read_points3D_binary(str(points3d_bin))
+                print(f"        3D 포인트: {len(xyzs)}개")
+                
+                # 데이터 병합 (ID 충돌 방지)
+                offset = len(all_cameras)
+                for cam_id, camera in cameras.items():
+                    all_cameras[cam_id + offset] = camera
+                
+                for img_id, image in images.items():
+                    all_images[img_id + offset] = image
+                
+                all_xyzs.extend(xyzs)
+                all_rgbs.extend(rgbs)
+                all_errors.extend(errors)
+            
+            print(f"    📊 병합 결과:")
+            print(f"      총 카메라: {len(all_cameras)}개")
+            print(f"      총 이미지: {len(all_images)}개")
+            print(f"      총 3D 포인트: {len(all_xyzs)}개")
+            
+            if len(all_images) == 0:
+                raise RuntimeError("병합된 이미지가 없습니다")
+            
+            # SceneInfo 생성
+            train_cameras = []
+            test_cameras = []
+            
+            # 이미지 경로 매핑 생성
+            image_name_to_path = {}
+            sorted_image_paths = sorted(image_paths, key=lambda x: x.name)
+            
+            for i, path in enumerate(sorted_image_paths):
+                colmap_name = f"image_{i:04d}.jpg"
+                image_name_to_path[colmap_name] = path
+            
+            successful_cameras = 0
+            for image_id, image in all_images.items():
+                # 이미지 파일 경로 찾기
+                image_name = image.name
+                if image_name not in image_name_to_path:
+                    print(f"      ⚠️  이미지 경로 없음: {image_name}")
+                    continue
+                
+                image_path = image_name_to_path[image_name]
+                
+                # 카메라 내부 파라미터
+                camera = all_cameras[image.camera_id]
+                width, height = camera.width, camera.height
+                
+                # PINHOLE 모델 가정
+                if len(camera.params) == 4:
+                    fx, fy, cx, cy = camera.params
+                    focal_length = (fx + fy) / 2.0
+                    fov_x = 2 * np.arctan(width / (2 * fx))
+                    fov_y = 2 * np.arctan(height / (2 * fy))
+                else:
+                    focal_length = max(width, height) * 1.2
+                    fov_x = 2 * np.arctan(width / (2 * focal_length))
+                    fov_y = 2 * np.arctan(height / (2 * focal_length))
+                
+                # 외부 파라미터
+                R = image.qvec2rotmat()
+                T = image.tvec
+                
+                # CameraInfo 생성
+                cam_info = CameraInfo(
+                    uid=image_id,
+                    R=R,
+                    T=T,
+                    FovY=fov_y,
+                    FovX=fov_x,
+                    depth_params=None,
+                    image_path=str(image_path),
+                    image_name=image_name,
+                    depth_path="",
+                    width=width,
+                    height=height,
+                    is_test=(image_id % 8 == 0)
+                )
+                
+                if cam_info.is_test:
+                    test_cameras.append(cam_info)
+                else:
+                    train_cameras.append(cam_info)
+                
+                successful_cameras += 1
+            
+            print(f"      ✅ 성공적으로 처리된 카메라: {successful_cameras}개")
+            
+            # 포인트 클라우드 생성
+            if all_xyzs:
+                all_xyzs = np.array(all_xyzs)
+                all_rgbs = np.array(all_rgbs)
+                all_errors = np.array(all_errors)
+                
+                point_cloud = BasicPointCloud(
+                    points=all_xyzs.astype(np.float32),
+                    colors=all_rgbs.astype(np.float32) / 255.0,
+                    normals=np.zeros_like(all_xyzs, dtype=np.float32)
+                )
+            else:
+                # 기본 포인트 클라우드 생성
+                n_points = 2000
+                xyz = np.random.randn(n_points, 3).astype(np.float32) * 2.0
+                rgb = np.random.rand(n_points, 3).astype(np.float32)
+                normals = np.random.randn(n_points, 3).astype(np.float32)
+                normals = normals / (np.linalg.norm(normals, axis=1, keepdims=True) + 1e-8)
+                
+                point_cloud = BasicPointCloud(
+                    points=xyz,
+                    colors=rgb,
+                    normals=normals
+                )
+            
+            # NeRF 정규화 계산
+            cam_centers = []
+            for cam in train_cameras:
+                cam_center = -np.dot(cam.R.T, cam.T)
+                cam_centers.append(cam_center)
+            
+            if cam_centers:
+                cam_centers = np.array(cam_centers)
+                center = np.mean(cam_centers, axis=0)
+                distances = np.linalg.norm(cam_centers - center, axis=1)
+                radius = np.max(distances) * 1.1
+            else:
+                center = np.zeros(3)
+                radius = 5.0
+            
+            nerf_normalization = {
+                "translate": -center,
+                "radius": radius
+            }
+            
+            # PLY 파일 저장
+            ply_path = output_path / "points3D.ply"
+            if all_xyzs:
+                self._save_basic_ply(ply_path, all_xyzs, all_rgbs / 255.0)
+            else:
+                self._save_basic_ply(ply_path, xyz, rgb)
+            
+            # SceneInfo 생성
+            scene_info = SceneInfo(
+                point_cloud=point_cloud,
+                train_cameras=train_cameras,
+                test_cameras=test_cameras,
+                nerf_normalization=nerf_normalization,
+                ply_path=str(ply_path),
+                is_nerf_synthetic=False
+            )
+            
+            print(f"    ✅ 여러 reconstruction 병합 성공!")
+            print(f"      Train cameras: {len(train_cameras)}")
+            print(f"      Test cameras: {len(test_cameras)}")
+            print(f"      Point cloud: {len(point_cloud.points)} points")
+            print(f"      Scene radius: {radius:.3f}")
+            
+            return scene_info
+            
+        except Exception as e:
+            print(f"    ❌ 여러 reconstruction 병합 실패: {e}")
+            import traceback
+            traceback.print_exc()
+            raise RuntimeError(f"여러 reconstruction 병합 실패: {e}")
 
 # 사용 예시
 if __name__ == "__main__":
