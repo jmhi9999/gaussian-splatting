@@ -402,44 +402,108 @@ class SuperGlue3DGSPipeline:
             # 6. 3DGS SceneInfo 생성
             scene_info = self._create_3dgs_scene_info(image_paths)
             
-            # 7. 3DGS 형식으로 저장
-            self._save_3dgs_format(scene_info, output_dir)
+            # 7. 3DGS 형식으로 저장 (안전한 방법)
+            try:
+                self._save_3dgs_format(scene_info, output_dir)
+            except Exception as save_error:
+                print(f"    Warning: Failed to save 3DGS format: {save_error}")
+                # 기본 텍스트 파일만 저장
+                self._save_basic_format(scene_info, output_dir)
             
             return scene_info
             
         except Exception as e:
             print(f"    Hybrid processing failed: {e}")
+            import traceback
+            traceback.print_exc()
             print("    Falling back to SuperGlue only")
             return self._process_superglue_only(image_paths, output_dir)
+    
+    def _save_basic_format(self, scene_info, output_dir):
+        """기본 텍스트 파일만 저장 (fallback)"""
+        output_dir = Path(output_dir)
+        output_dir.mkdir(exist_ok=True, parents=True)
+        
+        sparse_dir = output_dir / "sparse" / "0"
+        sparse_dir.mkdir(exist_ok=True, parents=True)
+        
+        images_dir = output_dir / "images"
+        images_dir.mkdir(exist_ok=True)
+        
+        # 텍스트 파일만 저장
+        self._write_cameras_txt(scene_info.train_cameras + scene_info.test_cameras, 
+                               sparse_dir / "cameras.txt")
+        self._write_images_txt(scene_info.train_cameras + scene_info.test_cameras, 
+                              sparse_dir / "images.txt")
+        self._write_points3d_ply(scene_info.point_cloud, sparse_dir / "points3D.ply")
+        
+        print(f"    Saved basic format to {output_dir}")
     
     def _load_colmap_reconstruction(self, output_dir):
         """COLMAP reconstruction 로드"""
         try:
             reconstruction_path = Path(output_dir) / "sparse" / "0"
+            print(f"    Checking reconstruction path: {reconstruction_path}")
+            
+            # 파일 존재 확인
+            cameras_bin = reconstruction_path / "cameras.bin"
+            images_bin = reconstruction_path / "images.bin"
+            points3d_bin = reconstruction_path / "points3D.bin"
+            
+            print(f"    cameras.bin exists: {cameras_bin.exists()}")
+            print(f"    images.bin exists: {images_bin.exists()}")
+            print(f"    points3D.bin exists: {points3d_bin.exists()}")
+            
+            if not cameras_bin.exists() or not images_bin.exists() or not points3d_bin.exists():
+                print("    Missing required COLMAP files")
+                return None
+            
+            # 파일 크기 확인
+            print(f"    cameras.bin size: {cameras_bin.stat().st_size} bytes")
+            print(f"    images.bin size: {images_bin.stat().st_size} bytes")
+            print(f"    points3D.bin size: {points3d_bin.stat().st_size} bytes")
             
             # COLMAP 모듈 import
             try:
                 from scene.colmap_loader import read_intrinsics_binary, read_extrinsics_binary, read_points3D_binary
-            except ImportError:
-                print("    COLMAP loader not available")
+                print("    COLMAP loader imported successfully")
+            except ImportError as e:
+                print(f"    COLMAP loader import failed: {e}")
                 return None
             
             # 카메라 내부 파라미터 로드
-            cameras_bin = reconstruction_path / "cameras.bin"
-            cameras = read_intrinsics_binary(str(cameras_bin))
+            print("    Loading cameras.bin...")
+            try:
+                cameras = read_intrinsics_binary(str(cameras_bin))
+                print(f"    Loaded {len(cameras)} cameras")
+            except Exception as e:
+                print(f"    Failed to load cameras.bin: {e}")
+                return None
             
             # 카메라 외부 파라미터 로드
-            images_bin = reconstruction_path / "images.bin"
-            images = read_extrinsics_binary(str(images_bin))
+            print("    Loading images.bin...")
+            try:
+                images = read_extrinsics_binary(str(images_bin))
+                print(f"    Loaded {len(images)} images")
+            except Exception as e:
+                print(f"    Failed to load images.bin: {e}")
+                return None
             
             # 3D 포인트 로드
-            points3d_bin = reconstruction_path / "points3D.bin"
-            points3d = read_points3D_binary(str(points3d_bin))
+            print("    Loading points3D.bin...")
+            try:
+                points3d = read_points3D_binary(str(points3d_bin))
+                print(f"    Loaded {len(points3d)} 3D points")
+            except Exception as e:
+                print(f"    Failed to load points3D.bin: {e}")
+                return None
             
             return cameras, images, points3d
             
         except Exception as e:
             print(f"    Failed to load COLMAP reconstruction: {e}")
+            import traceback
+            traceback.print_exc()
             return None
     
     def _convert_colmap_to_superglue_format(self, cameras, images, points3d, image_paths):
@@ -1896,26 +1960,45 @@ class SuperGlue3DGSPipeline:
             cameras_bin = reconstruction_path / "cameras.bin"
             
             if not cameras_bin.exists():
+                print(f"    cameras.bin not found at {cameras_bin}")
                 return None
             
+            # 파일 크기 확인
+            file_size = cameras_bin.stat().st_size
+            if file_size == 0:
+                print(f"    cameras.bin is empty")
+                return None
+            
+            print(f"    Reading COLMAP intrinsics from {cameras_bin} ({file_size} bytes)")
+            
             # COLMAP reconstruction 파싱
-            from scene.colmap_loader import read_intrinsics_binary
-            cameras = read_intrinsics_binary(str(cameras_bin))
-            
-            # 이미지 ID와 카메라 ID 매핑
-            images_bin = reconstruction_path / "images.bin"
-            if images_bin.exists():
-                from scene.colmap_loader import read_extrinsics_binary
-                images = read_extrinsics_binary(str(images_bin))
+            try:
+                from scene.colmap_loader import read_intrinsics_binary
+                cameras = read_intrinsics_binary(str(cameras_bin))
+                print(f"    Successfully loaded {len(cameras)} cameras from COLMAP")
                 
-                # 이미지 ID -> 카메라 ID 매핑
-                image_to_camera = {}
-                for image_id, image in images.items():
-                    image_to_camera[image_id] = image.camera_id
+                # 이미지 ID와 카메라 ID 매핑
+                images_bin = reconstruction_path / "images.bin"
+                if images_bin.exists():
+                    try:
+                        from scene.colmap_loader import read_extrinsics_binary
+                        images = read_extrinsics_binary(str(images_bin))
+                        
+                        # 이미지 ID -> 카메라 ID 매핑
+                        image_to_camera = {}
+                        for image_id, image in images.items():
+                            image_to_camera[image_id] = image.camera_id
+                        
+                        return image_to_camera, cameras
+                    except Exception as e:
+                        print(f"    Failed to read images.bin: {e}")
+                        return None
                 
-                return image_to_camera, cameras
-            
-            return None
+                return None
+                
+            except Exception as e:
+                print(f"    Failed to read cameras.bin: {e}")
+                return None
             
         except Exception as e:
             print(f"    COLMAP intrinsics 읽기 실패: {e}")
