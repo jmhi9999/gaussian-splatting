@@ -9,6 +9,7 @@ from pathlib import Path
 import shutil
 import json
 from typing import List, Optional, Tuple, Dict, Any
+import random
 
 class SuperGlueCOLMAPHybrid:
     def __init__(self, 
@@ -866,8 +867,8 @@ class SuperGlueCOLMAPHybrid:
             return None
 
     def _run_superpoint_only_matching(self, image_paths, database_path):
-        """SuperPoint만 사용한 매칭 - exhaustive로 변경"""
-        print("  🔥 SuperPoint-only exhaustive 매칭 중...")
+        """SuperPoint만 사용한 매칭 - 하이브리드 쌍 선택"""
+        print("  🔥 SuperPoint-only 하이브리드 매칭 중...")
         
         try:
             conn = sqlite3.connect(str(database_path))
@@ -887,32 +888,33 @@ class SuperGlueCOLMAPHybrid:
                 except:
                     continue
             
-            # exhaustive 매칭
+            # 하이브리드 쌍 생성
+            matching_pairs = self._generate_matching_pairs(image_paths)
+            print(f"    {len(image_paths)}장 이미지에서 {len(matching_pairs)}개 하이브리드 쌍 매칭 수행 (sequential+random+partial exhaustive)...")
+            
             successful_matches = 0
             total_pairs = 0
-            n = len(image_paths)
-            for i in range(n):
-                for j in range(i+1, n):
-                    total_pairs += 1
-                    print(f"        🔍 SuperPoint-only 매칭: {image_paths[i].name} ↔ {image_paths[j].name}")
-                    matches = self._match_single_pair_superpoint_only(image_paths[i], image_paths[j])
-                    if matches is not None and len(matches) >= 10:
-                        if i in image_id_map and j in image_id_map:
-                            pair_id = image_id_map[i] * 2147483647 + image_id_map[j]
-                            cursor.execute(
-                                "INSERT INTO matches (pair_id, rows, cols, data) VALUES (?, ?, ?, ?)",
-                                (pair_id, len(matches), 2, matches.tobytes())
-                            )
-                            cursor.execute(
-                                "INSERT INTO two_view_geometries (pair_id, rows, cols, data, config) VALUES (?, ?, ?, ?, ?)",
-                                (pair_id, len(matches), 2, matches.tobytes(), 2)
-                            )
-                            print(f"        ✅ {len(matches)}개 매칭 저장")
-                            successful_matches += 1
-                        else:
-                            print(f"        ❌ 이미지 ID 매핑 실패")
+            for i, j in matching_pairs:
+                total_pairs += 1
+                print(f"        🔍 SuperPoint-only 매칭: {image_paths[i].name} ↔ {image_paths[j].name}")
+                matches = self._match_single_pair_superpoint_only(image_paths[i], image_paths[j])
+                if matches is not None and len(matches) >= 10:
+                    if i in image_id_map and j in image_id_map:
+                        pair_id = image_id_map[i] * 2147483647 + image_id_map[j]
+                        cursor.execute(
+                            "INSERT INTO matches (pair_id, rows, cols, data) VALUES (?, ?, ?, ?)",
+                            (pair_id, len(matches), 2, matches.tobytes())
+                        )
+                        cursor.execute(
+                            "INSERT INTO two_view_geometries (pair_id, rows, cols, data, config) VALUES (?, ?, ?, ?, ?)",
+                            (pair_id, len(matches), 2, matches.tobytes(), 2)
+                        )
+                        print(f"        ✅ {len(matches)}개 매칭 저장")
+                        successful_matches += 1
                     else:
-                        print(f"        ❌ 매칭 실패 또는 부족")
+                        print(f"        ❌ 이미지 ID 매핑 실패")
+                else:
+                    print(f"        ❌ 매칭 실패 또는 부족")
             
             conn.commit()
             conn.close()
@@ -924,7 +926,7 @@ class SuperGlueCOLMAPHybrid:
                 self._run_colmap_matching_fast(database_path)
                 return True  # COLMAP 매칭은 성공으로 간주
             else:
-                print("    ✅ SuperPoint-only exhaustive 매칭 완료!")
+                print("    ✅ SuperPoint-only 하이브리드 매칭 완료!")
                 return True
                 
         except Exception as e:
@@ -967,6 +969,39 @@ class SuperGlueCOLMAPHybrid:
         except Exception as e:
             print(f"        ❌ SuperPoint-only 매칭 오류: {e}")
             return None
+
+    def _generate_matching_pairs(self, image_paths, seq_window=3, random_per_image=3, exhaustive_percent=0.05, seed=42):
+        import random
+        random.seed(seed)
+        n = len(image_paths)
+        pairs = set()
+        # Sequential
+        for i in range(n):
+            for w in range(1, seq_window+1):
+                j = i + w
+                if j < n:
+                    pairs.add((i, j))
+        # Random
+        for i in range(n):
+            candidates = list(set(range(n)) - {i})
+            random.shuffle(candidates)
+            count = 0
+            for j in candidates:
+                if i < j:
+                    pairs.add((i, j))
+                    count += 1
+                elif j < i:
+                    pairs.add((j, i))
+                    count += 1
+                if count >= random_per_image:
+                    break
+        # Partial exhaustive
+        all_pairs = [(i, j) for i in range(n) for j in range(i+1, n)]
+        random.shuffle(all_pairs)
+        num_exhaustive = int(len(all_pairs) * exhaustive_percent)
+        for i, j in all_pairs[:num_exhaustive]:
+            pairs.add((i, j))
+        return list(pairs)
 
     # 나머지 메서드들은 기존과 동일하게 유지...
     def process_images(self, image_dir: str, output_dir: str, max_images: int = 100):
@@ -1418,8 +1453,8 @@ class SuperGlueCOLMAPHybrid:
             return True  # 오류가 발생해도 계속 진행
 
     def _run_superglue_matching(self, image_paths, database_path):
-        """SuperGlue 매칭 - 실제 매칭 결과를 COLMAP DB에 저장 - 개선된 버전 (exhaustive)"""
-        print("  🔥 SuperGlue exhaustive 매칭 중...")
+        """SuperGlue 매칭 - 실제 매칭 결과를 COLMAP DB에 저장 - 하이브리드 쌍 선택"""
+        print("  🔥 SuperGlue 하이브리드 매칭 중...")
         
         if self.superglue is None:
             if self.superpoint is not None:
@@ -1443,46 +1478,41 @@ class SuperGlueCOLMAPHybrid:
             successful_matches = 0
             total_pairs = 0
             
-            print(f"    {len(image_paths)}장 이미지에서 exhaustive 매칭 수행...")
+            # 하이브리드 쌍 생성
+            matching_pairs = self._generate_matching_pairs(image_paths)
+            print(f"    {len(image_paths)}장 이미지에서 {len(matching_pairs)}개 하이브리드 쌍 매칭 수행 (sequential+random+partial exhaustive)...")
             
             # 이미지 ID 매핑 생성
             image_id_map = {}
             cursor.execute("SELECT image_id, name FROM images ORDER BY image_id")
             for image_id, name in cursor.fetchall():
-                # image_0000.jpg -> 0
                 try:
                     idx = int(name.split('_')[1].split('.')[0])
                     image_id_map[idx] = image_id
                 except:
                     continue
             
-            # 모든 쌍에 대해 매칭 (i < j)
-            n = len(image_paths)
-            for i in range(n):
-                for j in range(i+1, n):
-                    total_pairs += 1
-                    print(f"      매칭 {i}-{j}...")
-                    matches = self._match_single_pair(image_paths[i], image_paths[j])
-                    if matches is not None and len(matches) >= 10:  # 최소 10개 매칭
-                        # COLMAP DB에 저장
-                        if i in image_id_map and j in image_id_map:
-                            pair_id = image_id_map[i] * 2147483647 + image_id_map[j]  # COLMAP pair_id 형식
-                            # matches 테이블에 저장
-                            cursor.execute(
-                                "INSERT INTO matches (pair_id, rows, cols, data) VALUES (?, ?, ?, ?)",
-                                (pair_id, len(matches), 2, matches.tobytes())
-                            )
-                            # two_view_geometries 테이블에도 저장 (COLMAP 매퍼가 필요로 함)
-                            cursor.execute(
-                                "INSERT INTO two_view_geometries (pair_id, rows, cols, data, config) VALUES (?, ?, ?, ?, ?)",
-                                (pair_id, len(matches), 2, matches.tobytes(), 2)  # config=2는 기본값
-                            )
-                            print(f"        ✅ {len(matches)}개 매칭 저장 (pair_id: {pair_id})")
-                            successful_matches += 1
-                        else:
-                            print(f"        ❌ 이미지 ID 매핑 실패")
+            for i, j in matching_pairs:
+                total_pairs += 1
+                print(f"      매칭 {i}-{j}...")
+                matches = self._match_single_pair(image_paths[i], image_paths[j])
+                if matches is not None and len(matches) >= 10:  # 최소 10개 매칭
+                    if i in image_id_map and j in image_id_map:
+                        pair_id = image_id_map[i] * 2147483647 + image_id_map[j]  # COLMAP pair_id 형식
+                        cursor.execute(
+                            "INSERT INTO matches (pair_id, rows, cols, data) VALUES (?, ?, ?, ?)",
+                            (pair_id, len(matches), 2, matches.tobytes())
+                        )
+                        cursor.execute(
+                            "INSERT INTO two_view_geometries (pair_id, rows, cols, data, config) VALUES (?, ?, ?, ?, ?)",
+                            (pair_id, len(matches), 2, matches.tobytes(), 2)  # config=2는 기본값
+                        )
+                        print(f"        ✅ {len(matches)}개 매칭 저장 (pair_id: {pair_id})")
+                        successful_matches += 1
                     else:
-                        print(f"        ❌ 매칭 실패 또는 부족")
+                        print(f"        ❌ 이미지 ID 매핑 실패")
+                else:
+                    print(f"        ❌ 매칭 실패 또는 부족")
             
             conn.commit()
             conn.close()
@@ -1497,7 +1527,7 @@ class SuperGlueCOLMAPHybrid:
                 self._run_colmap_matching_fast(database_path)
                 return True  # COLMAP 매칭은 성공으로 간주
             else:
-                print("    ✅ SuperGlue exhaustive 매칭 완료!")
+                print("    ✅ SuperGlue 하이브리드 매칭 완료!")
                 return True
                 
         except Exception as e:
