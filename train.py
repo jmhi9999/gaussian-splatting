@@ -71,9 +71,13 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     # Early stopping variables
     best_test_psnr = 0.0
     best_iteration = 0
-    patience = 3  # Number of evaluations to wait before early stopping
+    patience = 2  # Number of evaluations to wait before early stopping (5 → 2, 더 빠른 중단)
     patience_counter = 0
-    early_stop_threshold = 0.5  # PSNR decrease threshold
+    early_stop_threshold = 0.1  # PSNR decrease threshold (0.3 → 0.1, 더 민감하게)
+    min_improvement = 0.05  # Minimum improvement to reset patience (0.1 → 0.05, 더 작은 개선도 허용)
+    
+    # Learning rate scheduling for regularization
+    reg_weight_scheduler = get_expon_lr_func(0.1, 0.01, max_steps=opt.iterations)  # Decreasing regularization weight
 
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
@@ -171,7 +175,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             
             # Early stopping logic
             if current_test_psnr is not None:
-                if current_test_psnr > best_test_psnr + early_stop_threshold:
+                if current_test_psnr > best_test_psnr + min_improvement:
                     best_test_psnr = current_test_psnr
                     best_iteration = iteration
                     patience_counter = 0
@@ -189,9 +193,29 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                             (model_params, _) = torch.load(best_checkpoint_path)
                             gaussians.restore(model_params, opt)
                             print(f"✅ Best model restored from iteration {best_iteration}")
+                        else:
+                            print(f"⚠️  Best checkpoint not found at {best_checkpoint_path}")
                         break
                 else:
-                    patience_counter = 0
+                    # Small improvement or no significant change
+                    if current_test_psnr > best_test_psnr:
+                        best_test_psnr = current_test_psnr
+                        best_iteration = iteration
+                    else:
+                        # Even small decrease increases patience counter
+                        patience_counter += 1
+                        if patience_counter >= patience:
+                            print(f"\n[ITER {iteration}] 🛑 Early stopping triggered! No improvement for {patience} evaluations.")
+                            print(f"Best PSNR was {best_test_psnr:.2f} at iteration {best_iteration}")
+                            # Load best checkpoint if available
+                            best_checkpoint_path = scene.model_path + "/chkpnt" + str(best_iteration) + ".pth"
+                            if os.path.exists(best_checkpoint_path):
+                                (model_params, _) = torch.load(best_checkpoint_path)
+                                gaussians.restore(model_params, opt)
+                                print(f"✅ Best model restored from iteration {best_iteration}")
+                            else:
+                                print(f"⚠️  Best checkpoint not found at {best_checkpoint_path}")
+                            break
             
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
