@@ -357,21 +357,64 @@ class SuperGlue3DGSPipeline:
             return self._create_fallback_scene_info(image_paths)
     
     def _check_colmap_reconstruction(self, output_dir):
-        """COLMAP reconstruction 존재 여부 확인"""
+        """COLMAP reconstruction 존재 여부 및 유효성 확인"""
         try:
             reconstruction_path = Path(output_dir) / "sparse" / "0"
             cameras_bin = reconstruction_path / "cameras.bin"
             images_bin = reconstruction_path / "images.bin"
+            points3d_bin = reconstruction_path / "points3D.bin"
             
-            if cameras_bin.exists() and images_bin.exists():
-                print(f"    Found COLMAP reconstruction at: {reconstruction_path}")
-                return True
-            else:
+            if not cameras_bin.exists() or not images_bin.exists():
                 print(f"    No COLMAP reconstruction found at: {reconstruction_path}")
                 return False
+            
+            # 파일 크기 확인
+            if cameras_bin.stat().st_size == 0 or images_bin.stat().st_size == 0:
+                print(f"    COLMAP files are empty, removing corrupted files")
+                self._cleanup_corrupted_colmap_files(reconstruction_path)
+                return False
+            
+            # 파일 형식 검증 시도
+            try:
+                from scene.colmap_loader import read_intrinsics_binary, read_extrinsics_binary
+                
+                # cameras.bin 검증
+                cameras = read_intrinsics_binary(str(cameras_bin))
+                if len(cameras) == 0:
+                    print(f"    cameras.bin is empty or corrupted")
+                    self._cleanup_corrupted_colmap_files(reconstruction_path)
+                    return False
+                
+                # images.bin 검증
+                images = read_extrinsics_binary(str(images_bin))
+                if len(images) == 0:
+                    print(f"    images.bin is empty or corrupted")
+                    self._cleanup_corrupted_colmap_files(reconstruction_path)
+                    return False
+                
+                print(f"    Found valid COLMAP reconstruction at: {reconstruction_path}")
+                print(f"    - {len(cameras)} cameras, {len(images)} images")
+                return True
+                
+            except Exception as e:
+                print(f"    COLMAP files are corrupted: {e}")
+                self._cleanup_corrupted_colmap_files(reconstruction_path)
+                return False
+                
         except Exception as e:
             print(f"    COLMAP reconstruction check failed: {e}")
             return False
+    
+    def _cleanup_corrupted_colmap_files(self, reconstruction_path):
+        """손상된 COLMAP 파일들 정리"""
+        try:
+            for file_name in ["cameras.bin", "images.bin", "points3D.bin"]:
+                file_path = reconstruction_path / file_name
+                if file_path.exists():
+                    file_path.unlink()
+                    print(f"    Deleted corrupted {file_name}")
+        except Exception as e:
+            print(f"    Failed to cleanup corrupted files: {e}")
     
     def _process_with_colmap_hybrid(self, image_paths, output_dir):
         """COLMAP reconstruction을 활용한 하이브리드 처리"""
@@ -407,6 +450,8 @@ class SuperGlue3DGSPipeline:
                 self._save_3dgs_format(scene_info, output_dir)
             except Exception as save_error:
                 print(f"    Warning: Failed to save 3DGS format: {save_error}")
+                import traceback
+                traceback.print_exc()
                 # 기본 텍스트 파일만 저장
                 self._save_basic_format(scene_info, output_dir)
             
@@ -1934,6 +1979,18 @@ class SuperGlue3DGSPipeline:
                     return K
         except Exception as e:
             print(f"    Camera {cam_id}: COLMAP intrinsics failed, using default: {e}")
+            # 손상된 COLMAP 파일들을 정리
+            try:
+                output_dir = getattr(self, 'output_dir', None)
+                if output_dir:
+                    reconstruction_path = Path(output_dir) / "sparse" / "0"
+                    for file_name in ["cameras.bin", "images.bin", "points3D.bin"]:
+                        file_path = reconstruction_path / file_name
+                        if file_path.exists():
+                            file_path.unlink()
+                            print(f"    Deleted corrupted {file_name}")
+            except Exception as cleanup_error:
+                print(f"    Failed to cleanup corrupted files: {cleanup_error}")
         
         # COLMAP이 없으면 기본 추정 사용
         focal = max(w, h) * 0.9  # 약간 보수적인 추정
@@ -2002,6 +2059,19 @@ class SuperGlue3DGSPipeline:
             
         except Exception as e:
             print(f"    COLMAP intrinsics 읽기 실패: {e}")
+            # 파일이 손상되었을 수 있으므로 삭제 시도
+            try:
+                if cameras_bin.exists():
+                    cameras_bin.unlink()
+                    print(f"    Deleted corrupted cameras.bin")
+                if images_bin.exists():
+                    images_bin.unlink()
+                    print(f"    Deleted corrupted images.bin")
+                if points3d_bin.exists():
+                    points3d_bin.unlink()
+                    print(f"    Deleted corrupted points3D.bin")
+            except Exception as del_error:
+                print(f"    Failed to delete corrupted files: {del_error}")
             return None
     
     def _triangulate_all_points_robust(self):
@@ -2827,21 +2897,19 @@ class SuperGlue3DGSPipeline:
                     focal_y = cam.height / (2 * np.tan(cam.FovY / 2))
                     cx, cy = cam.width / 2, cam.height / 2
                     
-                    # 카메라 ID
-                    f.write(struct.pack('<Q', cam.uid))
+                    # 카메라 ID (int)
+                    f.write(struct.pack('<i', cam.uid))
                     
-                    # 모델 이름 길이와 이름
-                    model_name = b'PINHOLE'
-                    f.write(struct.pack('<Q', len(model_name)))
-                    f.write(model_name)
+                    # 모델 ID (PINHOLE = 1)
+                    model_id = 1
+                    f.write(struct.pack('<i', model_id))
                     
-                    # 너비, 높이
+                    # 너비, 높이 (unsigned long long)
                     f.write(struct.pack('<Q', cam.width))
                     f.write(struct.pack('<Q', cam.height))
                     
-                    # 파라미터 수와 파라미터들
+                    # 파라미터들 (double)
                     params = [focal_x, focal_y, cx, cy]
-                    f.write(struct.pack('<Q', len(params)))
                     for param in params:
                         f.write(struct.pack('<d', param))
             
@@ -2849,6 +2917,8 @@ class SuperGlue3DGSPipeline:
             
         except Exception as e:
             print(f"    Error creating simple cameras.bin: {e}")
+            import traceback
+            traceback.print_exc()
     
     def _write_images_bin(self, cam_infos, output_path):
         """COLMAP 형식 images.bin 생성"""
