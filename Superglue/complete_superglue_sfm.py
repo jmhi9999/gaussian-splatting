@@ -290,7 +290,7 @@ class SuperGlue3DGSPipeline:
             torch.cuda.empty_cache()
     
     def process_images_to_3dgs(self, image_dir, output_dir, max_images=120):
-        """이미지들을 3DGS 형식으로 처리"""
+        """이미지들을 3DGS 형식으로 처리 - COLMAP 하이브리드 지원"""
         print(f"Processing images from {image_dir} to {output_dir}")
         
         try:
@@ -304,6 +304,14 @@ class SuperGlue3DGSPipeline:
             
             print(f"Found {len(image_paths)} images")
             self._monitor_memory()
+            
+            # 🔧 NEW: COLMAP reconstruction 확인 및 활용
+            colmap_available = self._check_colmap_reconstruction(output_dir)
+            if colmap_available:
+                print("  ✓ COLMAP reconstruction found - using hybrid approach")
+                return self._process_with_colmap_hybrid(image_paths, output_dir)
+            else:
+                print("  ⚠️  COLMAP reconstruction not found - using SuperGlue only")
             
             # 특징점 추출
             self._extract_all_features(image_paths)
@@ -347,6 +355,224 @@ class SuperGlue3DGSPipeline:
             # 실패시 fallback
             print("Falling back to simple camera arrangement...")
             return self._create_fallback_scene_info(image_paths)
+    
+    def _check_colmap_reconstruction(self, output_dir):
+        """COLMAP reconstruction 존재 여부 확인"""
+        try:
+            reconstruction_path = Path(output_dir) / "sparse" / "0"
+            cameras_bin = reconstruction_path / "cameras.bin"
+            images_bin = reconstruction_path / "images.bin"
+            
+            if cameras_bin.exists() and images_bin.exists():
+                print(f"    Found COLMAP reconstruction at: {reconstruction_path}")
+                return True
+            else:
+                print(f"    No COLMAP reconstruction found at: {reconstruction_path}")
+                return False
+        except Exception as e:
+            print(f"    COLMAP reconstruction check failed: {e}")
+            return False
+    
+    def _process_with_colmap_hybrid(self, image_paths, output_dir):
+        """COLMAP reconstruction을 활용한 하이브리드 처리"""
+        print("  🔄 Using COLMAP + SuperGlue hybrid approach")
+        
+        try:
+            # 1. COLMAP reconstruction 로드
+            colmap_data = self._load_colmap_reconstruction(output_dir)
+            if colmap_data is None:
+                print("    Failed to load COLMAP reconstruction, falling back to SuperGlue")
+                return self._process_superglue_only(image_paths, output_dir)
+            
+            cameras, images, points3d = colmap_data
+            print(f"    Loaded {len(cameras)} cameras, {len(images)} images, {len(points3d)} points from COLMAP")
+            
+            # 2. COLMAP 데이터를 SuperGlue 형식으로 변환
+            self._convert_colmap_to_superglue_format(cameras, images, points3d, image_paths)
+            
+            # 3. SuperGlue 특징점 추출 (COLMAP 포즈 개선용)
+            self._extract_all_features(image_paths)
+            
+            # 4. COLMAP 포즈를 기반으로 한 개선된 매칭
+            self._intelligent_matching_with_colmap_poses()
+            
+            # 5. Bundle Adjustment (COLMAP 초기값 사용)
+            self._bundle_adjustment_with_colmap_initialization()
+            
+            # 6. 3DGS SceneInfo 생성
+            scene_info = self._create_3dgs_scene_info(image_paths)
+            
+            # 7. 3DGS 형식으로 저장
+            self._save_3dgs_format(scene_info, output_dir)
+            
+            return scene_info
+            
+        except Exception as e:
+            print(f"    Hybrid processing failed: {e}")
+            print("    Falling back to SuperGlue only")
+            return self._process_superglue_only(image_paths, output_dir)
+    
+    def _load_colmap_reconstruction(self, output_dir):
+        """COLMAP reconstruction 로드"""
+        try:
+            reconstruction_path = Path(output_dir) / "sparse" / "0"
+            
+            # COLMAP 모듈 import
+            try:
+                from scene.colmap_loader import read_intrinsics_binary, read_extrinsics_binary, read_points3D_binary
+            except ImportError:
+                print("    COLMAP loader not available")
+                return None
+            
+            # 카메라 내부 파라미터 로드
+            cameras_bin = reconstruction_path / "cameras.bin"
+            cameras = read_intrinsics_binary(str(cameras_bin))
+            
+            # 카메라 외부 파라미터 로드
+            images_bin = reconstruction_path / "images.bin"
+            images = read_extrinsics_binary(str(images_bin))
+            
+            # 3D 포인트 로드
+            points3d_bin = reconstruction_path / "points3D.bin"
+            points3d = read_points3D_binary(str(points3d_bin))
+            
+            return cameras, images, points3d
+            
+        except Exception as e:
+            print(f"    Failed to load COLMAP reconstruction: {e}")
+            return None
+    
+    def _convert_colmap_to_superglue_format(self, cameras, images, points3d, image_paths):
+        """COLMAP 데이터를 SuperGlue 형식으로 변환"""
+        print("    Converting COLMAP data to SuperGlue format...")
+        
+        # 카메라 포즈 설정
+        for image_id, image_data in images.items():
+            if image_id < len(image_paths):
+                # COLMAP 포즈를 SuperGlue 형식으로 변환
+                R = image_data.qvec2rotmat()  # 쿼터니언을 회전 행렬로
+                T = image_data.tvec  # 이동 벡터
+                
+                # 카메라 내부 파라미터
+                camera_id = image_data.camera_id
+                if camera_id in cameras:
+                    camera = cameras[camera_id]
+                    K = self._colmap_camera_to_intrinsics(camera)
+                else:
+                    K = self._estimate_intrinsics(image_id)
+                
+                self.cameras[image_id] = {
+                    'R': R.astype(np.float32),
+                    'T': T.astype(np.float32),
+                    'K': K,
+                    'image_path': str(image_paths[image_id])
+                }
+        
+        print(f"    Converted {len(self.cameras)} camera poses from COLMAP")
+    
+    def _colmap_camera_to_intrinsics(self, camera):
+        """COLMAP 카메라를 내부 파라미터로 변환"""
+        if camera.model == "PINHOLE":
+            fx, fy, cx, cy = camera.params
+            K = np.array([
+                [fx, 0, cx],
+                [0, fy, cy],
+                [0, 0, 1]
+            ], dtype=np.float32)
+        else:
+            # 기본 PINHOLE 모델 사용
+            width, height = camera.width, camera.height
+            focal = max(width, height) * 0.9
+            cx, cy = width / 2, height / 2
+            K = np.array([
+                [focal, 0, cx],
+                [0, focal, cy],
+                [0, 0, 1]
+            ], dtype=np.float32)
+        
+        return K
+    
+    def _intelligent_matching_with_colmap_poses(self):
+        """COLMAP 포즈를 기반으로 한 개선된 매칭"""
+        print("    Using COLMAP poses for improved matching...")
+        
+        # COLMAP 포즈가 있으면 더 적극적인 매칭
+        n_images = len(self.image_features)
+        
+        # 전역 descriptors 계산
+        self._compute_global_descriptors()
+        
+        # COLMAP 포즈 기반 매칭 (더 적극적)
+        for i in range(n_images):
+            for j in range(i+1, n_images):
+                if i in self.cameras and j in self.cameras:
+                    # COLMAP 포즈 기반 유사도 계산
+                    pose_similarity = self._compute_pose_similarity(i, j)
+                    
+                    if pose_similarity > 0.1:  # 포즈가 유사한 경우
+                        matches = self._match_pair_superglue(i, j)
+                        if len(matches) > 1:
+                            self.matches[(i, j)] = matches
+                            self.camera_graph[i].append(j)
+                            self.camera_graph[j].append(i)
+    
+    def _compute_pose_similarity(self, cam_i, cam_j):
+        """두 카메라 포즈 간의 유사도 계산"""
+        try:
+            R_i, T_i = self.cameras[cam_i]['R'], self.cameras[cam_i]['T']
+            R_j, T_j = self.cameras[cam_j]['R'], self.cameras[cam_j]['T']
+            
+            # 회전 차이
+            R_diff = R_i @ R_j.T
+            rotation_error = np.arccos(np.clip((np.trace(R_diff) - 1) / 2, -1, 1))
+            
+            # 이동 차이
+            translation_error = np.linalg.norm(T_i - T_j)
+            
+            # 종합 유사도 (작을수록 유사)
+            similarity = 1.0 / (1.0 + rotation_error + translation_error * 0.1)
+            
+            return similarity
+            
+        except Exception:
+            return 0.0
+    
+    def _bundle_adjustment_with_colmap_initialization(self):
+        """COLMAP 초기값을 사용한 Bundle Adjustment"""
+        print("    Using COLMAP poses as initialization for Bundle Adjustment...")
+        
+        # COLMAP 포즈가 이미 있으므로 더 보수적인 BA
+        self._bundle_adjustment_robust(max_iterations=30)  # 반복 횟수 줄임
+    
+    def _process_superglue_only(self, image_paths, output_dir):
+        """SuperGlue만 사용한 처리 (기존 방식)"""
+        print("    Using SuperGlue-only processing...")
+        
+        # 특징점 추출
+        self._extract_all_features(image_paths)
+        
+        # 매칭
+        self._intelligent_matching()
+        
+        # 카메라 포즈 추정
+        self._estimate_camera_poses_robust()
+        
+        # 삼각측량
+        n_points = self._triangulate_all_points_robust()
+        
+        # Bundle Adjustment
+        self._bundle_adjustment_robust()
+        
+        # 품질 메트릭 계산
+        self._compute_quality_metrics()
+        
+        # 3DGS SceneInfo 생성
+        scene_info = self._create_3dgs_scene_info(image_paths)
+        
+        # 3DGS 형식으로 저장
+        self._save_3dgs_format(scene_info, output_dir)
+        
+        return scene_info
     
     def _compute_quality_metrics(self):
         """품질 메트릭 계산"""
@@ -672,7 +898,7 @@ class SuperGlue3DGSPipeline:
         print(f"  Generated random features for {len(self.image_features)} images")
     
     def _intelligent_matching(self, max_pairs=3000):
-        """지능적 이미지 매칭 (대폭 개선된 버전)"""
+        """지능적 이미지 매칭 (극도로 완화된 버전)"""
         n_images = len(self.image_features)
         
         # 전역 descriptors 계산
@@ -687,7 +913,7 @@ class SuperGlue3DGSPipeline:
             next_i = (i + 1) % n_images
             
             matches = self._match_pair_superglue(i, next_i)
-            if len(matches) > 2:  # 6 → 2로 대폭 완화
+            if len(matches) > 1:  # 2 → 1로 극도로 완화
                 self.matches[(i, next_i)] = matches
                 self.camera_graph[i].append(next_i)
                 self.camera_graph[next_i].append(i)
@@ -696,28 +922,28 @@ class SuperGlue3DGSPipeline:
         print(f"    Sequential pairs: {sequential_count}")
         
         # 2. 유사도 기반 매칭 (더 적극적으로)
-        similarity_count = self._similarity_based_matching_improved(max_pairs)
+        similarity_count = self._similarity_based_matching_very_relaxed(max_pairs)
         print(f"    Similarity pairs: {similarity_count}")
         
         # 3. Loop closure 매칭 (더 적극적으로)
-        loop_count = self._loop_closure_matching_improved()
+        loop_count = self._loop_closure_matching_very_relaxed()
         print(f"    Loop closure pairs: {loop_count}")
         
         # 4. 🔧 NEW: 그리드 기반 매칭 (연속된 이미지들 간의 연결)
-        grid_count = self._grid_based_matching()
+        grid_count = self._grid_based_matching_very_relaxed()
         print(f"    Grid-based pairs: {grid_count}")
         
         # 5. 🔧 NEW: 랜덤 샘플링 매칭 (연결되지 않은 카메라들을 위한 fallback)
-        random_count = self._random_sampling_matching(max_pairs)
+        random_count = self._random_sampling_matching_very_relaxed(max_pairs)
         print(f"    Random sampling pairs: {random_count}")
         
         print(f"  Total matching pairs: {len(self.matches)}")
         
         # 🔧 NEW: 연결성 분석 및 개선
-        self._analyze_and_improve_connectivity()
+        self._analyze_and_improve_connectivity_very_relaxed()
 
-    def _similarity_based_matching_improved(self, max_pairs):
-        """개선된 유사도 기반 매칭"""
+    def _similarity_based_matching_very_relaxed(self, max_pairs):
+        """극도로 완화된 유사도 기반 매칭"""
         # 유사도 행렬 계산
         n_images = len(self.global_descriptors)
         similarity_matrix = np.zeros((n_images, n_images))
@@ -729,13 +955,13 @@ class SuperGlue3DGSPipeline:
                     similarity_matrix[i, j] = sim
                     similarity_matrix[j, i] = sim
         
-        # 유사한 이미지들 매칭 (더 적극적으로)
+        # 유사한 이미지들 매칭 (극도로 적극적으로)
         similarity_count = 0
         for cam_id in range(n_images):
-            # 유사도 높은 상위 20개 선택 (12 → 20으로 증가)
+            # 유사도 높은 상위 30개 선택 (20 → 30으로 증가)
             similarities = similarity_matrix[cam_id]
             candidates = np.argsort(similarities)[::-1]
-            candidates = [c for c in candidates if c != cam_id and similarities[c] > 0.05][:20]  # 0.1 → 0.05로 완화
+            candidates = [c for c in candidates if c != cam_id and similarities[c] > 0.01][:30]  # 0.05 → 0.01로 극도로 완화
             
             for candidate in candidates:
                 pair_key = (min(cam_id, candidate), max(cam_id, candidate))
@@ -743,7 +969,7 @@ class SuperGlue3DGSPipeline:
                     continue
                 
                 matches = self._match_pair_superglue(cam_id, candidate)
-                if len(matches) > 2:  # 6 → 2로 대폭 완화
+                if len(matches) > 1:  # 2 → 1로 극도로 완화
                     self.matches[pair_key] = matches
                     self.camera_graph[cam_id].append(candidate)
                     self.camera_graph[candidate].append(cam_id)
@@ -754,14 +980,14 @@ class SuperGlue3DGSPipeline:
         
         return similarity_count
 
-    def _loop_closure_matching_improved(self):
-        """개선된 Loop closure 매칭"""
+    def _loop_closure_matching_very_relaxed(self):
+        """극도로 완화된 Loop closure 매칭"""
         n_images = len(self.image_features)
         loop_count = 0
         
         # 더 넓은 범위에서 loop closure 시도
-        for i in range(min(15, n_images//4)):  # 8 → 15로 증가
-            for j in range(max(n_images-15, 3*n_images//4), n_images):  # 8 → 15로 증가
+        for i in range(min(20, n_images//3)):  # 15 → 20으로 증가
+            for j in range(max(n_images-20, 2*n_images//3), n_images):  # 15 → 20으로 증가
                 if i >= j:
                     continue
                 
@@ -769,12 +995,12 @@ class SuperGlue3DGSPipeline:
                 if pair_key in self.matches:
                     continue
                 
-                # 전역 유사도 체크 (더 완화된 조건)
+                # 전역 유사도 체크 (극도로 완화된 조건)
                 if hasattr(self, 'global_descriptors') and i in self.global_descriptors and j in self.global_descriptors:
                     sim = np.dot(self.global_descriptors[i], self.global_descriptors[j])
-                    if sim > 0.1:  # 0.2 → 0.1로 완화
+                    if sim > 0.05:  # 0.1 → 0.05로 극도로 완화
                         matches = self._match_pair_superglue(i, j)
-                        if len(matches) > 2:  # 8 → 2로 대폭 완화
+                        if len(matches) > 1:  # 2 → 1로 극도로 완화
                             self.matches[pair_key] = matches
                             self.camera_graph[i].append(j)
                             self.camera_graph[j].append(i)
@@ -782,15 +1008,15 @@ class SuperGlue3DGSPipeline:
         
         return loop_count
 
-    def _grid_based_matching(self):
-        """그리드 기반 매칭 (NEW METHOD)"""
+    def _grid_based_matching_very_relaxed(self):
+        """극도로 완화된 그리드 기반 매칭"""
         n_images = len(self.image_features)
         grid_count = 0
         
         # 연속된 이미지들 간의 추가 연결
         for i in range(n_images - 1):
             # 인접한 이미지들
-            for offset in [1, 2, 3]:  # 1, 2, 3칸 떨어진 이미지들
+            for offset in [1, 2, 3, 4, 5]:  # 1, 2, 3 → 1, 2, 3, 4, 5로 증가
                 j = i + offset
                 if j >= n_images:
                     continue
@@ -800,7 +1026,7 @@ class SuperGlue3DGSPipeline:
                     continue
                 
                 matches = self._match_pair_superglue(i, j)
-                if len(matches) > 1:  # 4 → 1로 대폭 완화
+                if len(matches) > 1:  # 1 → 1로 유지 (이미 최소값)
                     self.matches[pair_key] = matches
                     self.camera_graph[i].append(j)
                     self.camera_graph[j].append(i)
@@ -808,8 +1034,8 @@ class SuperGlue3DGSPipeline:
         
         return grid_count
 
-    def _random_sampling_matching(self, max_pairs):
-        """랜덤 샘플링 매칭 (NEW METHOD)"""
+    def _random_sampling_matching_very_relaxed(self, max_pairs):
+        """극도로 완화된 랜덤 샘플링 매칭"""
         n_images = len(self.image_features)
         random_count = 0
         
@@ -833,7 +1059,7 @@ class SuperGlue3DGSPipeline:
                     continue
                 
                 matches = self._match_pair_superglue(cam_id, other_cam)
-                if len(matches) > 1:  # 4 → 1로 대폭 완화
+                if len(matches) > 1:  # 1 → 1로 유지 (이미 최소값)
                     self.matches[pair_key] = matches
                     self.camera_graph[cam_id].append(other_cam)
                     self.camera_graph[other_cam].append(cam_id)
@@ -842,8 +1068,8 @@ class SuperGlue3DGSPipeline:
         
         return random_count
 
-    def _analyze_and_improve_connectivity(self):
-        """연결성 분석 및 개선 (NEW METHOD)"""
+    def _analyze_and_improve_connectivity_very_relaxed(self):
+        """극도로 완화된 연결성 분석 및 개선"""
         n_images = len(self.image_features)
         
         # 연결성 분석
@@ -880,7 +1106,7 @@ class SuperGlue3DGSPipeline:
                 if best_connection is not None:
                     # 매칭 시도
                     matches = self._match_pair_superglue(isolated_cam, best_connection)
-                    if len(matches) > 1:  # 3 → 1로 대폭 완화
+                    if len(matches) > 1:  # 1 → 1로 유지 (이미 최소값)
                         pair_key = (min(isolated_cam, best_connection), max(isolated_cam, best_connection))
                         self.matches[pair_key] = matches
                         self.camera_graph[isolated_cam].append(best_connection)
@@ -1283,11 +1509,11 @@ class SuperGlue3DGSPipeline:
         print(f"  Total cameras with poses: {len(self.cameras)}")
     
     def _estimate_relative_pose_robust(self, cam_i, cam_j, pair_key):
-        """개선된 두 카메라 간 상대 포즈 추정 - 기하학적 검증 강화"""
+        """개선된 두 카메라 간 상대 포즈 추정 - 극도로 완화된 버전"""
         matches = self.matches[pair_key]
         
-        if len(matches) < 6:  # 8 → 6으로 완화
-            print(f"    Pair {cam_i}-{cam_j}: Insufficient matches ({len(matches)} < 6)")
+        if len(matches) < 4:  # 6 → 4로 더 완화
+            print(f"    Pair {cam_i}-{cam_j}: Insufficient matches ({len(matches)} < 4)")
             return None, None
         
         # 매칭점들 추출
@@ -1296,14 +1522,18 @@ class SuperGlue3DGSPipeline:
         
         print(f"    Pair {cam_i}-{cam_j}: kpts_i shape: {kpts_i.shape}, kpts_j shape: {kpts_j.shape}")
         
-        # 🔧 대폭 완화된 신뢰도 임계값
-        high_conf_matches = [(idx_i, idx_j, conf) for idx_i, idx_j, conf in matches if conf > 0.0001]  # 0.001 → 0.0001로 대폭 완화
+        # 🔧 극도로 완화된 신뢰도 임계값
+        high_conf_matches = [(idx_i, idx_j, conf) for idx_i, idx_j, conf in matches if conf > 0.00001]  # 0.0001 → 0.00001로 대폭 완화
         
-        if len(high_conf_matches) < 6:  # 8 → 6으로 완화
-            high_conf_matches = [(idx_i, idx_j, conf) for idx_i, idx_j, conf in matches if conf > 0.00001]  # 0.0001 → 0.00001로 대폭 완화
+        if len(high_conf_matches) < 4:  # 6 → 4로 더 완화
+            high_conf_matches = [(idx_i, idx_j, conf) for idx_i, idx_j, conf in matches if conf > 0.000001]  # 0.00001 → 0.000001로 대폭 완화
         
-        if len(high_conf_matches) < 6:  # 8 → 6으로 완화
-            print(f"    Pair {cam_i}-{cam_j}: Insufficient high-confidence matches ({len(high_conf_matches)} < 6)")
+        if len(high_conf_matches) < 4:  # 6 → 4로 더 완화
+            # 모든 매칭을 사용
+            high_conf_matches = [(idx_i, idx_j, conf) for idx_i, idx_j, conf in matches]
+        
+        if len(high_conf_matches) < 4:  # 6 → 4로 더 완화
+            print(f"    Pair {cam_i}-{cam_j}: Insufficient high-confidence matches ({len(high_conf_matches)} < 4)")
             return None, None
         
         # 🔧 인덱스 범위 검증 강화
@@ -1314,8 +1544,8 @@ class SuperGlue3DGSPipeline:
                 idx_i < len(kpts_i) and idx_j < len(kpts_j)):
                 valid_matches.append((idx_i, idx_j, conf))
         
-        if len(valid_matches) < 6:  # 8 → 6으로 완화
-            print(f"    Pair {cam_i}-{cam_j}: Insufficient valid matches after index validation ({len(valid_matches)} < 6)")
+        if len(valid_matches) < 4:  # 6 → 4로 더 완화
+            print(f"    Pair {cam_i}-{cam_j}: Insufficient valid matches after index validation ({len(valid_matches)} < 4)")
             return None, None
         
         print(f"    Pair {cam_i}-{cam_j}: Using {len(valid_matches)} validated matches")
@@ -1329,7 +1559,7 @@ class SuperGlue3DGSPipeline:
             return None, None
         
         # 🔧 기하학적 일관성 사전 검증 (더 관대하게)
-        if not self._check_geometric_consistency_relaxed(pts_i, pts_j):
+        if not self._check_geometric_consistency_very_relaxed(pts_i, pts_j):
             print(f"    Pair {cam_i}-{cam_j}: Failed geometric consistency check")
             return None, None
         
@@ -1337,14 +1567,15 @@ class SuperGlue3DGSPipeline:
         K_i = self.cameras.get(cam_i, {}).get('K', self._estimate_intrinsics(cam_i))
         K_j = self._estimate_intrinsics(cam_j)
         
-        # 🔧 더 관대한 Essential Matrix 추정 방법들
+        # 🔧 극도로 관대한 Essential Matrix 추정 방법들
         methods = [
-            (cv2.RANSAC, 1.0, 0.99),    # 더 관대한 임계값
-            (cv2.RANSAC, 2.0, 0.95),
-            (cv2.RANSAC, 3.0, 0.90),
-            (cv2.LMEDS, 1.0, 0.95),
+            (cv2.RANSAC, 0.5, 0.99),    # 극도로 관대한 임계값
+            (cv2.RANSAC, 1.0, 0.95),
+            (cv2.RANSAC, 2.0, 0.90),
+            (cv2.LMEDS, 0.5, 0.95),
             (cv2.RANSAC, 5.0, 0.85),    # 매우 관대한 설정
-            (cv2.RANSAC, 10.0, 0.80)    # 극도로 관대한 설정
+            (cv2.RANSAC, 10.0, 0.80),   # 극도로 관대한 설정
+            (cv2.RANSAC, 20.0, 0.70)    # 최대한 관대한 설정
         ]
         
         best_R, best_T = None, None
@@ -1359,7 +1590,7 @@ class SuperGlue3DGSPipeline:
                     method=method,
                     prob=confidence,
                     threshold=threshold,
-                    maxIters=1000  # 반복 횟수 줄임
+                    maxIters=500  # 반복 횟수 줄임
                 )
                 
                 if E is None or E.shape != (3, 3):
@@ -1373,9 +1604,9 @@ class SuperGlue3DGSPipeline:
                 
                 inliers = np.sum(mask)
                 
-                if inliers >= 4:  # 6 → 4로 완화
+                if inliers >= 2:  # 4 → 2로 극도로 완화
                     # 🔧 더 관대한 포즈 품질 검증
-                    quality_score = self._evaluate_pose_quality_relaxed(pts_i, pts_j, R, T.flatten(), K_i, K_j, mask)
+                    quality_score = self._evaluate_pose_quality_very_relaxed(pts_i, pts_j, R, T.flatten(), K_i, K_j, mask)
                     
                     if quality_score > best_quality:
                         best_R, best_T = R, T.flatten()
@@ -1393,28 +1624,28 @@ class SuperGlue3DGSPipeline:
         
         return best_R, best_T
 
-    def _check_geometric_consistency_relaxed(self, pts_i, pts_j):
-        """더 관대한 기하학적 일관성 사전 검증"""
+    def _check_geometric_consistency_very_relaxed(self, pts_i, pts_j):
+        """극도로 관대한 기하학적 일관성 사전 검증"""
         try:
-            # 1. 호모그래피 기반 일관성 검사 (더 관대하게)
-            H, mask = cv2.findHomography(pts_i, pts_j, cv2.RANSAC, 10.0)  # 5.0 → 10.0으로 완화
+            # 1. 호모그래피 기반 일관성 검사 (극도로 관대하게)
+            H, mask = cv2.findHomography(pts_i, pts_j, cv2.RANSAC, 20.0)  # 10.0 → 20.0으로 더 완화
             if H is not None:
                 homography_inliers = np.sum(mask)
-                if homography_inliers < len(pts_i) * 0.05:  # 10% → 5%로 완화
+                if homography_inliers < len(pts_i) * 0.01:  # 5% → 1%로 극도로 완화
                     return False
             
-            # 2. 포인트 분포 검사 (더 관대하게)
-            if len(pts_i) > 3:  # 5 → 3으로 완화
+            # 2. 포인트 분포 검사 (극도로 관대하게)
+            if len(pts_i) > 2:  # 3 → 2로 더 완화
                 # 포인트들의 분산 계산
                 var_i = np.var(pts_i, axis=0)
                 var_j = np.var(pts_j, axis=0)
                 
-                # 분산이 너무 작으면 나쁜 분포 (더 관대하게)
-                if np.min(var_i) < 1 or np.min(var_j) < 1:  # 10 → 1로 대폭 완화
+                # 분산이 너무 작으면 나쁜 분포 (극도로 관대하게)
+                if np.min(var_i) < 0.1 or np.min(var_j) < 0.1:  # 1 → 0.1로 대폭 완화
                     return False
             
-            # 3. 포인트 간 거리 검사 (더 관대하게)
-            if len(pts_i) > 2:  # 3 → 2로 완화
+            # 3. 포인트 간 거리 검사 (극도로 관대하게)
+            if len(pts_i) > 1:  # 2 → 1로 더 완화
                 distances_i = cdist(pts_i, pts_i)
                 distances_j = cdist(pts_j, pts_j)
                 
@@ -1425,8 +1656,8 @@ class SuperGlue3DGSPipeline:
                 min_dist_i = np.min(distances_i)
                 min_dist_j = np.min(distances_j)
                 
-                # 최소 거리가 너무 작으면 나쁜 분포 (더 관대하게)
-                if min_dist_i < 0.1 or min_dist_j < 0.1:  # 1 → 0.1로 대폭 완화
+                # 최소 거리가 너무 작으면 나쁜 분포 (극도로 관대하게)
+                if min_dist_i < 0.01 or min_dist_j < 0.01:  # 0.1 → 0.01로 대폭 완화
                     return False
             
             return True
@@ -1435,15 +1666,15 @@ class SuperGlue3DGSPipeline:
             print(f"      Geometric consistency check failed: {e}")
             return True  # 오류시 통과
 
-    def _evaluate_pose_quality_relaxed(self, pts_i, pts_j, R, T, K_i, K_j, mask):
-        """더 관대한 포즈 품질 평가"""
+    def _evaluate_pose_quality_very_relaxed(self, pts_i, pts_j, R, T, K_i, K_j, mask):
+        """극도로 관대한 포즈 품질 평가"""
         try:
-            # 1. 회전 행렬 유효성 확인 (더 관대하게)
+            # 1. 회전 행렬 유효성 확인 (극도로 관대하게)
             det = np.linalg.det(R)
-            if abs(det - 1.0) > 0.3:  # 0.2 → 0.3으로 완화
+            if abs(det - 1.0) > 0.5:  # 0.3 → 0.5로 더 완화
                 return 0.0
             
-            # 2. 삼각측량 품질 검사 (더 관대하게)
+            # 2. 삼각측량 품질 검사 (극도로 관대하게)
             P_i = K_i @ np.hstack([np.eye(3), np.zeros((3, 1))])
             P_j = K_j @ np.hstack([R, T.reshape(-1, 1)])
             
@@ -1451,10 +1682,10 @@ class SuperGlue3DGSPipeline:
             inlier_pts_i = pts_i[mask.flatten()]
             inlier_pts_j = pts_j[mask.flatten()]
             
-            if len(inlier_pts_i) < 4:  # 6 → 4로 완화
+            if len(inlier_pts_i) < 2:  # 4 → 2로 극도로 완화
                 return 0.0
             
-            # 삼각측량 테스트 (더 관대하게)
+            # 삼각측량 테스트 (극도로 관대하게)
             valid_points = 0
             total_error = 0.0
             
@@ -1466,8 +1697,8 @@ class SuperGlue3DGSPipeline:
                     if abs(pt_4d[3, 0]) > 1e-10:
                         pt_3d = (pt_4d[:3] / pt_4d[3]).flatten()
                         
-                        # 거리 체크 (더 관대하게)
-                        if 0.001 < np.linalg.norm(pt_3d) < 10000:  # 0.01~1000 → 0.001~10000으로 완화
+                        # 거리 체크 (극도로 관대하게)
+                        if 0.0001 < np.linalg.norm(pt_3d) < 100000:  # 0.001~10000 → 0.0001~100000으로 완화
                             # 재투영 오차 계산
                             proj_i = P_i @ np.append(pt_3d, 1)
                             proj_j = P_j @ np.append(pt_3d, 1)
@@ -1485,15 +1716,15 @@ class SuperGlue3DGSPipeline:
                 except:
                     continue
             
-            if valid_points < 4:  # 6 → 4로 완화
+            if valid_points < 2:  # 4 → 2로 극도로 완화
                 return 0.0
             
-            # 품질 점수 계산 (더 관대하게)
+            # 품질 점수 계산 (극도로 관대하게)
             avg_error = total_error / valid_points
             inlier_ratio = len(inlier_pts_i) / len(pts_i)
             
-            # 오차가 작고 inlier 비율이 높을수록 높은 점수 (더 관대하게)
-            quality_score = inlier_ratio * (1.0 / (1.0 + avg_error * 0.01))  # 0.1 → 0.01로 완화
+            # 오차가 작고 inlier 비율이 높을수록 높은 점수 (극도로 관대하게)
+            quality_score = inlier_ratio * (1.0 / (1.0 + avg_error * 0.001))  # 0.01 → 0.001로 완화
             
             return quality_score
             
@@ -2426,16 +2657,21 @@ class SuperGlue3DGSPipeline:
         images_dir = output_dir / "images"
         images_dir.mkdir(exist_ok=True)
         
-        # 1. 카메라 내부 파라미터 저장 (cameras.txt)
+        # 1. 카메라 내부 파라미터 저장 (cameras.txt + cameras.bin)
         self._write_cameras_txt(scene_info.train_cameras + scene_info.test_cameras, 
                                sparse_dir / "cameras.txt")
+        self._write_cameras_bin(scene_info.train_cameras + scene_info.test_cameras, 
+                               sparse_dir / "cameras.bin")
         
-        # 2. 카메라 포즈 저장 (images.txt)
+        # 2. 카메라 포즈 저장 (images.txt + images.bin)
         self._write_images_txt(scene_info.train_cameras + scene_info.test_cameras, 
                               sparse_dir / "images.txt")
+        self._write_images_bin(scene_info.train_cameras + scene_info.test_cameras, 
+                              sparse_dir / "images.bin")
         
-        # 3. 3D 포인트 저장 (points3D.ply)
+        # 3. 3D 포인트 저장 (points3D.ply + points3D.bin)
         self._write_points3d_ply(scene_info.point_cloud, sparse_dir / "points3D.ply")
+        self._write_points3d_bin(scene_info.point_cloud, sparse_dir / "points3D.bin")
         
         # 4. 이미지 복사 또는 심볼릭 링크
         self._setup_images_directory(scene_info.train_cameras + scene_info.test_cameras, 
@@ -2459,6 +2695,115 @@ class SuperGlue3DGSPipeline:
                 
                 f.write(f"{cam.uid} PINHOLE {cam.width} {cam.height} "
                        f"{focal_x:.6f} {focal_y:.6f} {cx:.6f} {cy:.6f}\n")
+    
+    def _write_cameras_bin(self, cam_infos, output_path):
+        """COLMAP 형식 cameras.bin 생성"""
+        try:
+            from scene.colmap_loader import write_intrinsics_binary
+            cameras = {}
+            
+            for cam in cam_infos:
+                # PINHOLE 모델 사용
+                focal_x = cam.width / (2 * np.tan(cam.FovX / 2))
+                focal_y = cam.height / (2 * np.tan(cam.FovY / 2))
+                cx, cy = cam.width / 2, cam.height / 2
+                
+                # COLMAP Camera 객체 생성
+                from scene.colmap_loader import Camera
+                camera = Camera(
+                    id=cam.uid,
+                    model="PINHOLE",
+                    width=cam.width,
+                    height=cam.height,
+                    params=[focal_x, focal_y, cx, cy]
+                )
+                cameras[cam.uid] = camera
+            
+            write_intrinsics_binary(cameras, str(output_path))
+            print(f"    Created cameras.bin with {len(cameras)} cameras")
+            
+        except ImportError:
+            print(f"    Warning: COLMAP loader not available, skipping cameras.bin")
+        except Exception as e:
+            print(f"    Warning: Failed to create cameras.bin: {e}")
+    
+    def _write_images_bin(self, cam_infos, output_path):
+        """COLMAP 형식 images.bin 생성"""
+        try:
+            from scene.colmap_loader import write_extrinsics_binary
+            images = {}
+            
+            for cam in cam_infos:
+                # 회전 행렬을 쿼터니언으로 변환
+                R = cam.R
+                trace = np.trace(R)
+                
+                if trace > 0:
+                    s = np.sqrt(trace + 1.0) * 2
+                    qw = 0.25 * s
+                    qx = (R[2, 1] - R[1, 2]) / s
+                    qy = (R[0, 2] - R[2, 0]) / s
+                    qz = (R[1, 0] - R[0, 1]) / s
+                else:
+                    qw = np.sqrt(1 + R[0,0] + R[1,1] + R[2,2]) / 2
+                    qx = (R[2,1] - R[1,2]) / (4 * qw) if qw != 0 else 0
+                    qy = (R[0,2] - R[2,0]) / (4 * qw) if qw != 0 else 0
+                    qz = (R[1,0] - R[0,1]) / (4 * qw) if qw != 0 else 0
+                
+                # 정규화
+                q_norm = np.sqrt(qw*qw + qx*qx + qy*qy + qz*qz)
+                if q_norm > 0:
+                    qw, qx, qy, qz = qw/q_norm, qx/q_norm, qy/q_norm, qz/q_norm
+                
+                # COLMAP Image 객체 생성
+                from scene.colmap_loader import Image
+                image = Image(
+                    id=cam.uid,
+                    qvec=np.array([qw, qx, qy, qz]),
+                    tvec=cam.T,
+                    camera_id=cam.uid,
+                    name=cam.image_name,
+                    xys=np.array([]),  # 빈 특징점 배열
+                    point3D_ids=np.array([])  # 빈 3D 포인트 ID 배열
+                )
+                images[cam.uid] = image
+            
+            write_extrinsics_binary(images, str(output_path))
+            print(f"    Created images.bin with {len(images)} images")
+            
+        except ImportError:
+            print(f"    Warning: COLMAP loader not available, skipping images.bin")
+        except Exception as e:
+            print(f"    Warning: Failed to create images.bin: {e}")
+    
+    def _write_points3d_bin(self, point_cloud, output_path):
+        """COLMAP 형식 points3D.bin 생성"""
+        try:
+            from scene.colmap_loader import write_points3D_binary
+            points3d = {}
+            
+            points = point_cloud.points
+            colors = point_cloud.colors
+            
+            for i in range(len(points)):
+                # COLMAP Point3D 객체 생성
+                from scene.colmap_loader import Point3D
+                point3d = Point3D(
+                    id=i,
+                    xyz=points[i],
+                    rgb=colors[i] * 255,  # 0-1 범위를 0-255로 변환
+                    error=0.0,  # 기본 오차
+                    track=[]  # 빈 트랙 (관찰 정보 없음)
+                )
+                points3d[i] = point3d
+            
+            write_points3D_binary(points3d, str(output_path))
+            print(f"    Created points3D.bin with {len(points3d)} points")
+            
+        except ImportError:
+            print(f"    Warning: COLMAP loader not available, skipping points3D.bin")
+        except Exception as e:
+            print(f"    Warning: Failed to create points3D.bin: {e}")
     
     def _write_images_txt(self, cam_infos, output_path):
         """COLMAP 형식 images.txt 생성"""
