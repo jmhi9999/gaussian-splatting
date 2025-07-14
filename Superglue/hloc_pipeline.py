@@ -29,6 +29,18 @@ except ImportError as e:
     HLOC_AVAILABLE = False
     print(f"✗ Hloc import failed: {e}")
 
+# pycolmap 0.6.0 호환: 쿼터니언을 회전행렬로 변환하는 함수 추가
+
+def quaternion_to_rotmat(qvec):
+    # qvec: (w, x, y, z) 또는 (x, y, z, w) 형식일 수 있음
+    # pycolmap 0.6.0은 (w, x, y, z) 순서임
+    w, x, y, z = qvec
+    return np.array([
+        [1 - 2*y**2 - 2*z**2,     2*x*y - 2*z*w,     2*x*z + 2*y*w],
+        [2*x*y + 2*z*w, 1 - 2*x**2 - 2*z**2,     2*y*z - 2*x*w],
+        [2*x*z - 2*y*w,     2*y*z + 2*x*w, 1 - 2*x**2 - 2*y**2]
+    ], dtype=np.float32)
+
 class HlocPipeline:
     """Hloc 기반 SfM 파이프라인 (Command Line 실행)"""
     
@@ -285,8 +297,7 @@ class HlocPipeline:
                 width, height = cam.width, cam.height
             
             # 회전 행렬과 평행이동 (COLMAP format)
-            # pycolmap.Image는 qvec를 사용하여 회전 행렬을 계산해야 함
-            R = image.qvec2rotmat().astype(np.float32)  # rotmat() → qvec2rotmat()
+            R = quaternion_to_rotmat(image.qvec)  # pycolmap 0.6.0 호환
             T = image.tvec.astype(np.float32)
             
             # 카메라 내부 파라미터에서 FOV 계산
