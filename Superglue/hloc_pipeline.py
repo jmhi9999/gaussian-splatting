@@ -285,7 +285,8 @@ class HlocPipeline:
                 width, height = cam.width, cam.height
             
             # 회전 행렬과 평행이동 (COLMAP format)
-            R = image.rotmat().astype(np.float32)
+            # pycolmap.Image는 qvec를 사용하여 회전 행렬을 계산해야 함
+            R = image.qvec2rotmat().astype(np.float32)  # rotmat() → qvec2rotmat()
             T = image.tvec.astype(np.float32)
             
             # 카메라 내부 파라미터에서 FOV 계산
