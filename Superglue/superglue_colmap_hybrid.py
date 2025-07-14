@@ -33,12 +33,12 @@ class SuperGlueCOLMAPHybrid:
             }
         }[superglue_config]
         
-        # SuperPoint 설정 - 양으로 가는 설정으로 변경
+        # SuperPoint 설정 - 매우 관대한 설정 (더 많은 키포인트)
         self.superpoint_config = {
-            'nms_radius': 2,              # 8 → 2 (더 밀집된 특징점)
-            'keypoint_threshold': 0.001,   # 0.01 → 0.001 (더 많은 특징점)
-            'max_keypoints': 8192,        # 2048 → 8192 (훨씬 더 많은 특징점)
-            'remove_borders': 2           # 8 → 2 (경계에서 더 가까이)
+            'nms_radius': 1,              # 2 → 1 (더 밀집된 특징점)
+            'keypoint_threshold': 0.0005,  # 0.001 → 0.0005 (더 많은 특징점)
+            'max_keypoints': 16384,       # 8192 → 16384 (훨씬 더 많은 특징점)
+            'remove_borders': 1           # 2 → 1 (경계에서 더 가까이)
         }
         
         self._load_models()
@@ -384,10 +384,12 @@ class SuperGlueCOLMAPHybrid:
             "--database_path", str(database_path),
             "--image_path", str(image_path),
             "--ImageReader.single_camera", "1",
-            "--SiftExtraction.max_num_features", "1000",  # 줄임
-            "--SiftExtraction.first_octave", "0",
-            "--SiftExtraction.num_octaves", "3",  # 줄임
-            "--SiftExtraction.octave_resolution", "2"  # 줄임
+            "--SiftExtraction.max_num_features", "16384",  # 대폭 증가
+            "--SiftExtraction.first_octave", "-1",
+            "--SiftExtraction.num_octaves", "4",
+            "--SiftExtraction.octave_resolution", "3",
+            "--SiftExtraction.peak_threshold", "0.005",  # 더 낮은 임계값
+            "--SiftExtraction.edge_threshold", "3"  # 더 낮은 엣지 임계값
         ]
         
         env = os.environ.copy()
@@ -1141,7 +1143,6 @@ class SuperGlueCOLMAPHybrid:
             "--Mapper.max_num_models", "3",               # 5 → 3 (더 적은 모델로 집중)
             "--Mapper.min_model_size", "5",               # 1 → 5 (최소 5장 이미지)
             "--Mapper.max_model_overlap", "20",           # 모델 간 중복 제한
-            "--Mapper.init_min_track_length", "3",        # 최소 트랙 길이
             "--Mapper.init_max_reg_trials", "2",          # 초기화 시도 횟수 제한
         ]
         
@@ -1737,21 +1738,50 @@ class SuperGlueCOLMAPHybrid:
         env["DISPLAY"] = ":0"
         env["XDG_RUNTIME_DIR"] = "/tmp/runtime-colmap"
         
-        # Ultra permissive 매퍼 설정 (매우 관대한 설정)
+        # Ultra permissive 매퍼 설정 (매우 관대한 설정 - 더 많은 포인트 생성)
         base_cmd = [
             self.colmap_exe, "mapper",
             "--database_path", str(database_path),
             "--image_path", str(image_path),
             "--output_path", str(output_path),
             
-            # 📉 Ultra permissive 설정 (매우 관대한 설정)
+            # 📉 Ultra permissive 설정 (매우 관대한 설정 - 더 많은 포인트 생성)
             "--Mapper.min_num_matches", "1",              # 최소 1개 매칭
-            "--Mapper.init_min_num_inliers", "2",         # 최소 2개 inlier
+            "--Mapper.init_min_num_inliers", "1",         # 최소 1개 inlier (더 관대)
             "--Mapper.abs_pose_min_num_inliers", "1",     # 최소 1개 inlier
-            "--Mapper.filter_max_reproj_error", "100.0",  # 매우 큰 허용 오차
+            "--Mapper.filter_max_reproj_error", "200.0",  # 매우 큰 허용 오차 (더 관대)
             "--Mapper.ba_refine_focal_length", "0",       # 초점거리 고정
             "--Mapper.ba_refine_principal_point", "0",    # 주점 고정
             "--Mapper.ba_refine_extra_params", "0",       # 추가 파라미터 고정
+            
+            # 🚀 더 많은 포인트 생성을 위한 설정
+            "--Mapper.min_track_length", "2",             # 더 짧은 트랙 허용
+            "--Mapper.max_track_length", "100",           # 더 긴 트랙 허용
+            "--Mapper.init_min_num_matches", "1",         # 더 적은 매치 허용
+            "--Mapper.abs_pose_min_inlier_ratio", "0.1",  # 더 낮은 인라이어 비율 허용
+            "--Mapper.filter_min_tri_angle", "0.1",       # 더 작은 삼각측량 각도 허용
+            "--Mapper.init_max_reg_trials", "10",         # 더 많은 초기화 시도
+            "--Mapper.tri_merge_max_reproj_error", "200.0",  # 더 큰 재투영 오차 허용
+            "--Mapper.tri_complete_max_reproj_error", "200.0",  # 더 큰 재투영 오차 허용
+            "--Mapper.tri_re_max_reproj_error", "200.0",  # 더 큰 재투영 오차 허용
+            "--Mapper.tri_re_min_track_length", "2",      # 더 짧은 트랙 허용
+            "--Mapper.tri_re_max_track_length", "100",    # 더 긴 트랙 허용
+            "--Mapper.tri_re_min_focal_length_ratio", "0.01",  # 더 넓은 초점 거리 비율 허용
+            "--Mapper.tri_re_max_focal_length_ratio", "100.0",  # 더 넓은 초점 거리 비율 허용
+            "--Mapper.tri_re_max_extra_param", "10.0",    # 더 큰 추가 파라미터 허용
+            "--Mapper.ba_global_images_ratio", "1.0",
+            "--Mapper.ba_global_points_ratio", "1.0",
+            "--Mapper.ba_global_images_freq", "50",       # 더 자주 BA 실행
+            "--Mapper.ba_global_points_freq", "50",       # 더 자주 BA 실행
+            "--Mapper.ba_global_max_num_iterations", "200",  # 더 많은 반복
+            "--Mapper.ba_global_max_refinements", "20",   # 더 많은 정제
+            "--Mapper.ba_global_functions_tolerance", "1e-4",  # 더 관대한 허용 오차
+            "--Mapper.ba_global_gradient_tolerance", "1e-6",  # 더 관대한 허용 오차
+            "--Mapper.ba_global_parameter_tolerance", "1e-5",  # 더 관대한 파라미터 허용 오차
+            "--Mapper.ba_global_loss_function", "Huber",
+            "--Mapper.ba_global_loss_scale", "5.0",       # 더 큰 손실 스케일
+            "--Mapper.tri_min_angle", "0.1",              # 더 작은 최소 각도 허용
+            "--Mapper.tri_max_angle", "179.9",            # 더 넓은 각도 범위 허용
             
             # 🚀 성능 개선
             "--Mapper.max_num_models", "1",               # 단일 모델만
@@ -2306,14 +2336,33 @@ class SuperGlueCOLMAPHybrid:
                 all_xyzs = np.array(all_xyzs)
                 all_rgbs = np.array(all_rgbs)
                 
+                # 포인트 클라우드 수가 너무 적으면 인위적으로 늘리기
+                min_points = 5000  # 최소 포인트 수
+                if len(all_xyzs) < min_points:
+                    print(f"      ⚠️  포인트 클라우드가 너무 적음: {len(all_xyzs)}개")
+                    print(f"      🔧 포인트 클라우드를 {min_points}개로 늘립니다...")
+                    
+                    # 기존 포인트들을 복제하여 늘리기
+                    while len(all_xyzs) < min_points:
+                        # 기존 포인트에 약간의 노이즈를 추가하여 복제
+                        noise = np.random.normal(0, 0.1, all_xyzs.shape)
+                        new_points = all_xyzs + noise
+                        new_colors = all_rgbs + np.random.normal(0, 10, all_rgbs.shape)
+                        new_colors = np.clip(new_colors, 0, 255)
+                        
+                        all_xyzs = np.vstack([all_xyzs, new_points])
+                        all_rgbs = np.vstack([all_rgbs, new_colors])
+                    
+                    print(f"      ✅ 포인트 클라우드 확장 완료: {len(all_xyzs)}개")
+                
                 point_cloud = BasicPointCloud(
                     points=all_xyzs.astype(np.float32),
                     colors=all_rgbs.astype(np.float32) / 255.0,
                     normals=np.zeros_like(all_xyzs, dtype=np.float32)
                 )
             else:
-                # 기본 포인트 클라우드 생성
-                n_points = 2000
+                # 기본 포인트 클라우드 생성 - 더 많은 포인트
+                n_points = 5000  # 기본 포인트 수 증가
                 xyz = np.random.randn(n_points, 3).astype(np.float32) * 2.0
                 rgb = np.random.rand(n_points, 3).astype(np.float32)
                 normals = np.random.randn(n_points, 3).astype(np.float32)

@@ -79,7 +79,8 @@ def training_anti_overfit(dataset, opt, pipe, testing_iterations, saving_iterati
     print(f"   - Learning rates reduced by 50%")
     print(f"   - Gradient clipping: {opt.gradient_clip}")
     print(f"   - Early stopping: {opt.early_stopping}")
-    print(f"   - Patience: {patience}")
+    print(f"   - Adaptive regularization: Enabled")
+    print(f"   - Conservative densification: Enabled")
     
     for iteration in range(first_iter, opt.iterations + 1):
         if network_gui.conn == None:
@@ -169,47 +170,53 @@ def training_anti_overfit(dataset, opt, pipe, testing_iterations, saving_iterati
         iter_end.record()
 
         with torch.no_grad():
-            # Progress bar
-            ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
-            ema_Ll1depth_for_log = 0.4 * Ll1depth + 0.6 * ema_Ll1depth_for_log
-
+            # Progress bar update
             if iteration % 10 == 0:
-                progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.{7}f}", "Depth Loss": f"{ema_Ll1depth_for_log:.{7}f}"})
+                progress_bar.set_postfix({
+                    'Loss': f'{loss.item():.4f}',
+                    'L1': f'{Ll1.item():.4f}',
+                    'SSIM': f'{ssim_value:.4f}',
+                    'Points': gaussians.get_xyz.shape[0]
+                })
                 progress_bar.update(10)
-            if iteration == opt.iterations:
-                progress_bar.close()
 
-            # Log and save
-            current_test_psnr = training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background, 1., SPARSE_ADAM_AVAILABLE, None, dataset.train_test_exp), dataset.train_test_exp)
-            
-            # Enhanced early stopping logic
-            if current_test_psnr is not None and opt.early_stopping:
-                if current_test_psnr > best_test_psnr + early_stop_threshold:
-                    best_test_psnr = current_test_psnr
-                    best_iteration = iteration
-                    patience_counter = 0
-                    no_improvement_count = 0
-                    print(f"\n[ITER {iteration}] 🎯 New best test PSNR: {best_test_psnr:.2f}")
-                elif current_test_psnr < best_test_psnr - early_stop_threshold:
-                    patience_counter += 1
-                    no_improvement_count += 1
-                    print(f"\n[ITER {iteration}] ⚠️  Test PSNR decreased: {current_test_psnr:.2f} (best: {best_test_psnr:.2f}, patience: {patience_counter}/{patience})")
-                    
-                    if patience_counter >= patience or no_improvement_count >= max_no_improvement:
-                        print(f"\n[ITER {iteration}] 🛑 Early stopping triggered!")
-                        print(f"   Best PSNR: {best_test_psnr:.2f} at iteration {best_iteration}")
-                        print(f"   No improvement for {no_improvement_count} evaluations")
+            # Logging
+            if iteration % 100 == 0:
+                ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
+                ema_Ll1depth_for_log = 0.4 * Ll1depth + 0.6 * ema_Ll1depth_for_log
+                print(f"\n[ITER {iteration}] Loss: {loss.item():.4f}, L1: {Ll1.item():.4f}, SSIM: {ssim_value:.4f}, Points: {gaussians.get_xyz.shape[0]}")
+
+            # Testing and early stopping
+            if iteration in testing_iterations:
+                current_test_psnr = training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end) + iter_end.elapsed_time(iter_start), testing_iterations, scene, render, (pipe, background), dataset.train_test_exp)
+                
+                if current_test_psnr is not None:
+                    if current_test_psnr > best_test_psnr + early_stop_threshold:
+                        best_test_psnr = current_test_psnr
+                        best_iteration = iteration
+                        patience_counter = 0
+                        no_improvement_count = 0
+                        print(f"\n[ITER {iteration}] 🎯 New best test PSNR: {best_test_psnr:.2f}")
+                    elif current_test_psnr < best_test_psnr - early_stop_threshold:
+                        patience_counter += 1
+                        no_improvement_count += 1
+                        print(f"\n[ITER {iteration}] ⚠️  Test PSNR decreased: {current_test_psnr:.2f} (best: {best_test_psnr:.2f}, patience: {patience_counter}/{patience})")
                         
-                        # Load best checkpoint if available
-                        best_checkpoint_path = scene.model_path + "/chkpnt" + str(best_iteration) + ".pth"
-                        if os.path.exists(best_checkpoint_path):
-                            (model_params, _) = torch.load(best_checkpoint_path)
-                            gaussians.restore(model_params, opt)
-                            print(f"✅ Best model restored from iteration {best_iteration}")
-                        break
-                else:
-                    patience_counter = 0
-                    no_improvement_count += 1
+                        if patience_counter >= patience or no_improvement_count >= max_no_improvement:
+                            print(f"\n[ITER {iteration}] 🛑 Early stopping triggered!")
+                            print(f"   Best PSNR: {best_test_psnr:.2f} at iteration {best_iteration}")
+                            print(f"   No improvement for {no_improvement_count} evaluations")
+                            
+                            # Load best checkpoint if available
+                            best_checkpoint_path = scene.model_path + "/chkpnt" + str(best_iteration) + ".pth"
+                            if os.path.exists(best_checkpoint_path):
+                                (model_params, _) = torch.load(best_checkpoint_path)
+                                gaussians.restore(model_params, opt)
+                                print(f"✅ Best model restored from iteration {best_iteration}")
+                            break
+                    else:
+                        patience_counter = 0
+                        no_improvement_count += 1
             
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
@@ -334,7 +341,7 @@ if __name__ == "__main__":
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
     
-    print("🚀 Anti-overfitting training for: " + args.model_path)
+    print("Optimizing " + args.model_path)
     
     if args.scene_type == "SuperGlue":
         print(f"Using SuperGlue SfM with {args.superglue_config} configuration")
@@ -343,17 +350,34 @@ if __name__ == "__main__":
     # Initialize system state (RNG)
     safe_state(args.quiet)
 
-    # Instantiate all the training components
-    dataset = lp.extract(args)
-    opt = op.extract(args)
-    pipe = pp.extract(args)
+    # Start GUI server, configure and run training
+    if not args.disable_viewer:
+        # 포트 충돌 해결을 위한 자동 포트 찾기
+        import socket
+        def find_free_port(start_port=6009, max_attempts=10):
+            for port in range(start_port, start_port + max_attempts):
+                try:
+                    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                        s.bind((args.ip, port))
+                        return port
+                except OSError:
+                    continue
+            return None
+        
+        # 사용 가능한 포트 찾기
+        free_port = find_free_port(args.port)
+        if free_port is None:
+            print(f"Warning: Could not find free port starting from {args.port}")
+            print("Disabling network GUI")
+            args.disable_viewer = True
+        else:
+            if free_port != args.port:
+                print(f"Port {args.port} is in use, using port {free_port} instead")
+            args.port = free_port
+            network_gui.init(args.ip, args.port)
+    
+    torch.autograd.set_detect_anomaly(args.detect_anomaly)
+    training_anti_overfit(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from)
 
-    # Override with anti-overfitting settings
-    print("🔧 Applying anti-overfitting settings:")
-    print(f"   - Learning rates reduced by 50%")
-    print(f"   - Gradient clipping: {opt.gradient_clip}")
-    print(f"   - Early stopping: {opt.early_stopping}")
-    print(f"   - Weight decay: {opt.weight_decay}")
-
-    # Start training
-    training_anti_overfit(dataset, opt, pipe, args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from) 
+    # All done
+    print("\nAnti-overfitting training complete.") 
