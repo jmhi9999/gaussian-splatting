@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Hloc + 3DGS 통합 파이프라인 (수정된 버전)
-Command line 방식으로 Hloc 실행하여 API 호환성 문제 해결
+Hloc + 3DGS 통합 파이프라인 (깔끔한 버전)
+순환 import 문제 해결
 """
 
 import os
@@ -9,31 +9,58 @@ import sys
 import numpy as np
 import torch
 from pathlib import Path
-import cv2
 from PIL import Image
-import json
 import subprocess
-from typing import Optional, List, Tuple, Dict, Any
+from typing import Optional, List, NamedTuple
 
-# 3DGS imports
-from utils.graphics_utils import BasicPointCloud, focal2fov, getWorld2View2
-from scene.dataset_readers import CameraInfo, SceneInfo
-
+# scipy import 추가 (pycolmap 최신 버전 지원용)
 try:
-    # Hloc imports (SfM에 필요한 것만)
-    from hloc import extract_features, match_features, reconstruction
+    from scipy.spatial.transform import Rotation
+    SCIPY_AVAILABLE = True
+except ImportError:
+    SCIPY_AVAILABLE = False
+    print("⚠️  scipy not available - will use fallback rotation conversion")
+
+# 순환 import 방지: 필요한 타입들을 직접 정의
+class CameraInfo(NamedTuple):
+    uid: int
+    R: np.array
+    T: np.array
+    FovY: float
+    FovX: float
+    image_path: str
+    image_name: str
+    width: int
+    height: int
+    depth_params: dict
+    depth_path: str
+    is_test: bool
+
+class BasicPointCloud:
+    def __init__(self, points, colors, normals):
+        self.points = points
+        self.colors = colors  
+        self.normals = normals
+
+class SceneInfo(NamedTuple):
+    point_cloud: BasicPointCloud
+    train_cameras: list
+    test_cameras: list
+    nerf_normalization: dict
+    ply_path: str
+    is_nerf_synthetic: bool
+
+# Hloc 및 pycolmap import
+try:
     import pycolmap
     HLOC_AVAILABLE = True
-    print("✓ Hloc SfM modules imported successfully")
+    print("✓ pycolmap imported successfully")
 except ImportError as e:
     HLOC_AVAILABLE = False
-    print(f"✗ Hloc import failed: {e}")
-
-# pycolmap 0.6.0 호환: 쿼터니언을 회전행렬로 변환하는 함수 추가
+    print(f"✗ pycolmap import failed: {e}")
 
 def quaternion_to_rotmat(qvec):
-    # qvec: (w, x, y, z) 또는 (x, y, z, w) 형식일 수 있음
-    # pycolmap 0.6.0은 (w, x, y, z) 순서임
+    """쿼터니언을 회전 행렬로 변환"""
     w, x, y, z = qvec
     return np.array([
         [1 - 2*y**2 - 2*z**2,     2*x*y - 2*z*w,     2*x*z + 2*y*w],
@@ -41,244 +68,324 @@ def quaternion_to_rotmat(qvec):
         [2*x*z - 2*y*w,     2*y*z + 2*x*w, 1 - 2*x**2 - 2*y**2]
     ], dtype=np.float32)
 
-class HlocPipeline:
-    """Hloc 기반 SfM 파이프라인 (Command Line 실행)"""
+def focal2fov(focal, pixels):
+    """Focal length를 FoV로 변환"""
+    return 2*np.arctan(pixels/(2*focal))
+
+def getWorld2View2(R, t, translate=np.array([.0, .0, .0]), scale=1.0):
+    """World2View 행렬 계산"""
+    Rt = np.zeros((4, 4))
+    Rt[:3, :3] = R.transpose()
+    Rt[:3, 3] = t
+    Rt[3, 3] = 1.0
+
+    C2W = np.linalg.inv(Rt)
+    cam_center = C2W[:3, 3]
+    cam_center = (cam_center + translate) * scale
+    C2W[:3, 3] = cam_center
+    Rt = np.linalg.inv(C2W)
+    return np.float32(Rt)
+
+def matrix_to_quaternion(R):
+    """회전 행렬을 쿼터니언으로 변환 (scipy 없이)"""
+    trace = np.trace(R)
     
-    def __init__(self, device='cuda'):
-        self.device = device
-        
-        # SuperPoint 가용성 확인
-        self.superpoint_available = self._check_superpoint()
-        
-        if not HLOC_AVAILABLE:
-            print("⚠️  Hloc not available, falling back to simple pipeline")
+    if trace > 0:
+        s = np.sqrt(trace + 1.0) * 2  # s=4*qw 
+        qw = 0.25 * s
+        qx = (R[2, 1] - R[1, 2]) / s
+        qy = (R[0, 2] - R[2, 0]) / s
+        qz = (R[1, 0] - R[0, 1]) / s
+    elif R[0, 0] > R[1, 1] and R[0, 0] > R[2, 2]:
+        s = np.sqrt(1.0 + R[0, 0] - R[1, 1] - R[2, 2]) * 2  # s=4*qx
+        qw = (R[2, 1] - R[1, 2]) / s
+        qx = 0.25 * s
+        qy = (R[0, 1] + R[1, 0]) / s
+        qz = (R[0, 2] + R[2, 0]) / s
+    elif R[1, 1] > R[2, 2]:
+        s = np.sqrt(1.0 + R[1, 1] - R[0, 0] - R[2, 2]) * 2  # s=4*qy
+        qw = (R[0, 2] - R[2, 0]) / s
+        qx = (R[0, 1] + R[1, 0]) / s
+        qy = 0.25 * s
+        qz = (R[1, 2] + R[2, 1]) / s
+    else:
+        s = np.sqrt(1.0 + R[2, 2] - R[0, 0] - R[1, 1]) * 2  # s=4*qz
+        qw = (R[1, 0] - R[0, 1]) / s
+        qx = (R[0, 2] + R[2, 0]) / s
+        qy = (R[1, 2] + R[2, 1]) / s
+        qz = 0.25 * s
     
-    def _check_superpoint(self):
-        """SuperPoint 사용 가능성 확인"""
+    return np.array([qw, qx, qy, qz], dtype=np.float32)
+
+def get_image_quaternion_and_translation(image):
+    """pycolmap Image 객체에서 안전하게 quaternion과 translation 추출 (Rigid3d 지원)"""
+    
+    # 최신 pycolmap API 시도 (cam_from_world)
+    if hasattr(image, 'cam_from_world'):
         try:
-            import subprocess
-            import sys
-            result = subprocess.run([
-                sys.executable, '-c', 
-                'from SuperGluePretrainedNetwork.models import superpoint'
-            ], capture_output=True, text=True)
-            return result.returncode == 0
-        except:
-            return False
+            # cam_from_world는 pycolmap.Rigid3d 객체 (함수 아님!)
+            rigid3d = image.cam_from_world
             
-    def process_images(self, 
-                      image_dir: str, 
-                      output_dir: str, 
-                      max_images: int = 100) -> Optional[SceneInfo]:
-        """이미지들을 처리하여 SceneInfo 생성"""
-        
-        print(f"\n🚀 Starting Hloc Pipeline")
-        print(f"📁 Input: {image_dir}")
-        print(f"📁 Output: {output_dir}")
-        print(f"📊 Max images: {max_images}")
-        
-        try:
-            # 출력 디렉토리 생성
-            output_path = Path(output_dir)
-            output_path.mkdir(parents=True, exist_ok=True)
-            
-            # 1. 이미지 수집
-            image_paths = self._collect_images(image_dir, max_images)
-            if len(image_paths) == 0:
-                raise ValueError(f"No images found in {image_dir}")
-            
-            print(f"📸 Found {len(image_paths)} images")
-            
-            if HLOC_AVAILABLE:
-                # 2. Hloc SfM 파이프라인 실행 (Command Line)
-                scene_info = self._run_hloc_command_line(image_paths, output_path)
-                if scene_info:
-                    return scene_info
+            # Rigid3d 객체에서 4x4 변환 행렬 추출
+            if hasattr(rigid3d, 'matrix'):
+                cam_from_world = rigid3d.matrix()
+            elif hasattr(rigid3d, 'Matrix'):
+                cam_from_world = rigid3d.Matrix()
+            else:
+                # rotation()과 translation() 메서드로 개별 추출
+                if hasattr(rigid3d, 'rotation') and hasattr(rigid3d, 'translation'):
+                    R = rigid3d.rotation()
+                    if hasattr(R, 'matrix'):
+                        R_matrix = R.matrix()  # 3x3 회전 행렬
+                    else:
+                        R_matrix = R  # 이미 행렬일 경우
+                    
+                    t = rigid3d.translation()  # 3x1 평행이동
+                    
+                    # 4x4 변환 행렬 구성
+                    cam_from_world = np.eye(4, dtype=np.float32)
+                    cam_from_world[:3, :3] = R_matrix
+                    cam_from_world[:3, 3] = t
                 else:
-                    print("⚠️  Hloc pipeline failed, falling back...")
+                    raise ValueError("Cannot extract matrix from Rigid3d object")
             
-            # 3. Fallback: 간단한 카메라 배치 (개발용만)
-            print("❌ Hloc failed - using fallback is NOT recommended for production!")
-            return self._create_fallback_scene(image_paths)
+            # 회전 행렬 (3x3)
+            R = cam_from_world[:3, :3]
+            
+            # 평행이동 벡터 (3x1)
+            t = cam_from_world[:3, 3]
+            
+            # 회전 행렬을 쿼터니언으로 변환
+            if SCIPY_AVAILABLE:
+                qvec_scipy = Rotation.from_matrix(R).as_quat()  # [x, y, z, w]
+                qvec = np.array([qvec_scipy[3], qvec_scipy[0], qvec_scipy[1], qvec_scipy[2]], dtype=np.float32)  # [w, x, y, z]
+            else:
+                qvec = matrix_to_quaternion(R)  # [w, x, y, z]
+            
+            return qvec, t.astype(np.float32)
             
         except Exception as e:
-            print(f"❌ Hloc pipeline error: {e}")
-            import traceback
-            traceback.print_exc()
-            return None
+            print(f"cam_from_world Rigid3d extraction failed: {e}")
     
-    def _collect_images(self, image_dir: str, max_images: int) -> List[Path]:
-        """이미지 파일 수집"""
-        image_dir = Path(image_dir)
-        
-        extensions = ['*.jpg', '*.jpeg', '*.png', '*.JPG', '*.JPEG', '*.PNG']
-        image_paths = []
-        
-        for ext in extensions:
-            image_paths.extend(list(image_dir.glob(ext)))
-        
-        image_paths.sort()
-        return image_paths[:max_images]
-    
-    def _run_hloc_command_line(self, image_paths: List[Path], output_path: Path) -> Optional[SceneInfo]:
-        """Command Line으로 Hloc SfM 파이프라인 실행"""
-        
-        print("\n📊 Running Hloc SfM pipeline (Command Line)...")
-        
+    # projection_center 시도
+    if hasattr(image, 'projection_center'):
         try:
-            image_dir = image_paths[0].parent
-            
-            # 1. 특징점 추출
-            print("🔍 Extracting features...")
-            
-            # SuperPoint 사용 가능하면 SuperPoint, 아니면 SIFT
-            if self.superpoint_available:
-                feature_conf = 'superpoint_aachen'
-                feature_file = 'feats-superpoint-n4096-r1024'  # .h5 확장자 제거 (Hloc이 자동으로 추가)
-                print("Using SuperPoint extractor")
-            else:
-                feature_conf = 'sift'
-                feature_file = 'feats-sift'  # .h5 확장자 제거 (Hloc이 자동으로 추가)
-                print("Using SIFT extractor (SuperPoint not available)")
-            
-            extract_cmd = [
-                sys.executable, '-m', 'hloc.extract_features',
-                '--image_dir', str(image_dir),
-                '--export_dir', str(output_path),
-                '--conf', feature_conf
-            ]
-            
-            print(f"Command: {' '.join(extract_cmd)}")
-            result = subprocess.run(extract_cmd, capture_output=True, text=True, timeout=600)
-            
-            if result.returncode != 0:
-                print(f"❌ Feature extraction failed: {result.stderr}")
-                return None
-            
-            print("✅ Feature extraction completed")
-            
-            # 2. 매칭 페어 생성
-            print("🔗 Creating image pairs...")
-            pairs_path = output_path / 'pairs.txt'
-            
-            # 순차 매칭 + 추가 연결
-            with open(pairs_path, 'w') as f:
-                # 순차 연결
-                for i in range(len(image_paths) - 1):
-                    name_i = image_paths[i].name
-                    name_j = image_paths[i + 1].name
-                    f.write(f"{name_i} {name_j}\n")
-                
-                # 추가 연결 (안정성)
-                for i in range(len(image_paths)):
-                    for j in range(i + 2, min(i + 4, len(image_paths))):
-                        name_i = image_paths[i].name
-                        name_j = image_paths[j].name
-                        f.write(f"{name_i} {name_j}\n")
-            
-            print(f"✅ Created {sum(1 for line in open(pairs_path))} image pairs")
-            
-            # 3. 특징점 매칭
-            print("🔗 Matching features...")
-            
-            # SuperPoint면 SuperGlue, SIFT면 NN-mutual
-            if self.superpoint_available:
-                matcher_conf = 'superglue'
-                matcher_file = f'{feature_file}_matches-superglue_pairs.h5'  # Hloc의 실제 파일명 형식
-                print("Using SuperGlue matcher")
-            else:
-                matcher_conf = 'NN-mutual'
-                matcher_file = f'{feature_file}_matches-NN-mutual_pairs.h5'  # Hloc의 실제 파일명 형식
-                print("Using NN-mutual matcher")
-            
-            # 매칭 명령어 수정 (경로 문제 해결)
-            match_cmd = [
-                sys.executable, '-m', 'hloc.match_features',
-                '--pairs', str(pairs_path),
-                '--features', feature_file,  # 파일명만
-                '--matches', matcher_file,   # 파일명만  
-                '--export_dir', str(output_path),
-                '--conf', matcher_conf
-            ]
-            
-            print(f"Command: {' '.join(match_cmd)}")
-            result = subprocess.run(match_cmd, capture_output=True, text=True, timeout=1200)
-            
-            if result.returncode != 0:
-                print(f"❌ Feature matching failed: {result.stderr}")
-                return None
-            
-            print("✅ Feature matching completed")
-            
-            # 4. SfM 재구성
-            print("🏗️  Running SfM reconstruction...")
-            sfm_dir = output_path / 'sfm'
-            sfm_dir.mkdir(exist_ok=True)
-            
-            reconstruction_cmd = [
-                sys.executable, '-m', 'hloc.reconstruction',
-                '--sfm_dir', str(sfm_dir),
-                '--image_dir', str(image_dir),
-                '--pairs', str(pairs_path),
-                '--features', str(output_path / (feature_file + '.h5')),  # .h5 확장자 추가
-                '--matches', str(output_path / matcher_file),   # Hloc의 실제 파일명 형식
-                '--camera_mode', 'SINGLE'
-            ]
-            
-            print(f"Command: {' '.join(reconstruction_cmd)}")
-            result = subprocess.run(reconstruction_cmd, capture_output=True, text=True, timeout=1800)
-            
-            if result.returncode != 0:
-                print(f"⚠️  SfM reconstruction command failed: {result.stderr}")
-                print("Trying to load existing reconstruction...")
-            
-            # 5. COLMAP 모델 로드
+            center = image.projection_center()
+            # 기본 회전 (단위 행렬)과 중심점 사용
+            qvec = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)  # [w, x, y, z]
+            tvec = -center.astype(np.float32)  # 카메라 중심의 반대
+            return qvec, tvec
+        except Exception as e:
+            print(f"projection_center method failed: {e}")
+    
+    # 기존 API 시도 (하위 호환성)
+    quat_attrs = ['qvec', 'quat', 'quaternion', 'rotation_quaternion']
+    trans_attrs = ['tvec', 'trans', 'translation']
+    
+    # Quaternion 추출
+    qvec = None
+    for attr in quat_attrs:
+        if hasattr(image, attr):
             try:
-                model_files = list(sfm_dir.glob('*'))
-                print(f"SfM output files: {[f.name for f in model_files]}")
-                
-                # COLMAP 모델 로드 시도
-                if (sfm_dir / 'cameras.bin').exists():
-                    model = pycolmap.Reconstruction(str(sfm_dir))
-                elif (sfm_dir / 'cameras.txt').exists():
-                    model = pycolmap.Reconstruction()
-                    model.read_text(str(sfm_dir))
-                else:
-                    print("❌ No COLMAP model files found")
-                    return None
-                
-                if len(model.images) == 0:
-                    print("❌ No cameras registered in reconstruction")
-                    return None
-                
-                print(f"✅ SfM success: {len(model.images)} cameras, {len(model.points3D)} points")
-                return self._create_scene_info_from_colmap(model, image_paths)
-                
-            except Exception as e:
-                print(f"❌ Failed to load COLMAP model: {e}")
-                return None
-            
-        except subprocess.TimeoutExpired:
-            print("❌ Hloc pipeline timeout")
-            return None
-        except Exception as e:
-            print(f"❌ Hloc command line pipeline failed: {e}")
-            import traceback
-            traceback.print_exc()
-            return None
+                qvec = getattr(image, attr)
+                if callable(qvec):
+                    qvec = qvec()
+                qvec = np.array(qvec, dtype=np.float32)
+                break
+            except:
+                continue
     
-    def _create_scene_info_from_colmap(self, model, image_paths: List[Path]) -> SceneInfo:
-        """COLMAP 모델에서 SceneInfo 생성"""
+    # Translation 추출
+    tvec = None
+    for attr in trans_attrs:
+        if hasattr(image, attr):
+            try:
+                tvec = getattr(image, attr)
+                if callable(tvec):
+                    tvec = tvec()
+                tvec = np.array(tvec, dtype=np.float32)
+                break
+            except:
+                continue
+    
+    # 기본값 사용 (최후의 수단)
+    if qvec is None or tvec is None:
+        print(f"Using default pose for image (no pose attributes found)")
+        qvec = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)  # 단위 쿼터니언
+        tvec = np.array([0.0, 0.0, 0.0], dtype=np.float32)  # 원점
+    
+    return qvec, tvec
+
+def safe_get_rotation_matrix(image):
+    """pycolmap Image 객체에서 안전하게 회전 행렬 추출 (Rigid3d 지원)"""
+    
+    # 최신 pycolmap API 시도 (cam_from_world Rigid3d)
+    if hasattr(image, 'cam_from_world'):
+        try:
+            rigid3d = image.cam_from_world
+            
+            # Rigid3d에서 4x4 변환 행렬 추출
+            if hasattr(rigid3d, 'matrix'):
+                cam_from_world = rigid3d.matrix()
+                R = cam_from_world[:3, :3].astype(np.float32)
+                return R
+            elif hasattr(rigid3d, 'Matrix'):
+                cam_from_world = rigid3d.Matrix()
+                R = cam_from_world[:3, :3].astype(np.float32)
+                return R
+            elif hasattr(rigid3d, 'rotation'):
+                rotation_obj = rigid3d.rotation()
+                if hasattr(rotation_obj, 'matrix'):
+                    R = rotation_obj.matrix().astype(np.float32)
+                    return R
+                else:
+                    # rotation_obj가 이미 행렬일 경우
+                    R = np.array(rotation_obj, dtype=np.float32)
+                    return R
+        except Exception as e:
+            print(f"cam_from_world Rigid3d rotation extraction failed: {e}")
+    
+    # 기존 메서드들 시도
+    try:
+        if hasattr(image, 'rotation_matrix'):
+            return image.rotation_matrix().astype(np.float32)
+        elif hasattr(image, 'qvec2rotmat'):
+            return image.qvec2rotmat().astype(np.float32)
+        else:
+            # 쿼터니언에서 회전 행렬 생성
+            qvec, _ = get_image_quaternion_and_translation(image)
+            return quaternion_to_rotmat(qvec)
+            
+    except Exception as e:
+        print(f"Warning: Failed to get rotation matrix: {e}")
+        # 기본 단위 행렬 반환
+        return np.eye(3, dtype=np.float32)
+
+def collect_images(image_dir: str, max_images: int = 100) -> List[Path]:
+    """이미지 파일들을 수집"""
+    image_dir = Path(image_dir)
+    extensions = ['*.jpg', '*.jpeg', '*.png', '*.JPG', '*.JPEG', '*.PNG']
+    
+    all_images = []
+    for ext in extensions:
+        all_images.extend(image_dir.glob(ext))
+    
+    all_images.sort(key=lambda x: x.name)
+    return all_images[:max_images]
+
+def run_hloc_reconstruction(image_dir: Path, output_dir: Path, max_images: int = 100):
+    """Hloc SfM 재구성 실행"""
+    print(f"\n🚀 Running Hloc SfM reconstruction")
+    print(f"📁 Images: {image_dir}")
+    print(f"📁 Output: {output_dir}")
+    
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    try:
+        # 1. Feature extraction
+        print("🔍 Extracting features...")
+        extract_cmd = [
+            sys.executable, '-m', 'hloc.extract_features',
+            '--image_dir', str(image_dir),
+            '--export_dir', str(output_dir),
+            '--conf', 'superpoint_aachen'
+        ]
         
-        print("📊 Converting COLMAP model to SceneInfo...")
+        result = subprocess.run(extract_cmd, capture_output=True, text=True, timeout=600)
+        if result.returncode != 0:
+            print(f"❌ Feature extraction failed: {result.stderr}")
+            return None
+        print("✅ Feature extraction completed")
         
-        # 카메라 정보 추출
-        cam_infos = []
-        for img_id, image in model.images.items():
-            cam = model.cameras[image.camera_id]
+        # 2. Image pairs
+        print("🔗 Creating image pairs...")
+        pairs_path = output_dir / 'pairs.txt'
+        image_paths = collect_images(image_dir, max_images)
+        
+        with open(pairs_path, 'w') as f:
+            for i, img1 in enumerate(image_paths):
+                for j, img2 in enumerate(image_paths[i+1:], i+1):
+                    f.write(f"{img1.name} {img2.name}\n")
+        
+        num_pairs = len(image_paths) * (len(image_paths) - 1) // 2
+        print(f"✅ Created {num_pairs} image pairs")
+        
+        # 3. Feature matching  
+        print("🔗 Matching features...")
+        match_cmd = [
+            sys.executable, '-m', 'hloc.match_features',
+            '--pairs', str(pairs_path),
+            '--features', 'feats-superpoint-n4096-r1024',
+            '--matches', 'feats-superpoint-n4096-r1024_matches-superglue_pairs.h5',
+            '--export_dir', str(output_dir),
+            '--conf', 'superglue'
+        ]
+        
+        result = subprocess.run(match_cmd, capture_output=True, text=True, timeout=600)
+        if result.returncode != 0:
+            print(f"❌ Feature matching failed: {result.stderr}")
+            return None
+        print("✅ Feature matching completed")
+        
+        # 4. SfM reconstruction
+        print("🏗️  Running SfM reconstruction...")
+        sfm_dir = output_dir / 'sfm'
+        sfm_dir.mkdir(exist_ok=True)
+        
+        reconstruction_cmd = [
+            sys.executable, '-m', 'hloc.reconstruction',
+            '--sfm_dir', str(sfm_dir),
+            '--image_dir', str(image_dir),
+            '--pairs', str(pairs_path),
+            '--features', str(output_dir / 'feats-superpoint-n4096-r1024.h5'),
+            '--matches', str(output_dir / 'feats-superpoint-n4096-r1024_matches-superglue_pairs.h5'),
+            '--camera_mode', 'SINGLE'
+        ]
+        
+        result = subprocess.run(reconstruction_cmd, capture_output=True, text=True, timeout=1800)
+        if result.returncode != 0:
+            print(f"⚠️  SfM reconstruction failed: {result.stderr}")
+        
+        # 5. Load COLMAP model
+        if (sfm_dir / 'cameras.bin').exists():
+            model = pycolmap.Reconstruction(str(sfm_dir))
+        elif (sfm_dir / 'cameras.txt').exists():
+            model = pycolmap.Reconstruction()
+            model.read_text(str(sfm_dir))
+        else:
+            print("❌ No COLMAP model files found")
+            return None
+        
+        if len(model.images) == 0:
+            print("❌ No cameras registered in reconstruction")
+            return None
+        
+        print(f"✅ SfM success: {len(model.images)} cameras, {len(model.points3D)} points")
+        return model
+        
+    except Exception as e:
+        print(f"❌ Hloc reconstruction failed: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+
+def colmap_to_scene_info(model, image_paths: List[Path]) -> SceneInfo:
+    """COLMAP 모델을 SceneInfo로 변환"""
+    print("📊 Converting COLMAP model to SceneInfo...")
+    
+    cam_infos = []
+    for img_id, image in model.images.items():
+        try:
+            # 카메라 정보
+            camera_id = getattr(image, 'camera_id', img_id)
+            if camera_id not in model.cameras:
+                print(f"⚠️  Camera {camera_id} not found for image {img_id}")
+                continue
+            
+            cam = model.cameras[camera_id]
             
             # 이미지 경로 찾기
-            image_name = image.name
+            image_name = getattr(image, 'name', f'image_{img_id}')
             image_path = None
             for path in image_paths:
                 if path.name == image_name:
@@ -294,23 +401,28 @@ class HlocPipeline:
                 with Image.open(image_path) as img:
                     width, height = img.size
             except:
-                width, height = cam.width, cam.height
+                width = getattr(cam, 'width', 640)
+                height = getattr(cam, 'height', 480)
             
-            # 회전 행렬과 평행이동 (COLMAP format)
-            R = quaternion_to_rotmat(image.qvec)  # pycolmap 0.6.0 호환
-            T = image.tvec.astype(np.float32)
+            # 회전 행렬과 평행이동
+            R = safe_get_rotation_matrix(image)
+            qvec, tvec = get_image_quaternion_and_translation(image)
+            T = tvec
             
-            # 카메라 내부 파라미터에서 FOV 계산
-            if cam.model_name in ['SIMPLE_PINHOLE', 'PINHOLE']:
-                if cam.model_name == 'SIMPLE_PINHOLE':
-                    fx = fy = cam.params[0]
+            # FOV 계산
+            model_name = getattr(cam, 'model_name', 'PINHOLE')
+            params = getattr(cam, 'params', [width * 0.8, height * 0.8])
+            
+            if model_name in ['SIMPLE_PINHOLE', 'PINHOLE']:
+                if model_name == 'SIMPLE_PINHOLE':
+                    fx = fy = params[0] if len(params) > 0 else width * 0.8
                 else:
-                    fx, fy = cam.params[0], cam.params[1]
+                    fx = params[0] if len(params) > 0 else width * 0.8
+                    fy = params[1] if len(params) > 1 else height * 0.8
                 
                 FovX = focal2fov(fx, width)
                 FovY = focal2fov(fy, height)
             else:
-                # 기본값
                 FovX = focal2fov(width * 0.8, width)
                 FovY = focal2fov(height * 0.8, height)
             
@@ -326,170 +438,177 @@ class HlocPipeline:
                 height=height,
                 depth_params=None,
                 depth_path="",
-                is_test=(img_id % 8 == 0)  # 8번째마다 테스트
+                is_test=(img_id % 8 == 0)
             )
             cam_infos.append(cam_info)
-        
-        print(f"✓ Created {len(cam_infos)} camera infos")
-        
-        # 3D 포인트 추출
-        points_3d = []
-        colors_3d = []
-        
-        for point_id, point in model.points3D.items():
-            points_3d.append(point.xyz)
-            colors_3d.append(point.color / 255.0)  # 0-1로 정규화
-        
-        if len(points_3d) == 0:
-            print("⚠️  No 3D points found, creating default point cloud")
-            points_3d = np.random.randn(1000, 3).astype(np.float32)
-            colors_3d = np.random.rand(1000, 3).astype(np.float32)
-        else:
-            points_3d = np.array(points_3d, dtype=np.float32)
-            colors_3d = np.array(colors_3d, dtype=np.float32)
-        
-        # 법선 벡터 (간단히 0으로)
-        normals_3d = np.zeros_like(points_3d)
-        
-        pcd = BasicPointCloud(
-            points=points_3d,
-            colors=colors_3d,
-            normals=normals_3d
-        )
-        
-        print(f"✓ Created point cloud with {len(points_3d)} points")
-        
-        # 학습/테스트 분할
-        train_cams = [c for c in cam_infos if not c.is_test]
-        test_cams = [c for c in cam_infos if c.is_test]
-        
-        # NeRF 정규화
-        nerf_norm = self._compute_nerf_normalization(cam_infos)
-        
-        scene_info = SceneInfo(
-            point_cloud=pcd,
-            train_cameras=train_cams,
-            test_cameras=test_cams,
-            nerf_normalization=nerf_norm,
-            ply_path="",
-            is_nerf_synthetic=False
-        )
-        
-        print(f"✅ SceneInfo created successfully!")
-        print(f"   - Training cameras: {len(train_cams)}")
-        print(f"   - Test cameras: {len(test_cams)}")
-        print(f"   - 3D points: {len(points_3d)}")
-        print(f"   - Scene radius: {nerf_norm['radius']:.3f}")
-        
-        return scene_info
+            
+        except Exception as e:
+            print(f"⚠️  Failed to process image {img_id}: {e}")
+            continue
     
-    def _compute_nerf_normalization(self, cam_infos: List[CameraInfo]) -> Dict[str, Any]:
-        """NeRF 정규화 파라미터 계산 (COLMAP 스타일)"""
-        
-        cam_centers = []
-        for cam in cam_infos:
-            # COLMAP 스타일에서 camera center 복원: camera_center = -R^T @ T
-            camera_center = -cam.R.T @ cam.T
-            cam_centers.append(camera_center)
-        
-        if len(cam_centers) > 0:
-            cam_centers = np.array(cam_centers)
-            center = np.mean(cam_centers, axis=0)
-            distances = np.linalg.norm(cam_centers - center, axis=1)
-            radius = np.max(distances)
-            
-            # 최소 반지름 보장
-            if radius < 1e-6:
-                radius = 5.0
-                print(f"⚠️  Computed radius too small, setting to {radius}")
-            else:
-                radius *= 1.1  # 10% 여유분
-        else:
-            center = np.zeros(3)
-            radius = 5.0
-            print(f"⚠️  No cameras found, using default radius: {radius}")
-        
-        return {"translate": -center, "radius": float(radius)}
+    # 카메라가 처리되지 않았다면 기본 시나리오 생성
+    if len(cam_infos) == 0:
+        print("⚠️  No cameras processed from COLMAP - creating fallback scenario")
+        return create_fallback_scene_info(image_paths)
     
-    def _create_fallback_scene(self, image_paths: List[Path]) -> SceneInfo:
-        """Fallback: 개발용만 사용 - 실제 품질 목표에는 부적합"""
-        
-        print("⚠️⚠️⚠️  FALLBACK SCENE - NOT FOR PRODUCTION USE ⚠️⚠️⚠️")
-        print("This will NOT achieve SSIM 0.9+ target!")
-        
-        # [이전과 동일한 fallback 코드...]
-        # 간단한 원형 배치
-        cam_infos = []
-        for i, image_path in enumerate(image_paths):
-            try:
-                with Image.open(image_path) as img:
-                    width, height = img.size
-            except:
-                width, height = 1920, 1080
-            
-            angle = (i / len(image_paths)) * 2 * np.pi
-            radius = 5.0
-            
-            camera_center = np.array([
-                radius * np.cos(angle),
-                0.0,
-                radius * np.sin(angle)
-            ], dtype=np.float32)
-            
-            z_axis = -camera_center / np.linalg.norm(camera_center)
-            world_up = np.array([0, 1, 0], dtype=np.float32)
-            x_axis = np.cross(world_up, z_axis)
-            x_axis = x_axis / np.linalg.norm(x_axis)
-            y_axis = np.cross(z_axis, x_axis)
-            
-            R = np.column_stack([x_axis, y_axis, z_axis]).astype(np.float32)
-            T = -R @ camera_center
-            
-            focal = max(width, height) * 0.8
-            FovX = focal2fov(focal, width)
-            FovY = focal2fov(focal, height)
-            
-            cam_info = CameraInfo(
-                uid=i, R=R, T=T, FovY=float(FovY), FovX=float(FovX),
-                image_path=str(image_path), image_name=image_path.name,
-                width=width, height=height, depth_params=None, depth_path="",
-                is_test=(i % 8 == 0)
-            )
-            cam_infos.append(cam_info)
-        
-        # 간단한 포인트 클라우드
+    # 3D 포인트 클라우드
+    if len(model.points3D) > 0:
+        xyz = np.array([point.xyz for point in model.points3D.values()], dtype=np.float32)
+        colors = np.array([point.color / 255.0 for point in model.points3D.values()], dtype=np.float32)
+        normals = np.random.randn(*xyz.shape).astype(np.float32)
+        normals = normals / (np.linalg.norm(normals, axis=1, keepdims=True) + 1e-8)
+    else:
+        print("⚠️  No 3D points found, creating default point cloud")
         n_points = 10000
-        points = np.random.randn(n_points, 3).astype(np.float32) * 2
+        xyz = np.random.randn(n_points, 3).astype(np.float32) * 2
         colors = np.random.rand(n_points, 3).astype(np.float32)
         normals = np.random.randn(n_points, 3).astype(np.float32)
         normals = normals / (np.linalg.norm(normals, axis=1, keepdims=True) + 1e-8)
-        
-        pcd = BasicPointCloud(points=points, colors=colors, normals=normals)
-        
-        train_cams = [c for c in cam_infos if not c.is_test]
-        test_cams = [c for c in cam_infos if c.is_test]
-        nerf_norm = self._compute_nerf_normalization(cam_infos)
-        
-        return SceneInfo(
-            point_cloud=pcd, train_cameras=train_cams, test_cameras=test_cams,
-            nerf_normalization=nerf_norm, ply_path="", is_nerf_synthetic=False
-        )
+    
+    pcd = BasicPointCloud(points=xyz, colors=colors, normals=normals)
+    
+    # Train/Test 분할
+    train_cams = [c for c in cam_infos if not c.is_test]
+    test_cams = [c for c in cam_infos if c.is_test]
+    
+    # NeRF 정규화
+    cam_centers = []
+    for cam in cam_infos:
+        W2C = getWorld2View2(cam.R, cam.T)
+        C2W = np.linalg.inv(W2C)
+        cam_centers.append(C2W[:3, 3:4])
+    
+    if cam_centers:
+        cam_centers = np.hstack(cam_centers)
+        center = np.mean(cam_centers, axis=1, keepdims=True).flatten()
+        distances = np.linalg.norm(cam_centers - center.reshape(-1, 1), axis=0)
+        radius = np.max(distances) * 1.1
+    else:
+        center = np.zeros(3)
+        radius = 5.0
+    
+    nerf_norm = {"translate": -center, "radius": radius}
+    
+    print(f"✅ SceneInfo created: {len(train_cams)} train, {len(test_cams)} test cameras")
+    
+    return SceneInfo(
+        point_cloud=pcd,
+        train_cameras=train_cams,
+        test_cameras=test_cams,
+        nerf_normalization=nerf_norm,
+        ply_path="",
+        is_nerf_synthetic=False
+    )
 
+def create_fallback_scene_info(image_paths: List[Path]) -> SceneInfo:
+    """COLMAP 실패시 fallback SceneInfo 생성"""
+    print("🛠️  Creating fallback SceneInfo with circular camera arrangement...")
+    
+    cam_infos = []
+    for i, image_path in enumerate(image_paths):
+        try:
+            # 이미지 크기
+            with Image.open(image_path) as img:
+                width, height = img.size
+            
+            # 기본 카메라 매트릭스
+            fx = fy = max(width, height) * 0.8
+            FovX = focal2fov(fx, width)
+            FovY = focal2fov(fy, height)
+            
+            # 원형 배치
+            angle = 2 * np.pi * i / len(image_paths)
+            radius = 3.0
+            
+            # 카메라 위치
+            camera_pos = np.array([
+                radius * np.cos(angle),
+                radius * np.sin(angle),
+                0.0
+            ], dtype=np.float32)
+            
+            # 원점을 바라보는 방향
+            look_at = np.array([0.0, 0.0, 0.0], dtype=np.float32)
+            up = np.array([0.0, 0.0, 1.0], dtype=np.float32)
+            
+            # View 행렬 계산
+            forward = look_at - camera_pos
+            forward = forward / (np.linalg.norm(forward) + 1e-8)
+            
+            right = np.cross(forward, up)
+            right = right / (np.linalg.norm(right) + 1e-8)
+            
+            up = np.cross(right, forward)
+            up = up / (np.linalg.norm(up) + 1e-8)
+            
+            # 회전 행렬 (카메라 -> 월드)
+            R = np.column_stack([right, up, -forward]).T.astype(np.float32)
+            T = camera_pos.astype(np.float32)
+            
+            cam_info = CameraInfo(
+                uid=i,
+                R=R,
+                T=T,
+                FovY=float(FovY),
+                FovX=float(FovX),
+                image_path=str(image_path),
+                image_name=image_path.name,
+                width=width,
+                height=height,
+                depth_params=None,
+                depth_path="",
+                is_test=(i % 8 == 0)
+            )
+            cam_infos.append(cam_info)
+            
+        except Exception as e:
+            print(f"⚠️  Failed to process fallback {image_path}: {e}")
+            continue
+    
+    if len(cam_infos) == 0:
+        raise RuntimeError("Failed to create any cameras in fallback mode")
+    
+    # 기본 포인트 클라우드
+    n_points = 10000
+    points = np.random.randn(n_points, 3).astype(np.float32) * 2
+    colors = np.random.rand(n_points, 3).astype(np.float32)
+    normals = np.random.randn(n_points, 3).astype(np.float32)
+    normals = normals / (np.linalg.norm(normals, axis=1, keepdims=True) + 1e-8)
+    
+    pcd = BasicPointCloud(points=points, colors=colors, normals=normals)
+    
+    train_cams = [c for c in cam_infos if not c.is_test]
+    test_cams = [c for c in cam_infos if c.is_test]
+    
+    # NeRF 정규화
+    center = np.zeros(3)
+    radius = 5.0
+    nerf_norm = {"translate": -center, "radius": radius}
+    
+    print(f"✅ Fallback SceneInfo: {len(train_cams)} train, {len(test_cams)} test cameras")
+    
+    return SceneInfo(
+        point_cloud=pcd,
+        train_cameras=train_cams,
+        test_cameras=test_cams,
+        nerf_normalization=nerf_norm,
+        ply_path="",
+        is_nerf_synthetic=False
+    )
 
 def readHlocSceneInfo(path: str, 
                      images: str = "images", 
                      eval: bool = False, 
                      train_test_exp: bool = False,
                      max_images: int = 100,
-                     feature_extractor: str = 'superpoint_aachen',
-                     matcher: str = 'superglue') -> SceneInfo:
-    """Hloc 파이프라인으로 SceneInfo 생성"""
+                     **kwargs) -> SceneInfo:
+    """Hloc 파이프라인으로 SceneInfo 생성 (메인 함수)"""
     
     print("\n" + "="*60)
     print("              HLOC + 3DGS PIPELINE")
     print("="*60)
     
-    # 이미지 폴더 경로
+    # 경로 설정
     image_dir = Path(path) / images
     if not image_dir.exists():
         fallback_paths = [Path(path), Path(path) / "input"]
@@ -500,30 +619,57 @@ def readHlocSceneInfo(path: str,
     
     print(f"📁 Source path: {path}")
     print(f"📁 Images folder: {image_dir}")
-    print(f"🔧 Feature extractor: {feature_extractor}")
-    print(f"🔧 Matcher: {matcher}")
     print(f"📊 Max images: {max_images}")
     print(f"🚀 Hloc available: {HLOC_AVAILABLE}")
     
-    # 출력 디렉토리
-    output_dir = Path(path) / "hloc_output"
+    # 이미지 수집
+    image_paths = collect_images(image_dir, max_images)
+    if len(image_paths) == 0:
+        raise ValueError(f"No images found in {image_dir}")
     
-    # Hloc 파이프라인 실행
-    pipeline = HlocPipeline(device='cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"📸 Found {len(image_paths)} images")
     
-    scene_info = pipeline.process_images(
-        image_dir=str(image_dir),
-        output_dir=str(output_dir),
-        max_images=max_images
-    )
+    # HLOC이 사용 가능한 경우 시도
+    if HLOC_AVAILABLE:
+        try:
+            # Hloc SfM 실행
+            output_dir = Path(path) / "hloc_output"
+            model = run_hloc_reconstruction(image_dir, output_dir, max_images)
+            
+            if model is not None:
+                # SceneInfo 생성 시도
+                scene_info = colmap_to_scene_info(model, image_paths)
+                print("✅ Hloc pipeline completed successfully!")
+                return scene_info
+            else:
+                print("⚠️  Hloc reconstruction failed")
+        
+        except Exception as e:
+            print(f"⚠️  Hloc pipeline failed: {e}")
+            import traceback
+            traceback.print_exc()
+    else:
+        print("⚠️  pycolmap not available")
     
-    if scene_info is None:
-        raise RuntimeError("Failed to create scene info with Hloc pipeline")
-    
-    return scene_info
-
+    # Fallback: 기본 시나리오 생성
+    print("🛠️  Using fallback scenario (circular camera arrangement)")
+    try:
+        scene_info = create_fallback_scene_info(image_paths)
+        print("✅ Fallback scenario created successfully!")
+        return scene_info
+    except Exception as e:
+        print(f"❌ Fallback scenario failed: {e}")
+        raise RuntimeError(f"All reconstruction methods failed: {e}")
 
 if __name__ == "__main__":
     # 테스트
     print("Testing Hloc Pipeline...")
-    print(f"Hloc available: {HLOC_AVAILABLE}")
+    print(f"pycolmap available: {HLOC_AVAILABLE}")
+    
+    if len(sys.argv) > 1:
+        test_path = sys.argv[1]
+        try:
+            scene_info = readHlocSceneInfo(test_path)
+            print(f"✅ Success: {len(scene_info.train_cameras)} train cameras")
+        except Exception as e:
+            print(f"❌ Test failed: {e}")

@@ -97,7 +97,10 @@ def import_superglue_colmap_hybrid():
         superglue_paths = [
             current_dir / "Superglue",
             current_dir / "SuperGlue", 
-            current_dir
+            current_dir,
+            Path.cwd(),  # 현재 작업 디렉토리 추가
+            Path.cwd() / "Superglue",
+            Path.cwd() / "SuperGlue"
         ]
         
         for path in superglue_paths:

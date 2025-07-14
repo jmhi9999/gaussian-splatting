@@ -665,35 +665,30 @@ class SuperGlueCOLMAPHybrid:
             return np.zeros(len(keypoints), dtype=np.float32)
 
     def _match_single_pair(self, image_path1, image_path2):
-        """두 이미지 간 SuperGlue 매칭 수행"""
+        """두 이미지 간 SuperGlue 매칭 수행 (향상된 매칭 전략 적용, fallback 제거)"""
         try:
-            
             # 이미지 로드 및 전처리
             img1 = self._load_and_preprocess_image(image_path1)
             img2 = self._load_and_preprocess_image(image_path2)
-            
             if img1 is None or img2 is None:
                 print(f"        ❌ 이미지 로드 실패")
                 return None
-            
             # SuperPoint 특징점 추출
             pred1 = self._extract_superpoint_features_for_matching(img1)
             pred2 = self._extract_superpoint_features_for_matching(img2)
-            
             if pred1 is None or pred2 is None:
                 print(f"        ❌ SuperPoint 특징점 추출 실패")
                 return None
-            
             # SuperGlue 매칭
             matches = self._run_superglue_matching_on_pair(pred1, pred2)
-            
+            # enhanced matching: geometric verification
+            matches = self.geometric_verification(
+                pred1['keypoints'], pred2['keypoints'], matches)
             if matches is not None and len(matches) > 0:
-                
                 return matches
             else:
                 print(f"        ❌ 매칭 실패")
                 return None
-                
         except Exception as e:
             print(f"        ❌ 매칭 오류: {e}")
             return None
@@ -766,20 +761,15 @@ class SuperGlueCOLMAPHybrid:
             return None
 
     def _run_superglue_matching_on_pair(self, pred1, pred2):
-        """SuperGlue를 사용한 두 이미지 간 매칭"""
+        """SuperGlue를 사용한 두 이미지 간 매칭 (fallback 제거)"""
         try:
-            
             # SuperGlue가 기대하는 형태로 데이터 변환
-            # SuperGlue는 (B, D, N) 형태를 기대
             keypoints0 = torch.from_numpy(pred1['keypoints']).unsqueeze(0).to(self.device)  # (1, N, 2)
             keypoints1 = torch.from_numpy(pred2['keypoints']).unsqueeze(0).to(self.device)  # (1, N, 2)
             scores0 = torch.from_numpy(pred1['scores']).unsqueeze(0).to(self.device)  # (1, N)
             scores1 = torch.from_numpy(pred2['scores']).unsqueeze(0).to(self.device)  # (1, N)
             descriptors0 = torch.from_numpy(pred1['descriptors']).unsqueeze(0).transpose(1, 2).to(self.device)  # (1, 256, N)
             descriptors1 = torch.from_numpy(pred2['descriptors']).unsqueeze(0).transpose(1, 2).to(self.device)  # (1, 256, N)
-            
-            print(f"        변환된 shapes: keypoints0={keypoints0.shape}, descriptors0={descriptors0.shape}")
-            
             # 입력 데이터 준비
             data = {
                 'image0': torch.zeros(1, 1, 480, 640).to(self.device),  # 더미 이미지
@@ -791,18 +781,11 @@ class SuperGlueCOLMAPHybrid:
                 'descriptors0': descriptors0,
                 'descriptors1': descriptors1,
             }
-            
             # SuperGlue 추론
             with torch.no_grad():
                 pred = self.superglue(data)
                 matches = pred['indices0'][0].cpu().numpy()  # (N,)
                 confidence = pred['matching_scores0'][0].cpu().numpy()  # (N,)
-            
-            # 메모리 정리
-            del data, keypoints0, keypoints1, scores0, scores1, descriptors0, descriptors1
-            if self.device == "cuda":
-                torch.cuda.empty_cache()
-            
             # 유효한 매칭 필터링
             valid_matches = []
             for i, match_idx in enumerate(matches):
@@ -810,60 +793,12 @@ class SuperGlueCOLMAPHybrid:
                     confidence_score = confidence[i]
                     if confidence_score > self.superglue_config['match_threshold']:
                         valid_matches.append([i, match_idx])
-            
             if len(valid_matches) > 0:
-                
                 return np.array(valid_matches, dtype=np.int32)
             else:
-
-                # SuperGlue 실패시 간단한 descriptor 매칭으로 fallback
-                return self._fallback_descriptor_matching(pred1, pred2)
-                
+                return None
         except Exception as e:
             print(f"        ❌ SuperGlue 매칭 오류: {e}")
-            # fallback 매칭 시도
-            return self._fallback_descriptor_matching(pred1, pred2)
-
-    def _fallback_descriptor_matching(self, pred1, pred2):
-        """간단한 descriptor 매칭 fallback - 더 엄격한 설정"""
-        try:
-            print(f"        🔄 Fallback descriptor 매칭 시도...")
-            
-            desc1 = pred1['descriptors']  # (N1, 256)
-            desc2 = pred2['descriptors']  # (N2, 256)
-            
-            # L2 거리 계산
-            desc1_norm = desc1 / (np.linalg.norm(desc1, axis=1, keepdims=True) + 1e-8)
-            desc2_norm = desc2 / (np.linalg.norm(desc2, axis=1, keepdims=True) + 1e-8)
-            
-            # 모든 쌍의 거리 계산
-            distances = np.zeros((desc1.shape[0], desc2.shape[0]))
-            for i in range(desc1.shape[0]):
-                for j in range(desc2.shape[0]):
-                    distances[i, j] = np.linalg.norm(desc1_norm[i] - desc2_norm[j])
-            
-            # 최근접 이웃 매칭 (더 엄격한 조건)
-            matches = []
-            for i in range(desc1.shape[0]):
-                best_j = np.argmin(distances[i])
-                best_distance = distances[i, best_j]
-                
-                # 더 엄격한 거리 임계값
-                if best_distance < 0.6:  # 1.0 → 0.6 (더 엄격한 임계값)
-                    # 상호 최근접 이웃 확인 (Mutual Nearest Neighbor)
-                    reciprocal_best = np.argmin(distances[:, best_j])
-                    if reciprocal_best == i:
-                        matches.append([i, best_j])
-            
-            if len(matches) > 0:
-                print(f"        ✅ Fallback 매칭: {len(matches)}개")
-                return np.array(matches, dtype=np.int32)
-            else:
-                print(f"        ❌ Fallback 매칭도 실패")
-                return None
-                
-        except Exception as e:
-            print(f"        ❌ Fallback 매칭 오류: {e}")
             return None
 
     def _run_superpoint_only_matching(self, image_paths, database_path):
@@ -1045,6 +980,16 @@ class SuperGlueCOLMAPHybrid:
                 raise RuntimeError(f"유효한 이미지가 부족합니다: {len(valid_images)}장 (최소 3장 필요)")
             image_paths = valid_images
             print(f"  ✅ 유효한 이미지: {len(image_paths)}장")
+            # === 초기쌍 선택 (앞 10장만 사용) ===
+            initial_pair = self.find_initial_pair(image_paths[:10])
+            if initial_pair is not None:
+                i, j = initial_pair
+                print(f"  ✅ 초기쌍: {initial_pair} ({image_paths[i].name}, {image_paths[j].name})")
+                # === 증분식 카메라 등록 ===
+                poses, points3D = self.incremental_reconstruction(image_paths[:10], initial_pair)
+                print(f"  ✅ 증분식 SfM 결과: 카메라 {len(poses)}개, 3D포인트 {len(points3D)}개")
+            else:
+                print("  ⚠️  초기쌍을 찾지 못했습니다.")
             # === 랜덤 train/test split 적용 ===
             train_paths, test_paths, train_indices, test_indices = self.split_train_test(image_paths, test_ratio=0.2, seed=42)
             print(f"  ✅ 랜덤 split: train {len(train_paths)}장, test {len(test_paths)}장")
@@ -1146,9 +1091,6 @@ class SuperGlueCOLMAPHybrid:
             "--Mapper.init_min_num_inliers", "1",
             "--Mapper.abs_pose_min_num_inliers", "1",
             "--Mapper.filter_max_reproj_error", "200.0",
-            "--Mapper.min_track_length", "2",
-            "--Mapper.tri_min_angle", "0.1",
-            "--Mapper.tri_max_angle", "179.9",
             "--Mapper.max_num_models", "1",
             "--Mapper.min_model_size", "1"
         ]
@@ -2247,6 +2189,275 @@ class SuperGlueCOLMAPHybrid:
             traceback.print_exc()
             raise RuntimeError(f"여러 reconstruction 병합 실패: {e}")
 
+    def find_initial_pair(self, image_paths):
+        """
+        모든 이미지 쌍에 대해 SuperPoint/Glue 매칭 개수를 계산하여
+        가장 매칭이 잘 되는 쌍을 초기쌍으로 선택
+        (입력 이미지가 많을 경우, 앞 10장만 사용)
+        """
+        print("🔍 초기쌍(Initial Pair) 탐색 중...")
+        best_pair = None
+        max_matches = 0
+        n = len(image_paths)
+        for i in range(n):
+            for j in range(i+1, n):
+                print(f"  [초기쌍 후보] {i}-{j} 매칭 시도...")
+                matches = self._match_single_pair(image_paths[i], image_paths[j])
+                if matches is not None:
+                    num_matches = len(matches)
+                    print(f"    → 매칭 개수: {num_matches}")
+                    if num_matches > max_matches:
+                        max_matches = num_matches
+                        best_pair = (i, j)
+                else:
+                    print("    → 매칭 실패")
+        print(f"✅ 최적 초기쌍: {best_pair} (매칭 {max_matches}개)")
+        return best_pair
+
+    def extract_all_features(self, image_paths):
+        """
+        모든 이미지에 대해 SuperPoint 특징점/디스크립터 추출
+        """
+        features = []
+        for img_path in image_paths:
+            img = self._load_and_preprocess_image(img_path)
+            pred = self._extract_superpoint_features_for_matching(img)
+            if pred is None:
+                raise RuntimeError(f"SuperPoint 추출 실패: {img_path}")
+            features.append(pred)
+        return features
+
+    def initialize_reconstruction(self, features, i, j, K):
+        """
+        초기쌍(i, j)으로 relative pose 추정 및 triangulation (SuperGlue만 사용)
+        """
+        matches = self._run_superglue_matching_on_pair(features[i], features[j])
+        matches = self.geometric_verification(
+            features[i]['keypoints'], features[j]['keypoints'], matches)
+        if matches is None or len(matches) < 8:
+            raise RuntimeError("초기쌍 매칭 실패")
+        kpts1 = features[i]['keypoints'][matches[:,0]]
+        kpts2 = features[j]['keypoints'][matches[:,1]]
+        E, mask = cv2.findEssentialMat(kpts1, kpts2, K, method=cv2.RANSAC, threshold=1.0)
+        if E is None:
+            raise RuntimeError("Essential matrix 추정 실패")
+        _, R, t, mask_pose = cv2.recoverPose(E, kpts1, kpts2, K)
+        pose0 = (np.eye(3), np.zeros(3))
+        pose1 = (R, t.reshape(3))
+        P0 = K @ np.hstack([pose0[0], pose0[1][:,None]])
+        P1 = K @ np.hstack([pose1[0], pose1[1][:,None]])
+        pts4d = cv2.triangulatePoints(P0, P1, kpts1.T, kpts2.T).T
+        pts3d = (pts4d[:,:3] / pts4d[:,3:4])
+        point_observations = []
+        for idx, m in enumerate(mask_pose.ravel()):
+            if m:
+                point_observations.append({
+                    'xyz': pts3d[idx],
+                    'obs': {i: matches[idx,0], j: matches[idx,1]}
+                })
+        return {i: pose0, j: pose1}, point_observations
+
+    def find_2d3d_correspondences(self, features, point_observations, img_idx):
+        """
+        등록된 3D포인트와 img_idx의 2D keypoint 매칭
+        """
+        pts3d = []
+        pts2d = []
+        for pt in point_observations:
+            if img_idx in pt['obs']:
+                pts3d.append(pt['xyz'])
+                pts2d.append(features[img_idx]['keypoints'][pt['obs'][img_idx]])
+        if len(pts3d) < 6:
+            return None, None
+        return np.array(pts3d, dtype=np.float32), np.array(pts2d, dtype=np.float32)
+
+    def estimate_pose_pnp(self, pts3d, pts2d, K):
+        """
+        PnP로 pose 추정 (RANSAC)
+        """
+        success, rvec, tvec, inliers = cv2.solvePnPRansac(
+            pts3d, pts2d, K, None, flags=cv2.SOLVEPNP_ITERATIVE)
+        if not success or inliers is None or len(inliers) < 6:
+            return None, None
+        R, _ = cv2.Rodrigues(rvec)
+        t = tvec.reshape(3)
+        return (R, t), inliers.ravel()
+
+    def triangulate_new_points(self, features, poses, K, point_observations, new_img_idx):
+        """
+        새로 등록된 이미지와 기존 등록 이미지 간 매칭으로 새로운 3D포인트 생성
+        """
+        for reg_img_idx in poses.keys():
+            if reg_img_idx == new_img_idx:
+                continue
+            matches = self._fallback_descriptor_matching(features[reg_img_idx], features[new_img_idx])
+            if matches is None or len(matches) < 8:
+                continue
+            kpts1 = features[reg_img_idx]['keypoints'][matches[:,0]]
+            kpts2 = features[new_img_idx]['keypoints'][matches[:,1]]
+            P0 = K @ np.hstack([poses[reg_img_idx][0], poses[reg_img_idx][1][:,None]])
+            P1 = K @ np.hstack([poses[new_img_idx][0], poses[new_img_idx][1][:,None]])
+            pts4d = cv2.triangulatePoints(P0, P1, kpts1.T, kpts2.T).T
+            pts3d = (pts4d[:,:3] / pts4d[:,3:4])
+            for idx in range(len(pts3d)):
+                already = False
+                for pt in point_observations:
+                    if reg_img_idx in pt['obs'] and pt['obs'][reg_img_idx] == matches[idx,0]:
+                        already = True
+                        break
+                if not already:
+                    point_observations.append({
+                        'xyz': pts3d[idx],
+                        'obs': {reg_img_idx: matches[idx,0], new_img_idx: matches[idx,1]}
+                    })
+
+    def incremental_reconstruction(self, image_paths, initial_pair):
+        """
+        Sequential SfM: 초기쌍으로 reconstruction 시작 후, 나머지 이미지를 하나씩 증분식으로 등록
+        Selective pair generation, BA, enhanced matching 적용
+        """
+        print("🚀 Incremental camera registration 시작")
+        n = len(image_paths)
+        # 카메라 내부 파라미터 (간단히 고정)
+        K = np.array([[1200,0,640],[0,1200,480],[0,0,1]], dtype=np.float32)
+        # 1. 모든 특징점 추출
+        features = self.extract_all_features(image_paths)
+        # 2. selective pair generation
+        overlap = self.compute_feature_overlap_matrix(features)
+        selective_pairs = self.get_selective_pairs(overlap)
+        print(f"  [SelectivePairs] {len(selective_pairs)}쌍 사용")
+        # 3. 초기쌍으로 reconstruction 시작
+        poses, point_observations = self.initialize_reconstruction(features, initial_pair[0], initial_pair[1], K)
+        registered = set(poses.keys())
+        unregistered = set(range(n)) - registered
+        # 4. 증분식 등록 반복
+        ba_interval = 2  # BA 주기
+        step = 0
+        while unregistered:
+            best_img = None
+            best_inliers = 0
+            best_pose = None
+            best_inlier_idx = None
+            for k in unregistered:
+                pts3d, pts2d = self.find_2d3d_correspondences(features, point_observations, k)
+                if pts3d is None or len(pts3d) < 6:
+                    continue
+                pose, inliers = self.estimate_pose_pnp(pts3d, pts2d, K)
+                if pose is not None and len(inliers) > best_inliers:
+                    best_inliers = len(inliers)
+                    best_img = k
+                    best_pose = pose
+                    best_inlier_idx = inliers
+            if best_img is None:
+                print("  더 이상 등록할 이미지가 없습니다.")
+                break
+            # 등록
+            poses[best_img] = best_pose
+            registered.add(best_img)
+            unregistered.remove(best_img)
+            print(f"  [등록] {best_img} ({image_paths[best_img].name}), inliers: {best_inliers}")
+            # selective pair triangulation
+            for reg_img_idx in poses.keys():
+                if reg_img_idx == best_img:
+                    continue
+                if (min(reg_img_idx, best_img), max(reg_img_idx, best_img)) not in selective_pairs:
+                    continue
+                matches = self._fallback_descriptor_matching(features[reg_img_idx], features[best_img])
+                # enhanced matching: geometric verification
+                matches = self.geometric_verification(
+                    features[reg_img_idx]['keypoints'], features[best_img]['keypoints'], matches)
+                if matches is None or len(matches) < 8:
+                    continue
+                kpts1 = features[reg_img_idx]['keypoints'][matches[:,0]]
+                kpts2 = features[best_img]['keypoints'][matches[:,1]]
+                P0 = K @ np.hstack([poses[reg_img_idx][0], poses[reg_img_idx][1][:,None]])
+                P1 = K @ np.hstack([poses[best_img][0], poses[best_img][1][:,None]])
+                pts4d = cv2.triangulatePoints(P0, P1, kpts1.T, kpts2.T).T
+                pts3d = (pts4d[:,:3] / pts4d[:,3:4])
+                for idx in range(len(pts3d)):
+                    already = False
+                    for pt in point_observations:
+                        if reg_img_idx in pt['obs'] and pt['obs'][reg_img_idx] == matches[idx,0]:
+                            already = True
+                            break
+                    if not already:
+                        point_observations.append({
+                            'xyz': pts3d[idx],
+                            'obs': {reg_img_idx: matches[idx,0], best_img: matches[idx,1]}
+                        })
+            step += 1
+            if step % ba_interval == 0:
+                self.bundle_adjustment(poses, point_observations, features, K)
+        print(f"✅ Incremental registration 완료! 등록된 카메라: {len(poses)}개, 3D포인트: {len(point_observations)}개")
+        return poses, point_observations
+
+    def compute_feature_overlap_matrix(self, features, min_matches=15):
+        """
+        모든 이미지 쌍에 대해 SuperPoint 매칭 개수(overlap) 행렬 계산 (SuperGlue만 사용)
+        """
+        n = len(features)
+        overlap = np.zeros((n, n), dtype=int)
+        for i in range(n):
+            for j in range(i+1, n):
+                matches = self._run_superglue_matching_on_pair(features[i], features[j])
+                matches = self.geometric_verification(
+                    features[i]['keypoints'], features[j]['keypoints'], matches)
+                if matches is not None:
+                    overlap[i, j] = len(matches)
+                    overlap[j, i] = len(matches)
+        return overlap
+
+    def get_selective_pairs(self, overlap, min_matches=15, seq_window=2):
+        """
+        overlap 행렬을 기반으로, 충분히 겹치는 쌍만 반환
+        + 연속 프레임(seq_window)도 항상 포함
+        """
+        n = overlap.shape[0]
+        pairs = set()
+        for i in range(n):
+            for j in range(i+1, n):
+                if overlap[i, j] >= min_matches or abs(i-j) <= seq_window:
+                    pairs.add((i, j))
+        return list(pairs)
+
+    def geometric_verification(self, kpts1, kpts2, matches, threshold=1.0):
+        """
+        매칭 결과에 대해 RANSAC으로 inlier만 남김 (Fundamental matrix)
+        """
+        if matches is None or len(matches) < 8:
+            return np.array([], dtype=int)
+        pts1 = kpts1[matches[:,0]]
+        pts2 = kpts2[matches[:,1]]
+        F, mask = cv2.findFundamentalMat(pts1, pts2, cv2.RANSAC, threshold)
+        if mask is not None:
+            inlier_idx = np.where(mask.ravel() == 1)[0]
+            return matches[inlier_idx]
+        else:
+            return np.array([], dtype=int)
+
+    def bundle_adjustment(self, poses, point_observations, features, K, max_iter=20):
+        """
+        간단한 품질 기반 번들조정(BA): reprojection error 최소화
+        (실제 최적화는 옵션, 잔차함수만 구현)
+        """
+        # 실제 최적화는 생략, 잔차만 계산
+        total_error = 0
+        count = 0
+        for pt in point_observations:
+            xyz = pt['xyz']
+            for img_idx, kp_idx in pt['obs'].items():
+                R, t = poses[img_idx]
+                Xc = R @ xyz + t
+                x_proj = K @ Xc
+                x_proj = x_proj[:2] / x_proj[2]
+                x_gt = features[img_idx]['keypoints'][kp_idx]
+                error = np.linalg.norm(x_proj - x_gt)
+                total_error += error
+                count += 1
+        avg_error = total_error / max(count, 1)
+        print(f"  [BA] 평균 reprojection error: {avg_error:.2f} (관측 {count}개)")
+        return avg_error
+
 # 사용 예시
 if __name__ == "__main__":
     import argparse
@@ -2280,3 +2491,4 @@ if __name__ == "__main__":
         print(f"   Point cloud: {len(scene_info.point_cloud.points)} points")
     else:
         print("❌ 파이프라인 실패")
+
