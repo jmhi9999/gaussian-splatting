@@ -1003,10 +1003,22 @@ class SuperGlueCOLMAPHybrid:
             pairs.add((i, j))
         return list(pairs)
 
-    # 나머지 메서드들은 기존과 동일하게 유지...
+    def split_train_test(self, image_paths, test_ratio=0.2, seed=42):
+        import random
+        random.seed(seed)
+        n = len(image_paths)
+        indices = list(range(n))
+        random.shuffle(indices)
+        n_test = int(n * test_ratio)
+        test_indices = set(indices[:n_test])
+        train_indices = set(indices[n_test:])
+        train_paths = [image_paths[i] for i in train_indices]
+        test_paths = [image_paths[i] for i in test_indices]
+        return train_paths, test_paths, train_indices, test_indices
+
     def process_images(self, image_dir: str, output_dir: str, max_images: int = 100):
-        """메인 처리 메서드 - 개선된 에러 처리"""
-        print("🚀 SuperGlue + COLMAP 하이브리드 파이프라인 시작")
+        """메인 처리 메서드 - 개선된 에러 처리 (anti-overfitting)"""
+        print("🚀 SuperGlue + COLMAP 하이브리드 파이프라인 시작 (anti-overfitting)")
         
         output_path = Path(output_dir)
         output_path.mkdir(parents=True, exist_ok=True)
@@ -1017,9 +1029,7 @@ class SuperGlueCOLMAPHybrid:
             image_paths = self._collect_images(image_dir, max_images)
             if len(image_paths) == 0:
                 raise RuntimeError("처리할 이미지를 찾을 수 없습니다")
-            
             print(f"  선택된 이미지: {len(image_paths)}장")
-            
             # ✅ 이미지 유효성 검증
             valid_images = []
             for img_path in image_paths:
@@ -1031,83 +1041,66 @@ class SuperGlueCOLMAPHybrid:
                         print(f"  ⚠️  무효한 이미지 제외: {img_path}")
                 except Exception as e:
                     print(f"  ⚠️  이미지 로드 실패 제외: {img_path} - {e}")
-            
             if len(valid_images) < 3:
                 raise RuntimeError(f"유효한 이미지가 부족합니다: {len(valid_images)}장 (최소 3장 필요)")
-            
             image_paths = valid_images
             print(f"  ✅ 유효한 이미지: {len(image_paths)}장")
-            
-            input_dir = self._prepare_input_images(image_paths, output_path)
-            
+            # === 랜덤 train/test split 적용 ===
+            train_paths, test_paths, train_indices, test_indices = self.split_train_test(image_paths, test_ratio=0.2, seed=42)
+            print(f"  ✅ 랜덤 split: train {len(train_paths)}장, test {len(test_paths)}장")
+            # 입력 이미지 준비 (순서는 train+test 순서로)
+            all_paths = train_paths + test_paths
+            input_dir = self._prepare_input_images(all_paths, output_path)
             # 2. COLMAP 데이터베이스 생성
             print("\n[2/6] COLMAP 데이터베이스 생성...")
             database_path = output_path / "database.db"
-            if not self._create_colmap_database(image_paths, database_path, input_dir):
+            if not self._create_colmap_database(all_paths, database_path, input_dir):
                 raise RuntimeError("COLMAP 데이터베이스 생성 실패")
-            
-            # 3. 특징점 추출 (SuperPoint 또는 COLMAP SIFT)
+            # 3. 특징점 추출 (SuperPoint)
             print("\n[3/6] 특징점 추출...")
-            superpoint_success = self._extract_superpoint_features(image_paths, database_path, input_dir)
-            
+            superpoint_success = self._extract_superpoint_features(all_paths, database_path, input_dir)
             if not superpoint_success:
                 print("  ❌ SuperPoint 특징점 추출 실패. SIFT fallback은 비활성화됨.")
                 raise RuntimeError("SuperPoint 특징점 추출 실패")
-            
             # ✅ 특징점 개수 검증
             if not self._verify_features_in_database(database_path):
                 raise RuntimeError("특징점 추출 실패 - 충분한 특징점이 없습니다")
-            
-            # 4. 매칭 (빠른 COLMAP exhaustive matcher)
+            # 4. 매칭 (train set만)
             print("\n[4/6] 특징점 매칭...")
-            matching_success = self._run_superglue_matching(image_paths, database_path)
-            
+            matching_success = self._run_superglue_matching(train_paths, database_path, all_paths)
             if not matching_success:
                 print("  ⚠️  SuperGlue 매칭 실패, COLMAP 매칭으로 fallback...")
                 self._run_colmap_matching_fast(database_path)
-            
             # ✅ 매칭 결과 검증
             if not self._verify_matches_in_database(database_path):
                 raise RuntimeError("매칭 실패 - 충분한 매칭이 없습니다")
-            
             # 5. 포즈 추정
             print("\n[5/6] 포즈 추정...")
             sparse_dir = output_path / "sparse"
             sparse_dir.mkdir(exist_ok=True)
-            
-            # COLMAP 매퍼 실행 - 실패시 예외 발생
             if not self._run_colmap_mapper_fast(database_path, input_dir, sparse_dir):
                 raise RuntimeError("COLMAP 매퍼 실패 - SceneInfo fallback 방지")
-            
             # ✅ reconstruction 결과 검증
             if not self._verify_reconstruction(sparse_dir):
                 raise RuntimeError("COLMAP reconstruction 실패 - 유효한 3D 모델이 없습니다")
-            
             # 6. 언디스토션 (옵션)
             print("\n[6/6] 언디스토션...")
             undistorted_dir = output_path / "undistorted"
             self._run_colmap_undistortion_fast(input_dir, sparse_dir, undistorted_dir)
-            
             # 7. 3DGS 변환
             print("\n[7/6] 3DGS 형식 변환...")
-            scene_info = self._convert_to_3dgs_format(output_path, image_paths)
-            
+            scene_info = self._convert_to_3dgs_format(output_path, all_paths, train_indices, test_indices)
             if scene_info is None:
                 raise RuntimeError("3DGS 형식 변환 실패")
-            
             # ✅ 최종 결과 검증
             if not self._verify_scene_info(scene_info):
                 raise RuntimeError("SceneInfo 검증 실패")
-            
             print("✅ 하이브리드 파이프라인 완료!")
             return scene_info
-            
         except Exception as e:
             print(f"\n❌ 파이프라인 실패: {e}")
             import traceback
             traceback.print_exc()
-            
-            # ✅ 실패시 기본 SceneInfo 생성 시도
             print("🔄 기본 SceneInfo 생성 시도...")
             try:
                 fallback_scene = self._create_default_scene_info(image_paths, output_path)
@@ -1116,7 +1109,6 @@ class SuperGlueCOLMAPHybrid:
                     return fallback_scene
             except Exception as fallback_error:
                 print(f"❌ 기본 SceneInfo 생성도 실패: {fallback_error}")
-            
             return None
 
     def _run_colmap_matching_fast(self, database_path):
@@ -1452,90 +1444,72 @@ class SuperGlueCOLMAPHybrid:
             print("    💡 하지만 계속 진행합니다...")
             return True  # 오류가 발생해도 계속 진행
 
-    def _run_superglue_matching(self, image_paths, database_path):
-        """SuperGlue 매칭 - 실제 매칭 결과를 COLMAP DB에 저장 - 하이브리드 쌍 선택"""
-        print("  🔥 SuperGlue 하이브리드 매칭 중...")
-        
-        if self.superglue is None:
-            if self.superpoint is not None:
-                print("  ⚠️  SuperGlue 모델 없음, SuperPoint-only 매칭으로 fallback...")
-                return self._run_superpoint_only_matching(image_paths, database_path)
-            else:
-                print("  ⚠️  SuperGlue 모델 없음, COLMAP 매칭으로 fallback...")
-                self._run_colmap_matching_fast(database_path)
-                return True  # COLMAP 매칭은 성공으로 간주
-            return False
-        
+    def _run_superglue_matching(self, train_paths, database_path, all_paths):
+        """SuperGlue 매칭 - train set만 사용 (anti-overfitting)"""
+        print("  🔥 SuperGlue 하이브리드 매칭 중 (train set only)...")
         try:
             conn = sqlite3.connect(str(database_path))
             cursor = conn.cursor()
-            
-            # 기존 matches 정리
             cursor.execute("DELETE FROM matches")
             cursor.execute("DELETE FROM two_view_geometries")
-            
-            # 이미지 쌍 매칭
             successful_matches = 0
             total_pairs = 0
-            
-            # 하이브리드 쌍 생성
-            matching_pairs = self._generate_matching_pairs(image_paths)
-            print(f"    {len(image_paths)}장 이미지에서 {len(matching_pairs)}개 하이브리드 쌍 매칭 수행 (sequential+random+partial exhaustive)...")
-            
-            # 이미지 ID 매핑 생성
+            matching_pairs = self._generate_matching_pairs(train_paths)
+            print(f"    {len(train_paths)}장 train 이미지에서 {len(matching_pairs)}개 쌍 매칭 수행 (sequential+random+partial exhaustive)...")
+            # 이미지 ID 매핑 생성 (all_paths 기준)
             image_id_map = {}
             cursor.execute("SELECT image_id, name FROM images ORDER BY image_id")
             for image_id, name in cursor.fetchall():
                 try:
                     idx = int(name.split('_')[1].split('.')[0])
-                    image_id_map[idx] = image_id
+                    if idx < len(all_paths):
+                        image_id_map[idx] = image_id
                 except:
                     continue
-            
+            # train set 내 쌍만 매칭
             for i, j in matching_pairs:
                 total_pairs += 1
                 print(f"      매칭 {i}-{j}...")
-                matches = self._match_single_pair(image_paths[i], image_paths[j])
-                if matches is not None and len(matches) >= 10:  # 최소 10개 매칭
-                    if i in image_id_map and j in image_id_map:
-                        pair_id = image_id_map[i] * 2147483647 + image_id_map[j]  # COLMAP pair_id 형식
-                        cursor.execute(
-                            "INSERT INTO matches (pair_id, rows, cols, data) VALUES (?, ?, ?, ?)",
-                            (pair_id, len(matches), 2, matches.tobytes())
-                        )
-                        cursor.execute(
-                            "INSERT INTO two_view_geometries (pair_id, rows, cols, data, config) VALUES (?, ?, ?, ?, ?)",
-                            (pair_id, len(matches), 2, matches.tobytes(), 2)  # config=2는 기본값
-                        )
-                        print(f"        ✅ {len(matches)}개 매칭 저장 (pair_id: {pair_id})")
-                        successful_matches += 1
+                matches = self._match_single_pair(train_paths[i], train_paths[j])
+                if matches is not None and len(matches) >= 10:
+                    if i < len(train_paths) and j < len(train_paths):
+                        idx_i = all_paths.index(train_paths[i])
+                        idx_j = all_paths.index(train_paths[j])
+                        if idx_i in image_id_map and idx_j in image_id_map:
+                            pair_id = image_id_map[idx_i] * 2147483647 + image_id_map[idx_j]
+                            cursor.execute(
+                                "INSERT INTO matches (pair_id, rows, cols, data) VALUES (?, ?, ?, ?)",
+                                (pair_id, len(matches), 2, matches.tobytes())
+                            )
+                            cursor.execute(
+                                "INSERT INTO two_view_geometries (pair_id, rows, cols, data, config) VALUES (?, ?, ?, ?, ?)",
+                                (pair_id, len(matches), 2, matches.tobytes(), 2)
+                            )
+                            print(f"        ✅ {len(matches)}개 매칭 저장 (pair_id: {pair_id})")
+                            successful_matches += 1
+                        else:
+                            print(f"        ❌ 이미지 ID 매핑 실패")
                     else:
-                        print(f"        ❌ 이미지 ID 매핑 실패")
+                        print(f"        ❌ 인덱스 범위 오류")
                 else:
                     print(f"        ❌ 매칭 실패 또는 부족")
-            
             conn.commit()
             conn.close()
-            
             print(f"    📊 매칭 결과: {successful_matches}/{total_pairs} 성공")
-            
-            # 매칭 결과 확인
             self._verify_matches_in_database(database_path)
-            
             if successful_matches == 0:
                 print("    ⚠️  SuperGlue 매칭 실패, COLMAP 매칭으로 fallback...")
                 self._run_colmap_matching_fast(database_path)
-                return True  # COLMAP 매칭은 성공으로 간주
+                return True
             else:
                 print("    ✅ SuperGlue 하이브리드 매칭 완료!")
                 return True
-                
         except Exception as e:
             print(f"    ❌ SuperGlue 매칭 오류: {e}")
             print("    🔄 COLMAP 매칭으로 fallback...")
             self._run_colmap_matching_fast(database_path)
-            return True  # COLMAP 매칭은 성공으로 간주
-    
+            return True
+
     def _create_default_scene_info(self, image_paths, output_path):
         """기본 SceneInfo 생성 - 개선된 버전"""
         print("    🎯 기본 SceneInfo 생성 (개선된 버전)...")
@@ -1724,22 +1698,15 @@ class SuperGlueCOLMAPHybrid:
         """Ultra-permissive COLMAP 매퍼 (최대 포인트 클라우드) - 중복 정의 방지 위해 fast와 동일하게 유지"""
         return self._run_colmap_mapper_fast(database_path, image_path, output_path)
 
-    def _convert_to_3dgs_format(self, output_path, image_paths):
-        """3DGS 형식으로 변환 - 가장 큰 reconstruction 우선 사용"""
-        print("  🔧 3DGS SceneInfo 생성 중...")
-        
+    def _convert_to_3dgs_format(self, output_path, all_paths, train_indices, test_indices):
+        """3DGS 형식으로 변환 - train/test split 반영"""
+        print("  🔧 3DGS SceneInfo 생성 중 (anti-overfitting)...")
         try:
-            # ✅ 정확한 import 경로
             from utils.graphics_utils import BasicPointCloud
             from scene.dataset_readers import CameraInfo, SceneInfo
-            
-            # sparse 디렉토리 확인
             sparse_dir = output_path / "sparse"
-            
-            # 모든 reconstruction 찾기
             reconstruction_paths = []
             if sparse_dir.exists():
-                # 모든 하위 디렉토리 확인
                 all_dirs = [d for d in sparse_dir.iterdir() if d.is_dir()]
                 for recon_dir in all_dirs:
                     bin_files = list(recon_dir.glob("*.bin"))
@@ -1760,16 +1727,15 @@ class SuperGlueCOLMAPHybrid:
                 # 가장 큰 reconstruction을 우선적으로 사용
                 best_reconstruction = self._select_best_reconstruction(reconstruction_paths)
                 if best_reconstruction:
-                    print(f"    🎯 최적 reconstruction 선택: {best_reconstruction}")
-                    return self._parse_colmap_reconstruction(best_reconstruction, image_paths, output_path)
+                    return self._parse_colmap_reconstruction(best_reconstruction, all_paths, output_path, train_indices, test_indices)
                 else:
                     # 병합 시도
                     try:
-                        return self._parse_multiple_colmap_reconstructions(reconstruction_paths, image_paths, output_path)
+                        return self._parse_multiple_colmap_reconstructions(reconstruction_paths, all_paths, output_path, train_indices, test_indices)
                     except Exception as e:
                         print(f"    여러 reconstruction 파싱 실패: {e}")
                         # 첫 번째 reconstruction만 사용
-                        return self._parse_colmap_reconstruction(reconstruction_paths[0], image_paths, output_path)
+                        return self._parse_colmap_reconstruction(reconstruction_paths[0], all_paths, output_path, train_indices, test_indices)
             else:
                 raise RuntimeError("COLMAP reconstruction 없음 - SceneInfo fallback 방지")
             
@@ -1824,93 +1790,56 @@ class SuperGlueCOLMAPHybrid:
         
         return best_reconstruction
 
-    def _parse_colmap_reconstruction(self, reconstruction_path, image_paths, output_path):
-        """COLMAP reconstruction 파싱 - 개선된 버전"""
+    def _parse_colmap_reconstruction(self, reconstruction_path, all_paths, output_path, train_indices, test_indices):
+        """COLMAP reconstruction 파싱 - train/test split 반영"""
         print(f"    COLMAP reconstruction 파싱: {reconstruction_path}")
-        
         try:
-            # COLMAP reconstruction 파일들 확인
-            cameras_bin = reconstruction_path / "cameras.bin"
-            images_bin = reconstruction_path / "images.bin"
-            points3d_bin = reconstruction_path / "points3D.bin"
-            
-            if not all([cameras_bin.exists(), images_bin.exists(), points3d_bin.exists()]):
-                raise RuntimeError("COLMAP reconstruction 파일 누락")
-            
-            # COLMAP reconstruction을 직접 파싱
             from scene.colmap_loader import read_intrinsics_binary, read_extrinsics_binary, read_points3D_binary
             from utils.graphics_utils import BasicPointCloud
             from scene.dataset_readers import CameraInfo, SceneInfo
-            
-            # 카메라 내부 파라미터 읽기
+            cameras_bin = reconstruction_path / "cameras.bin"
+            images_bin = reconstruction_path / "images.bin"
+            points3d_bin = reconstruction_path / "points3D.bin"
+            if not all([cameras_bin.exists(), images_bin.exists(), points3d_bin.exists()]):
+                raise RuntimeError("COLMAP reconstruction 파일 누락")
             cameras = read_intrinsics_binary(str(cameras_bin))
             print(f"      카메라 내부 파라미터: {len(cameras)}개")
-            
-            # 이미지 외부 파라미터 읽기
             images = read_extrinsics_binary(str(images_bin))
             print(f"      이미지 외부 파라미터: {len(images)}개")
-            
-            # 3D 포인트 읽기
             xyzs, rgbs, errors = read_points3D_binary(str(points3d_bin))
             print(f"      3D 포인트: {len(xyzs)}개")
-            
-            # ⚠️ 카메라 개수 경고
-            if len(images) < len(image_paths) * 0.5:  # 50% 미만이면 경고
-                print(f"      ⚠️  경고: COLMAP reconstruction에 포함된 이미지가 적습니다!")
-                print(f"         원본 이미지: {len(image_paths)}개")
-                print(f"         Reconstruction 이미지: {len(images)}개")
-                print(f"         포함률: {len(images)/len(image_paths)*100:.1f}%")
-            
-            # SceneInfo 생성
             train_cameras = []
             test_cameras = []
-            
-            # 이미지 경로 매핑 생성 - COLMAP 이름과 실제 파일명 매핑
             image_name_to_path = {}
-            
-            # 원본 이미지 파일들을 순서대로 정렬
-            sorted_image_paths = sorted(image_paths, key=lambda x: x.name)
-            
+            sorted_image_paths = list(all_paths)
             for i, path in enumerate(sorted_image_paths):
-                # COLMAP이 사용하는 이름 형식: image_0000.jpg, image_0001.jpg, ...
                 colmap_name = f"image_{i:04d}.jpg"
                 image_name_to_path[colmap_name] = path
-            
             successful_cameras = 0
             for image_id, image in images.items():
-                # 이미지 파일 경로 찾기
                 image_name = image.name
                 if image_name not in image_name_to_path:
                     print(f"      ⚠️  이미지 경로 없음: {image_name}")
                     continue
-                
                 image_path = image_name_to_path[image_name]
-                
-                # 카메라 내부 파라미터
                 camera = cameras[image.camera_id]
                 width, height = camera.width, camera.height
-                
-                # PINHOLE 모델 가정 (fx, fy, cx, cy)
                 if len(camera.params) == 4:
                     fx, fy, cx, cy = camera.params
                     focal_length = (fx + fy) / 2.0
                     fov_x = 2 * np.arctan(width / (2 * fx))
                     fov_y = 2 * np.arctan(height / (2 * fy))
                 else:
-                    # 기본값
                     focal_length = max(width, height) * 1.2
                     fov_x = 2 * np.arctan(width / (2 * focal_length))
                     fov_y = 2 * np.arctan(height / (2 * focal_length))
-                
-                # 외부 파라미터 (quaternion -> rotation matrix)
-                R = image.qvec2rotmat()
-                T = image.tvec
-                
-                # CameraInfo 생성
+                # train/test split 반영
+                idx = sorted_image_paths.index(image_path)
+                is_test = idx in test_indices
                 cam_info = CameraInfo(
                     uid=image_id,
-                    R=R,
-                    T=T,
+                    R=image.qvec2rotmat(),
+                    T=image.tvec,
                     FovY=fov_y,
                     FovX=fov_x,
                     depth_params=None,
@@ -1919,31 +1848,29 @@ class SuperGlueCOLMAPHybrid:
                     depth_path="",
                     width=width,
                     height=height,
-                    is_test=(image_id % 8 == 0)  # 8개마다 1개씩 테스트
+                    is_test=is_test
                 )
-                
-                if cam_info.is_test:
+                if is_test:
                     test_cameras.append(cam_info)
                 else:
                     train_cameras.append(cam_info)
-                
                 successful_cameras += 1
-            
             print(f"      ✅ 성공적으로 처리된 카메라: {successful_cameras}개")
-            
-            # 포인트 클라우드 생성
+            # 포인트 클라우드 개수 제한
+            max_points = 10000
+            if len(xyzs) > max_points:
+                print(f"      ⚠️  포인트 클라우드가 너무 많음: {len(xyzs)}개 → {max_points}개로 제한")
+                xyzs = xyzs[:max_points]
+                rgbs = rgbs[:max_points]
             point_cloud = BasicPointCloud(
                 points=xyzs.astype(np.float32),
-                colors=rgbs.astype(np.float32) / 255.0,  # 0-255 -> 0-1
-                normals=np.zeros_like(xyzs, dtype=np.float32)  # 기본값
+                colors=rgbs.astype(np.float32) / 255.0,
+                normals=np.zeros_like(xyzs, dtype=np.float32)
             )
-            
-            # NeRF 정규화 계산
             cam_centers = []
             for cam in train_cameras:
                 cam_center = -np.dot(cam.R.T, cam.T)
                 cam_centers.append(cam_center)
-            
             if cam_centers:
                 cam_centers = np.array(cam_centers)
                 center = np.mean(cam_centers, axis=0)
@@ -1952,17 +1879,12 @@ class SuperGlueCOLMAPHybrid:
             else:
                 center = np.zeros(3)
                 radius = 5.0
-            
             nerf_normalization = {
                 "translate": -center,
                 "radius": radius
             }
-            
-            # PLY 파일 저장
             ply_path = output_path / "points3D.ply"
             self._save_basic_ply(ply_path, xyzs, rgbs / 255.0)
-            
-            # SceneInfo 생성
             scene_info = SceneInfo(
                 point_cloud=point_cloud,
                 train_cameras=train_cameras,
@@ -1971,20 +1893,15 @@ class SuperGlueCOLMAPHybrid:
                 ply_path=str(ply_path),
                 is_nerf_synthetic=False
             )
-            
             print(f"    ✅ COLMAP reconstruction 파싱 성공!")
             print(f"      Train cameras: {len(train_cameras)}")
             print(f"      Test cameras: {len(test_cameras)}")
             print(f"      Point cloud: {len(xyzs)} points")
             print(f"      Scene radius: {radius:.3f}")
-            
-            # 최종 경고
             if len(train_cameras) + len(test_cameras) < 10:
                 print(f"      ⚠️  경고: 카메라 개수가 매우 적습니다!")
                 print(f"         이는 학습 품질에 영향을 줄 수 있습니다.")
-            
             return scene_info
-            
         except Exception as e:
             print(f"    ❌ COLMAP reconstruction 파싱 실패: {e}")
             import traceback
@@ -2070,7 +1987,7 @@ class SuperGlueCOLMAPHybrid:
             print("  💡 하지만 계속 진행합니다...")
             return True  # 오류가 발생해도 계속 진행
 
-    def _parse_multiple_colmap_reconstructions(self, reconstruction_paths, image_paths, output_path):
+    def _parse_multiple_colmap_reconstructions(self, reconstruction_paths, all_paths, output_path, train_indices, test_indices):
         """여러 COLMAP reconstruction 병합 - 개선된 버전"""
         print(f"    여러 COLMAP reconstruction 병합: {len(reconstruction_paths)}개")
         
