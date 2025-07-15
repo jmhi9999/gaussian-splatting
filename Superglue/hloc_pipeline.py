@@ -222,13 +222,30 @@ class QualityVerifier:
         try:
             model_dir = sfm_dir / "0"
             
+            print(f"  🔍 Checking reconstruction in: {model_dir}")
+            
+            # 디렉토리 존재 확인
+            if not model_dir.exists():
+                print(f"  ❌ Model directory does not exist: {model_dir}")
+                return False
+            
             # 필수 파일 존재 확인
             required_files = ["cameras.bin", "images.bin", "points3D.bin"]
+            missing_files = []
             for filename in required_files:
                 filepath = model_dir / filename
-                if not filepath.exists() or filepath.stat().st_size == 0:
-                    print(f"  ❌ Missing or empty file: {filename}")
-                    return False
+                if not filepath.exists():
+                    missing_files.append(filename)
+                    print(f"  ❌ Missing file: {filename}")
+                elif filepath.stat().st_size == 0:
+                    missing_files.append(filename)
+                    print(f"  ❌ Empty file: {filename}")
+                else:
+                    print(f"  ✅ Found file: {filename} ({filepath.stat().st_size} bytes)")
+            
+            if missing_files:
+                print(f"  ❌ Missing or empty files: {missing_files}")
+                return False
             
             # 카메라 수 확인
             try:
@@ -480,12 +497,18 @@ class ImprovedHlocPipeline:
             '--pairs', str(pairs_path),
             '--features', str(output_dir / f'{features_name}.h5'),
             '--matches', str(output_dir / matches_name),
-            '--camera_mode', 'SINGLE'
+            '--camera_mode', 'SINGLE',
+            '--min_num_matches', '5',  # 더 관대하게
+            '--min_num_inliers', '5'   # 더 관대하게
         ]
         
         try:
             print(f"  🚀 Running: {' '.join(reconstruction_cmd)}")
             result = subprocess.run(reconstruction_cmd, capture_output=True, text=True, timeout=3600)
+            
+            print(f"  📄 Command return code: {result.returncode}")
+            print(f"  📄 Command stdout: {result.stdout}")
+            print(f"  📄 Command stderr: {result.stderr}")
             
             if result.returncode != 0:
                 print(f"  ⚠️  Primary SfM failed: {result.stderr}")
@@ -556,11 +579,19 @@ class ImprovedHlocPipeline:
             '--pairs', str(fallback_pairs_path),
             '--features', str(output_dir / f'{features_name}.h5'),
             '--matches', str(output_dir / matches_name),
-            '--camera_mode', 'SINGLE'
+            '--camera_mode', 'SINGLE',
+            '--min_num_matches', '3',  # 매우 관대하게
+            '--min_num_inliers', '3'   # 매우 관대하게
         ]
         
         try:
+            print(f"    🚀 Running fallback: {' '.join(fallback_cmd)}")
             result = subprocess.run(fallback_cmd, capture_output=True, text=True, timeout=3600)
+            
+            print(f"    📄 Fallback return code: {result.returncode}")
+            print(f"    📄 Fallback stdout: {result.stdout}")
+            print(f"    📄 Fallback stderr: {result.stderr}")
+            
             success = result.returncode == 0 and self.verifier.verify_reconstruction(sfm_dir)
             
             if success:
