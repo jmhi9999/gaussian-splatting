@@ -36,7 +36,7 @@ def extract_superpoint_features(image_dir, output_path, config=None):
     np.savez(output_path, keypoints=all_keypoints, descriptors=all_descriptors, scores=all_scores)
     print(f"SuperPoint features saved to {output_path}")
 
-def generate_image_pairs(image_list, max_skip=5, random_pairs=500):
+def generate_image_pairs(image_list, max_skip=8, random_pairs=2000):
     pairs = []
     n = len(image_list)
     # Sequential + skip
@@ -56,10 +56,10 @@ def match_superglue(features_path, image_dir, output_path, superglue_config=None
     import torch
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     if superglue_config is None:
-        superglue_config = {'match_threshold': 0.1}
+        superglue_config = {'match_threshold': 0.05}
     else:
         if 'match_threshold' not in superglue_config:
-            superglue_config['match_threshold'] = 0.1
+            superglue_config['match_threshold'] = 0.05
     model = SuperGlue(superglue_config).to(device)
     model.eval()
     data = np.load(features_path, allow_pickle=True)
@@ -67,7 +67,7 @@ def match_superglue(features_path, image_dir, output_path, superglue_config=None
     descriptors = data['descriptors'].item()
     scores = data['scores'].item()
     image_list = sorted(keypoints.keys())
-    pairs = generate_image_pairs(image_list, max_skip=5, random_pairs=500)
+    pairs = generate_image_pairs(image_list, max_skip=8, random_pairs=2000)
     matches_dict = {}
     for img0, img1 in pairs:
         kpts0 = torch.from_numpy(keypoints[img0])[None].to(device)
@@ -128,8 +128,8 @@ def export_superglue2colmap_format(features_path, matches_path, colmap_desc_dir,
     with open(matches_txt_path, 'w') as f:
         for (im1, im2), matches in matches_dict.items():
             valid_matches = [(i, int(m)) for i, m in enumerate(matches) if m != -1]
-            if len(valid_matches) < 5:
-                continue  # 매칭 5개 미만 쌍은 기록하지 않음
+            if len(valid_matches) < 3:
+                continue  # 매칭 3개 미만 쌍은 기록하지 않음
             f.write(f"{im1} {im2}\n")
             for i, m in valid_matches:
                 f.write(f"{i} {m}\n")
@@ -248,11 +248,11 @@ def run_colmap_matches_importer(database_path, matches_path):
 if __name__ == "__main__":
     # 파라미터 쉽게 조정
     superpoint_config = {
-        'nms_radius': 4,
-        'keypoint_threshold': 0.005,
-        'max_keypoints': 1024
+        'nms_radius': 3,
+        'keypoint_threshold': 0.002,
+        'max_keypoints': 4096
     }
-    superglue_config = {'match_threshold': 0.1}
+    superglue_config = {'match_threshold': 0.05}
     min_matches_per_pair = 10  # 원하는 값으로 조정
     extract_superpoint_features("ImageInputs/images", "ImageInputs/superpoint_features.npz", config=superpoint_config)
     match_superglue("ImageInputs/superpoint_features.npz", "ImageInputs/images", "ImageInputs/superglue_matches.npz", superglue_config=superglue_config)
