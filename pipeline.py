@@ -36,14 +36,19 @@ def extract_superpoint_features(image_dir, output_path, config=None):
     np.savez(output_path, keypoints=all_keypoints, descriptors=all_descriptors, scores=all_scores)
     print(f"SuperPoint features saved to {output_path}")
 
-def generate_image_pairs(image_list, max_skip=3):
+def generate_image_pairs(image_list, max_skip=5, random_pairs=500):
     pairs = []
     n = len(image_list)
+    # Sequential + skip
     for i in range(n):
         for skip in range(1, max_skip+1):
             j = i + skip
             if j < n:
                 pairs.append((image_list[i], image_list[j]))
+    # 랜덤 일부 쌍 추가 (long-range)
+    all_possible = [(image_list[i], image_list[j]) for i in range(n) for j in range(i+max_skip+1, n)]
+    if len(all_possible) > 0 and random_pairs > 0:
+        pairs += random.sample(all_possible, min(random_pairs, len(all_possible)))
     return pairs
 
 def match_superglue(features_path, image_dir, output_path, superglue_config=None, partial_gap=5):
@@ -62,7 +67,7 @@ def match_superglue(features_path, image_dir, output_path, superglue_config=None
     descriptors = data['descriptors'].item()
     scores = data['scores'].item()
     image_list = sorted(keypoints.keys())
-    pairs = generate_image_pairs(image_list, max_skip=3)
+    pairs = generate_image_pairs(image_list, max_skip=5, random_pairs=500)
     matches_dict = {}
     for img0, img1 in pairs:
         kpts0 = torch.from_numpy(keypoints[img0])[None].to(device)
@@ -236,13 +241,18 @@ def run_colmap_matches_importer(database_path, matches_path):
         "colmap", "matches_importer",
         "--database_path", database_path,
         "--match_list_path", matches_path,
-        "--match_type", "raw"
+        "--match_type", "raw",
+        "--SiftMatching.guided_matching", "1"
     ], check=True)
 
 if __name__ == "__main__":
     # 파라미터 쉽게 조정
-    superpoint_config = {}
-    superglue_config = {'match_threshold': 0.2}  # 원하는 값으로 조정
+    superpoint_config = {
+        'nms_radius': 4,
+        'keypoint_threshold': 0.005,
+        'max_keypoints': 1024
+    }
+    superglue_config = {'match_threshold': 0.1}
     min_matches_per_pair = 10  # 원하는 값으로 조정
     extract_superpoint_features("ImageInputs/images", "ImageInputs/superpoint_features.npz", config=superpoint_config)
     match_superglue("ImageInputs/superpoint_features.npz", "ImageInputs/images", "ImageInputs/superglue_matches.npz", superglue_config=superglue_config)
