@@ -102,9 +102,9 @@ class SuperGlue3DGSPipeline:
         print("  Building camera graph from matches...")
         self._build_camera_graph_from_matches()
 
-        # 6. 🔧 FIX: 카메라 포즈 추정 (누락된 단계 추가)
+        # 6. 🔧 FIX: 카메라 포즈 추정 (개선된 버전 사용)
         print("  Estimating camera poses...")
-        self._estimate_camera_poses_robust()
+        self._estimate_camera_poses_improved()
         
         # 🔧 DEBUG: 카메라 포즈 추정 결과 확인
         print(f"    DEBUG: After pose estimation, cameras dictionary has {len(self.cameras)} cameras")
@@ -3554,6 +3554,606 @@ class SuperGlue3DGSPipeline:
                 self.point_observations[point_id] = []
             for cam_id, observed_pt, confidence in point_data['observations']:
                 self.point_observations[point_id].append((cam_id, observed_pt, confidence))
+
+    def _estimate_camera_poses_improved(self):
+        """개선된 카메라 포즈 추정 - 글로벌 최적화 및 더 나은 검증"""
+        
+        print(f"  Starting improved camera pose estimation...")
+        
+        # 1. 가장 강한 매칭 쌍을 찾아 기준 카메라 결정
+        best_pair = self._find_best_camera_pair()
+        if best_pair is None:
+            print("    No suitable camera pair found, using default poses")
+            self._create_default_camera_poses()
+            return
+        
+        cam_i, cam_j = best_pair
+        print(f"    Using cameras {cam_i} and {cam_j} as reference pair")
+        
+        # 2. 기준 카메라 쌍 초기화
+        self._initialize_reference_cameras(cam_i, cam_j)
+        
+        # 3. 점진적 카메라 등록 (Incremental SfM)
+        self._incremental_camera_registration()
+        
+        # 4. 글로벌 포즈 최적화
+        self._global_pose_optimization()
+        
+        # 5. 포즈 품질 검증 및 보정
+        self._validate_and_correct_poses()
+        
+        print(f"    Improved pose estimation completed for {len(self.cameras)} cameras")
+    
+    def _find_best_camera_pair(self):
+        """가장 강한 매칭을 가진 카메라 쌍 찾기"""
+        best_pair = None
+        best_score = 0
+        
+        for (cam_i, cam_j), matches in self.matches.items():
+            if len(matches) < 20:  # 최소 매칭 수
+                continue
+            
+            # 매칭 품질 점수 계산
+            confidences = [conf for _, _, conf in matches]
+            avg_confidence = np.mean(confidences)
+            match_score = len(matches) * avg_confidence
+            
+            if match_score > best_score:
+                best_score = match_score
+                best_pair = (cam_i, cam_j)
+        
+        return best_pair
+    
+    def _initialize_reference_cameras(self, cam_i, cam_j):
+        """기준 카메라 쌍 초기화"""
+        # 첫 번째 카메라를 원점으로 설정
+        self.cameras[cam_i] = {
+            'R': np.eye(3, dtype=np.float32),
+            'T': np.zeros(3, dtype=np.float32),
+            'K': self._estimate_intrinsics(cam_i)
+        }
+        
+        # 두 번째 카메라 포즈 추정
+        pair_key = (cam_i, cam_j) if cam_i < cam_j else (cam_j, cam_i)
+        R_rel, T_rel = self._estimate_relative_pose_strict(cam_i, cam_j, pair_key)
+        
+        if R_rel is not None and T_rel is not None:
+            self.cameras[cam_j] = {
+                'R': R_rel.astype(np.float32),
+                'T': T_rel.astype(np.float32),
+                'K': self._estimate_intrinsics(cam_j)
+            }
+            print(f"    Initialized reference pair: cameras {cam_i} and {cam_j}")
+        else:
+            print(f"    Failed to initialize reference pair")
+    
+    def _estimate_relative_pose_strict(self, cam_i, cam_j, pair_key):
+        """더 엄격한 상대 포즈 추정"""
+        matches = self.matches[pair_key]
+        
+        if len(matches) < 15:  # 더 높은 최소 매칭 수
+            return None, None
+        
+        # 고품질 매칭만 선택
+        high_conf_matches = [(idx_i, idx_j, conf) for idx_i, idx_j, conf in matches if conf > 0.3]
+        
+        if len(high_conf_matches) < 10:
+            return None, None
+        
+        kpts_i = self.image_features[cam_i]['keypoints']
+        kpts_j = self.image_features[cam_j]['keypoints']
+        
+        # 매칭점들 추출
+        pts_i = np.array([kpts_i[idx_i] for idx_i, _, _ in high_conf_matches])
+        pts_j = np.array([kpts_j[idx_j] for _, idx_j, _ in high_conf_matches])
+        
+        # 카메라 내부 파라미터
+        K_i = self.cameras.get(cam_i, {}).get('K', self._estimate_intrinsics(cam_i))
+        K_j = self._estimate_intrinsics(cam_j)
+        
+        # 엄격한 Essential Matrix 추정
+        methods = [
+            (cv2.RANSAC, 0.5, 0.999),
+            (cv2.RANSAC, 1.0, 0.999),
+            (cv2.RANSAC, 2.0, 0.99),
+            (cv2.LMEDS, 0.5, 0.99)
+        ]
+        
+        best_R, best_T = None, None
+        best_inliers = 0
+        best_quality = 0
+        
+        for method, threshold, confidence in methods:
+            try:
+                E, mask = cv2.findEssentialMat(
+                    pts_i, pts_j, K_i,
+                    method=method,
+                    prob=confidence,
+                    threshold=threshold,
+                    maxIters=2000
+                )
+                
+                if E is None or E.shape != (3, 3):
+                    continue
+                
+                # 포즈 복원
+                _, R, T, mask = cv2.recoverPose(E, pts_i, pts_j, K_i, mask=mask)
+                
+                if R is None or T is None:
+                    continue
+                
+                inliers = np.sum(mask)
+                
+                if inliers >= 8:  # 더 엄격한 최소 inlier 수
+                    # 엄격한 포즈 품질 검증
+                    quality_score = self._evaluate_pose_quality_strict(pts_i, pts_j, R, T.flatten(), K_i, K_j, mask)
+                    
+                    if quality_score > best_quality:
+                        best_R, best_T = R, T.flatten()
+                        best_inliers = inliers
+                        best_quality = quality_score
+            except Exception as e:
+                continue
+        
+        if best_R is not None:
+            print(f"    Strict pose estimation: {best_inliers} inliers, quality: {best_quality:.3f}")
+        
+        return best_R, best_T
+    
+    def _evaluate_pose_quality_strict(self, pts_i, pts_j, R, T, K_i, K_j, mask):
+        """엄격한 포즈 품질 평가"""
+        try:
+            # 회전 행렬 유효성 확인
+            det = np.linalg.det(R)
+            if abs(det - 1.0) > 0.1:
+                return 0.0
+            
+            # 삼각측량 품질 검사
+            P_i = K_i @ np.hstack([np.eye(3), np.zeros((3, 1))])
+            P_j = K_j @ np.hstack([R, T.reshape(-1, 1)])
+            
+            # inlier 포인트들만 사용
+            inlier_pts_i = pts_i[mask.flatten()]
+            inlier_pts_j = pts_j[mask.flatten()]
+            
+            if len(inlier_pts_i) < 8:
+                return 0.0
+            
+            # 삼각측량 테스트
+            valid_points = 0
+            total_error = 0.0
+            
+            for pt_i, pt_j in zip(inlier_pts_i, inlier_pts_j):
+                try:
+                    # 삼각측량
+                    pt_4d = cv2.triangulatePoints(P_i, P_j, pt_i.reshape(2, 1), pt_j.reshape(2, 1))
+                    
+                    if abs(pt_4d[3, 0]) > 1e-10:
+                        pt_3d = (pt_4d[:3] / pt_4d[3]).flatten()
+                        
+                        # 거리 체크
+                        if 0.1 < np.linalg.norm(pt_3d) < 50:
+                            # 재투영 오차 계산
+                            proj_i = P_i @ np.append(pt_3d, 1)
+                            proj_j = P_j @ np.append(pt_3d, 1)
+                            
+                            if proj_i[2] > 0 and proj_j[2] > 0:
+                                proj_i_2d = proj_i[:2] / proj_i[2]
+                                proj_j_2d = proj_j[:2] / proj_j[2]
+                                
+                                error_i = np.linalg.norm(proj_i_2d - pt_i)
+                                error_j = np.linalg.norm(proj_j_2d - pt_j)
+                                
+                                max_error = max(error_i, error_j)
+                                if max_error < 3.0:  # 엄격한 재투영 오차 임계값
+                                    total_error += max_error
+                                    valid_points += 1
+                except:
+                    continue
+            
+            if valid_points < 6:
+                return 0.0
+            
+            # 품질 점수 계산
+            avg_error = total_error / valid_points
+            inlier_ratio = len(inlier_pts_i) / len(pts_i)
+            
+            # 더 엄격한 점수 계산
+            quality_score = inlier_ratio * (1.0 / (1.0 + avg_error * 0.1))
+            
+            return quality_score
+            
+        except Exception as e:
+            return 0.0
+    
+    def _incremental_camera_registration(self):
+        """점진적 카메라 등록"""
+        estimated_cameras = set(self.cameras.keys())
+        
+        # 연결된 카메라들을 점진적으로 등록
+        changed = True
+        while changed:
+            changed = False
+            
+            for cam_id in range(len(self.image_features)):
+                if cam_id in estimated_cameras:
+                    continue
+                
+                # 이미 등록된 카메라와 연결된 카메라 찾기
+                for registered_cam in estimated_cameras:
+                    pair_key = (min(cam_id, registered_cam), max(cam_id, registered_cam))
+                    
+                    if pair_key in self.matches:
+                        # 상대 포즈 추정
+                        R_rel, T_rel = self._estimate_relative_pose_strict(registered_cam, cam_id, pair_key)
+                        
+                        if R_rel is not None and T_rel is not None:
+                            # 절대 포즈 계산
+                            R_ref, T_ref = self.cameras[registered_cam]['R'], self.cameras[registered_cam]['T']
+                            
+                            R_world = R_rel @ R_ref
+                            T_world = R_rel @ T_ref + T_rel
+                            
+                            if self._is_valid_rotation_matrix(R_world):
+                                self.cameras[cam_id] = {
+                                    'R': R_world.astype(np.float32),
+                                    'T': T_world.astype(np.float32),
+                                    'K': self._estimate_intrinsics(cam_id)
+                                }
+                                
+                                estimated_cameras.add(cam_id)
+                                changed = True
+                                print(f"    Registered camera {cam_id} from {registered_cam}")
+                                break
+    
+    def _global_pose_optimization(self):
+        """글로벌 포즈 최적화"""
+        print("    Performing global pose optimization...")
+        
+        # 간단한 Bundle Adjustment 수행
+        if len(self.cameras) >= 3 and len(self.matches) >= 10:
+            try:
+                # 카메라 포즈만 최적화 (포인트는 제외)
+                self._optimize_camera_poses_only()
+                print("    Global pose optimization completed")
+            except Exception as e:
+                print(f"    Global pose optimization failed: {e}")
+    
+    def _optimize_camera_poses_only(self):
+        """카메라 포즈만 최적화"""
+        from scipy.optimize import least_squares
+        
+        # 카메라 포즈를 벡터로 패킹
+        initial_poses = []
+        cam_ids = sorted(self.cameras.keys())
+        
+        for cam_id in cam_ids[1:]:  # 첫 번째 카메라는 고정
+            cam = self.cameras[cam_id]
+            # 회전 행렬을 로드리게스 벡터로 변환
+            rvec = self._rotation_matrix_to_angle_axis(cam['R'])
+            initial_poses.extend(rvec)
+            initial_poses.extend(cam['T'])
+        
+        if len(initial_poses) == 0:
+            return
+        
+        # 최적화 실행
+        try:
+            result = least_squares(
+                self._pose_residuals,
+                initial_poses,
+                args=(cam_ids,),
+                method='lm',
+                max_nfev=100,
+                ftol=1e-4,
+                xtol=1e-4
+            )
+            
+            # 결과 언패킹
+            self._unpack_camera_poses(result.x, cam_ids)
+            
+        except Exception as e:
+            print(f"    Pose optimization failed: {e}")
+    
+    def _pose_residuals(self, poses, cam_ids):
+        """포즈 최적화를 위한 잔차 계산"""
+        residuals = []
+        
+        # 포즈 언패킹
+        self._unpack_camera_poses(poses, cam_ids)
+        
+        # 각 매칭에 대한 재투영 오차 계산
+        for (cam_i, cam_j), matches in self.matches.items():
+            if cam_i not in self.cameras or cam_j not in self.cameras:
+                continue
+            
+            # 고품질 매칭만 사용
+            high_conf_matches = [(idx_i, idx_j, conf) for idx_i, idx_j, conf in matches if conf > 0.2]
+            
+            if len(high_conf_matches) < 5:
+                continue
+            
+            # 에피폴라 오차 계산
+            for idx_i, idx_j, conf in high_conf_matches[:10]:  # 최대 10개만 사용
+                try:
+                    kpt_i = self.image_features[cam_i]['keypoints'][idx_i]
+                    kpt_j = self.image_features[cam_j]['keypoints'][idx_j]
+                    
+                    # 에피폴라 오차 계산
+                    error = self._compute_epipolar_error(kpt_i, kpt_j, cam_i, cam_j)
+                    residuals.append(error * conf)  # 신뢰도로 가중치
+                    
+                except Exception:
+                    continue
+        
+        return np.array(residuals) if residuals else np.array([0.0])
+    
+    def _compute_epipolar_error(self, kpt_i, kpt_j, cam_i, cam_j):
+        """에피폴라 오차 계산"""
+        try:
+            # 카메라 매트릭스
+            K_i = self.cameras[cam_i]['K']
+            K_j = self.cameras[cam_j]['K']
+            R_i = self.cameras[cam_i]['R']
+            T_i = self.cameras[cam_i]['T']
+            R_j = self.cameras[cam_j]['R']
+            T_j = self.cameras[cam_j]['T']
+            
+            # 상대 포즈 계산
+            R_rel = R_j @ R_i.T
+            T_rel = T_j - R_rel @ T_i
+            
+            # Essential Matrix 계산
+            T_skew = np.array([
+                [0, -T_rel[2], T_rel[1]],
+                [T_rel[2], 0, -T_rel[0]],
+                [-T_rel[1], T_rel[0], 0]
+            ])
+            E = T_skew @ R_rel
+            
+            # Fundamental Matrix 계산
+            F = np.linalg.inv(K_j).T @ E @ np.linalg.inv(K_i)
+            
+            # 에피폴라 오차 계산
+            kpt_i_h = np.append(kpt_i, 1)
+            kpt_j_h = np.append(kpt_j, 1)
+            
+            error = abs(kpt_j_h @ F @ kpt_i_h)
+            
+            return error
+            
+        except Exception:
+            return 1.0
+    
+    def _unpack_camera_poses(self, poses, cam_ids):
+        """카메라 포즈 언패킹"""
+        idx = 0
+        
+        for cam_id in cam_ids[1:]:  # 첫 번째 카메라는 고정
+            # 로드리게스 벡터
+            rvec = poses[idx:idx+3]
+            idx += 3
+            
+            # 이동 벡터
+            tvec = poses[idx:idx+3]
+            idx += 3
+            
+            # 회전 행렬로 변환
+            R = self._angle_axis_to_rotation_matrix(rvec)
+            
+            self.cameras[cam_id]['R'] = R.astype(np.float32)
+            self.cameras[cam_id]['T'] = tvec.astype(np.float32)
+    
+    def _validate_and_correct_poses(self):
+        """포즈 품질 검증 및 보정"""
+        print("    Validating and correcting poses...")
+        
+        invalid_cameras = []
+        
+        for cam_id, cam_data in self.cameras.items():
+            if not self._is_valid_camera_pose_strict(cam_data):
+                invalid_cameras.append(cam_id)
+        
+        if invalid_cameras:
+            print(f"    Found {len(invalid_cameras)} invalid poses, correcting...")
+            self._correct_invalid_poses(invalid_cameras)
+    
+    def _is_valid_camera_pose_strict(self, cam_data):
+        """엄격한 카메라 포즈 유효성 검증"""
+        try:
+            R, T = cam_data['R'], cam_data['T']
+            
+            # 회전 행렬 검증
+            if not self._is_valid_rotation_matrix(R):
+                return False
+            
+            # 이동 벡터 검증
+            if np.any(np.isnan(T)) or np.any(np.isinf(T)):
+                return False
+            
+            # 이동 벡터 크기 검증
+            if np.linalg.norm(T) > 100:  # 너무 멀리 있는 카메라
+                return False
+            
+            return True
+            
+        except Exception:
+            return False
+    
+    def _correct_invalid_poses(self, invalid_cameras):
+        """잘못된 포즈 보정"""
+        for cam_id in invalid_cameras:
+            # 이웃 카메라들의 평균 포즈 사용
+            valid_neighbors = []
+            
+            for neighbor_id in self.camera_graph.get(cam_id, []):
+                if neighbor_id in self.cameras and neighbor_id not in invalid_cameras:
+                    valid_neighbors.append(neighbor_id)
+            
+            if valid_neighbors:
+                # 이웃 카메라들의 평균 포즈 계산
+                avg_R = np.mean([self.cameras[n]['R'] for n in valid_neighbors], axis=0)
+                avg_T = np.mean([self.cameras[n]['T'] for n in valid_neighbors], axis=0)
+                
+                # 회전 행렬 정규화
+                U, _, Vt = np.linalg.svd(avg_R)
+                avg_R = U @ Vt
+                
+                self.cameras[cam_id]['R'] = avg_R.astype(np.float32)
+                self.cameras[cam_id]['T'] = avg_T.astype(np.float32)
+                
+                print(f"    Corrected pose for camera {cam_id}")
+    
+    def _create_default_camera_poses(self):
+        """기본 카메라 포즈 생성"""
+        print("    Creating default camera poses...")
+        
+        for cam_id in range(len(self.image_features)):
+            angle = cam_id * (2 * np.pi / len(self.image_features))
+            radius = 3.0
+            
+            # 카메라 포즈 (원을 바라보도록)
+            camera_pos = np.array([
+                radius * np.cos(angle),
+                0.0,
+                radius * np.sin(angle)
+            ])
+            
+            # 원점을 향하는 방향
+            look_at = np.array([0.0, 0.0, 0.0])
+            up = np.array([0.0, 1.0, 0.0])
+            
+            # 카메라 회전 행렬 계산
+            forward = look_at - camera_pos
+            forward = forward / np.linalg.norm(forward)
+            right = np.cross(forward, up)
+            right = right / np.linalg.norm(right)
+            up = np.cross(right, forward)
+            
+            R = np.array([right, up, -forward]).T
+            T = camera_pos
+            
+            self.cameras[cam_id] = {
+                'R': R.astype(np.float32),
+                'T': T.astype(np.float32),
+                'K': self._estimate_intrinsics(cam_id)
+            }
+    
+    def _estimate_relative_pose_robust(self, cam_i, cam_j, pair_key):
+        """개선된 두 카메라 간 상대 포즈 추정 - 극도로 완화된 버전"""
+        matches = self.matches[pair_key]
+        
+        if len(matches) < 4:  # 6 → 4로 더 완화
+            print(f"    Pair {cam_i}-{cam_j}: Insufficient matches ({len(matches)} < 4)")
+            return None, None
+        
+        # 매칭점들 추출
+        kpts_i = self.image_features[cam_i]['keypoints']
+        kpts_j = self.image_features[cam_j]['keypoints']
+        
+        print(f"    Pair {cam_i}-{cam_j}: kpts_i shape: {kpts_i.shape}, kpts_j shape: {kpts_j.shape}")
+        
+        # 🔧 극도로 완화된 신뢰도 임계값
+        high_conf_matches = [(idx_i, idx_j, conf) for idx_i, idx_j, conf in matches if conf > 0.00001]  # 0.0001 → 0.00001로 대폭 완화
+        
+        if len(high_conf_matches) < 4:  # 6 → 4로 더 완화
+            high_conf_matches = [(idx_i, idx_j, conf) for idx_i, idx_j, conf in matches if conf > 0.000001]  # 0.00001 → 0.000001로 대폭 완화
+        
+        if len(high_conf_matches) < 4:  # 6 → 4로 더 완화
+            # 모든 매칭을 사용
+            high_conf_matches = [(idx_i, idx_j, conf) for idx_i, idx_j, conf in matches]
+        
+        if len(high_conf_matches) < 4:  # 6 → 4로 더 완화
+            print(f"    Pair {cam_i}-{cam_j}: Insufficient high-confidence matches ({len(high_conf_matches)} < 4)")
+            return None, None
+        
+        # 🔧 인덱스 범위 검증 강화
+        valid_matches = []
+        for idx_i, idx_j, conf in high_conf_matches:
+            if (isinstance(idx_i, (int, np.integer)) and isinstance(idx_j, (int, np.integer)) and
+                idx_i >= 0 and idx_j >= 0 and 
+                idx_i < len(kpts_i) and idx_j < len(kpts_j)):
+                valid_matches.append((idx_i, idx_j, conf))
+        
+        if len(valid_matches) < 4:  # 6 → 4로 더 완화
+            print(f"    Pair {cam_i}-{cam_j}: Insufficient valid matches after index validation ({len(valid_matches)} < 4)")
+            return None, None
+        
+        print(f"    Pair {cam_i}-{cam_j}: Using {len(valid_matches)} validated matches")
+        
+        # 🔧 개선된 포인트 추출
+        try:
+            pts_i = np.array([kpts_i[idx_i] for idx_i, _, _ in valid_matches])
+            pts_j = np.array([kpts_j[idx_j] for _, idx_j, _ in valid_matches])
+        except IndexError as e:
+            print(f"    IndexError during point extraction: {e}")
+            return None, None
+        
+        # 🔧 기하학적 일관성 사전 검증 (더 관대하게)
+        if not self._check_geometric_consistency_very_relaxed(pts_i, pts_j):
+            print(f"    Pair {cam_i}-{cam_j}: Failed geometric consistency check")
+            return None, None
+        
+        # 카메라 내부 파라미터
+        K_i = self.cameras.get(cam_i, {}).get('K', self._estimate_intrinsics(cam_i))
+        K_j = self._estimate_intrinsics(cam_j)
+        
+        # 🔧 극도로 관대한 Essential Matrix 추정 방법들
+        methods = [
+            (cv2.RANSAC, 0.5, 0.99),    # 극도로 관대한 임계값
+            (cv2.RANSAC, 1.0, 0.95),
+            (cv2.RANSAC, 2.0, 0.90),
+            (cv2.LMEDS, 0.5, 0.95),
+            (cv2.RANSAC, 5.0, 0.85),    # 매우 관대한 설정
+            (cv2.RANSAC, 10.0, 0.80),   # 극도로 관대한 설정
+            (cv2.RANSAC, 20.0, 0.70)    # 최대한 관대한 설정
+        ]
+        
+        best_R, best_T = None, None
+        best_inliers = 0
+        best_quality = 0
+        
+        for method, threshold, confidence in methods:
+            try:
+                # Essential Matrix 추정
+                E, mask = cv2.findEssentialMat(
+                    pts_i, pts_j, K_i,
+                    method=method,
+                    prob=confidence,
+                    threshold=threshold,
+                    maxIters=500  # 반복 횟수 줄임
+                )
+                
+                if E is None or E.shape != (3, 3):
+                    continue
+                
+                # 포즈 복원
+                _, R, T, mask = cv2.recoverPose(E, pts_i, pts_j, K_i, mask=mask)
+                
+                if R is None or T is None:
+                    continue
+                
+                inliers = np.sum(mask)
+                
+                if inliers >= 2:  # 4 → 2로 극도로 완화
+                    # 🔧 더 관대한 포즈 품질 검증
+                    quality_score = self._evaluate_pose_quality_very_relaxed(pts_i, pts_j, R, T.flatten(), K_i, K_j, mask)
+                    
+                    if quality_score > best_quality:
+                        best_R, best_T = R, T.flatten()
+                        best_inliers = inliers
+                        best_quality = quality_score
+                        
+            except Exception as e:
+                print(f"      Method {method} failed: {e}")
+                continue
+        
+        if best_R is not None:
+            print(f"    Pair {cam_i}-{cam_j}: Successfully estimated pose with {best_inliers} inliers, quality: {best_quality:.3f}")
+        else:
+            print(f"    Pair {cam_i}-{cam_j}: Failed to estimate pose")
+        
+        return best_R, best_T
 
 
 def readSuperGlueSceneInfo(path, images, eval, train_test_exp=False, llffhold=8, 

@@ -440,6 +440,13 @@ class BundleAdjuster:
             idx += 3
             points_3d[point_id]['xyz'] = xyz.astype(np.float32)
     
+    def monitor_quality(self, metrics):
+        """품질 모니터링 콜백"""
+        if metrics:
+            print(f"    Quality metrics updated: cost_reduction={metrics.get('cost_reduction', 0):.6f}")
+        else:
+            print("    Quality metrics updated: No metrics available")
+
     def _is_valid_camera_pose(self, cam_data):
         """카메라 포즈 유효성 검증"""
         try:
@@ -507,26 +514,123 @@ class BundleAdjuster:
     
     def _get_convergence_reason(self, result):
         """수렴 이유 분석"""
-        if result.success:
-            if result.optimality < self.convergence_criteria['gtol']:
-                return "Gradient tolerance reached"
-            elif result.cost < self.convergence_criteria['ftol']:
-                return "Function tolerance reached"
-            else:
-                return "Parameter tolerance reached"
+        if hasattr(result, 'message'):
+            return result.message
+        elif hasattr(result, 'success') and result.success:
+            return "Successfully converged"
         else:
-            return f"Failed: {result.message}"
+            return "Unknown convergence status"
     
-    def monitor_quality(self, metrics):
-        """품질 모니터링 콜백"""
-        print(f"    Quality metrics updated: cost_reduction={metrics.get('cost_reduction', 0):.6f}")
+    def _pack_parameters(self, cameras, points_3d):
+        """카메라 포즈와 3D 포인트를 하나의 벡터로 패킹"""
+        params = []
+        
+        # 카메라 포즈 (회전 + 이동)
+        for cam_id in sorted(cameras.keys()):
+            cam = cameras[cam_id]
+            R = cam['R']
+            T = cam['T']
+            
+            # 회전 행렬을 로드리게스 벡터로 변환
+            angle_axis = self._rotation_matrix_to_angle_axis(R)
+            params.extend(angle_axis)
+            params.extend(T)
+        
+        # 3D 포인트
+        for point_id in sorted(points_3d.keys()):
+            if isinstance(points_3d[point_id], dict):
+                point = points_3d[point_id]['xyz']
+            else:
+                point = points_3d[point_id]
+            params.extend(point)
+        
+        params = np.array(params)
+        
+        # NaN이나 무한대 값 체크
+        if np.any(np.isnan(params)) or np.any(np.isinf(params)):
+            raise ValueError("Invalid parameters detected (NaN or Inf)")
+        
+        return params
     
+    def _unpack_parameters(self, params, cameras, points_3d):
+        """벡터에서 카메라 포즈와 3D 포인트 언패킹"""
+        idx = 0
+        
+        # 카메라 포즈 복원
+        for cam_id in sorted(cameras.keys()):
+            # 로드리게스 벡터 (3개)
+            angle_axis = params[idx:idx+3]
+            idx += 3
+            
+            # 이동 벡터 (3개)
+            T = params[idx:idx+3]
+            idx += 3
+            
+            # 회전 행렬로 변환
+            R = self._angle_axis_to_rotation_matrix(angle_axis)
+            
+            cameras[cam_id]['R'] = R.astype(np.float32)
+            cameras[cam_id]['T'] = T.astype(np.float32)
+        
+        # 3D 포인트 복원
+        for point_id in sorted(points_3d.keys()):
+            xyz = params[idx:idx+3]
+            idx += 3
+            if isinstance(points_3d[point_id], dict):
+                points_3d[point_id]['xyz'] = xyz.astype(np.float32)
+            else:
+                points_3d[point_id] = xyz.astype(np.float32)
+
     def _rotation_matrix_to_angle_axis(self, R):
-        """회전 행렬을 로드리게스 벡터로 변환"""
-        angle_axis, _ = cv2.Rodrigues(R)
-        return angle_axis.flatten()
+        """회전 행렬을 로드리게스 벡터로 변환 (기존 메서드 유지)"""
+        try:
+            # OpenCV의 Rodrigues 함수 사용
+            rvec, _ = cv2.Rodrigues(R)
+            return rvec.flatten().astype(np.float32)
+        except:
+            # 수동 계산 fallback
+            trace = np.trace(R)
+            if trace > 3.0 - 1e-6:
+                return np.zeros(3, dtype=np.float32)
+            
+            angle = np.arccos(np.clip((trace - 1.0) / 2.0, -1.0, 1.0))
+            if angle < 1e-6:
+                return np.zeros(3, dtype=np.float32)
+            
+            axis = np.array([
+                R[2, 1] - R[1, 2],
+                R[0, 2] - R[2, 0],
+                R[1, 0] - R[0, 1]
+            ]) / (2.0 * np.sin(angle))
+            
+            return (axis * angle).astype(np.float32)
     
     def _angle_axis_to_rotation_matrix(self, angle_axis):
-        """로드리게스 벡터를 회전 행렬로 변환"""
-        R, _ = cv2.Rodrigues(angle_axis)
-        return R 
+        """로드리게스 벡터를 회전 행렬로 변환 (기존 메서드 유지)"""
+        try:
+            # OpenCV의 Rodrigues 함수 사용
+            R, _ = cv2.Rodrigues(angle_axis)
+            return R.astype(np.float32)
+        except:
+            # 수동 계산 fallback
+            angle = np.linalg.norm(angle_axis)
+            if angle < 1e-8:
+                return np.eye(3, dtype=np.float32)
+            
+            axis = angle_axis / angle
+            cos_angle = np.cos(angle)
+            sin_angle = np.sin(angle)
+            one_minus_cos = 1.0 - cos_angle
+            
+            outer = np.outer(axis, axis)
+            cross = np.array([
+                [0, -axis[2], axis[1]],
+                [axis[2], 0, -axis[0]],
+                [-axis[1], axis[0], 0]
+            ])
+            
+            R = (cos_angle * np.eye(3) + 
+                 sin_angle * cross + 
+                 one_minus_cos * outer)
+            
+            return R.astype(np.float32) 
