@@ -31,13 +31,9 @@ def extract_superpoint_features(image_dir, output_path, config=None):
     np.savez(output_path, keypoints=all_keypoints, descriptors=all_descriptors, scores=all_scores)
     print(f"SuperPoint features saved to {output_path}")
 
-def generate_image_pairs(image_list, partial_gap=10):
+def generate_image_pairs(image_list):
     pairs = []
-    # Sequential pairs
-    for i in range(len(image_list) - 1):
-        pairs.append((image_list[i], image_list[i+1]))
-    # Partial exhaustive: every partial_gap-th image와 모든 이미지 쌍
-    for i in range(0, len(image_list), partial_gap):
+    for i in range(len(image_list)):
         for j in range(i+1, len(image_list)):
             pairs.append((image_list[i], image_list[j]))
     return pairs
@@ -55,7 +51,7 @@ def match_superglue(features_path, image_dir, output_path, superglue_config=None
     descriptors = data['descriptors'].item()
     scores = data['scores'].item()
     image_list = sorted(keypoints.keys())
-    pairs = generate_image_pairs(image_list, partial_gap=partial_gap)
+    pairs = generate_image_pairs(image_list)
     matches_dict = {}
     for img0, img1 in pairs:
         kpts0 = torch.from_numpy(keypoints[img0])[None].to(device)
@@ -129,8 +125,7 @@ def run_colmap_feature_importer(database_path, image_path, desc_path):
         "colmap", "feature_importer",
         "--database_path", database_path,
         "--image_path", image_path,
-        "--import_path", desc_path,
-        "--import_format", "TXT"
+        "--import_path", desc_path
     ], check=True)
 
 def run_colmap_matches_importer(database_path, matches_path):
