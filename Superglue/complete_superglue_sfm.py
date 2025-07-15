@@ -1643,11 +1643,26 @@ class SuperGlue3DGSPipeline:
             assert colors.shape == (n_points, 3), f"Colors shape error: {colors.shape}"
             assert normals.shape == (n_points, 3), f"Normals shape error: {normals.shape}"
             
-            pcd = BasicPointCloud(
-                points=points,
-                colors=colors,
-                normals=normals
-            )
+            # BasicPointCloud가 정의되지 않았을 경우를 대비한 fallback
+            try:
+                pcd = BasicPointCloud(
+                    points=points,
+                    colors=colors,
+                    normals=normals
+                )
+            except NameError:
+                # BasicPointCloud가 정의되지 않았으면 간단한 클래스 생성
+                class BasicPointCloud:
+                    def __init__(self, points, colors, normals):
+                        self.points = points
+                        self.colors = colors
+                        self.normals = normals
+                
+                pcd = BasicPointCloud(
+                    points=points,
+                    colors=colors,
+                    normals=normals
+                )
             
             # 학습/테스트 분할
             train_cams = [c for c in cam_infos if not c.is_test]
@@ -3433,6 +3448,19 @@ class SuperGlue3DGSPipeline:
             colors = np.random.rand(n_points, 3).astype(np.float32)
             normals = np.random.randn(n_points, 3).astype(np.float32)
             normals = normals / np.linalg.norm(normals, axis=1, keepdims=True)
+            
+            # BasicPointCloud가 정의되지 않았을 경우를 대비한 fallback
+            try:
+                pcd = BasicPointCloud(points=points, colors=colors, normals=normals)
+            except NameError:
+                # BasicPointCloud가 정의되지 않았으면 간단한 클래스 생성
+                class BasicPointCloud:
+                    def __init__(self, points, colors, normals):
+                        self.points = points
+                        self.colors = colors
+                        self.normals = normals
+                
+                pcd = BasicPointCloud(points=points, colors=colors, normals=normals)
         
         # 학습/테스트 분할
         train_cams = [c for c in cam_infos if not c.is_test]
@@ -4206,6 +4234,38 @@ def readSuperGlueSceneInfo(path, images, eval, train_test_exp=False, llffhold=8,
 def _create_fallback_scene_info(images_folder, max_images):
     """개선된 fallback scene 생성"""
     try:
+        # 3DGS 모듈 import 시도
+        try:
+            CameraInfo, SceneInfo, BasicPointCloud = get_3dgs_imports()
+        except Exception as e:
+            print(f"⚠️  3DGS modules not available: {e}")
+            # Fallback 클래스 정의
+            class CameraInfo:
+                def __init__(self, uid, R, T, FovY, FovX, image_path, image_name, 
+                             width, height, depth_params=None, depth_path="", is_test=False):
+                    self.uid = uid
+                    self.R = R
+                    self.T = T
+                    self.FovY = FovY
+                    self.FovX = FovX
+                    self.image_path = image_path
+                    self.image_name = image_name
+                    self.width = width
+                    self.height = height
+                    self.depth_params = depth_params
+                    self.depth_path = depth_path
+                    self.is_test = is_test
+            
+            class SceneInfo:
+                def __init__(self, point_cloud, train_cameras, test_cameras, 
+                             nerf_normalization, ply_path="", is_nerf_synthetic=False):
+                    self.point_cloud = point_cloud
+                    self.train_cameras = train_cameras
+                    self.test_cameras = test_cameras
+                    self.nerf_normalization = nerf_normalization
+                    self.ply_path = ply_path
+                    self.is_nerf_synthetic = is_nerf_synthetic
+        
         # 이미지 수집
         image_paths = []
         for ext in ['*.jpg', '*.jpeg', '*.png', '*.JPG', '*.JPEG', '*.PNG']:
@@ -4311,11 +4371,26 @@ def _create_fallback_scene_info(images_folder, max_images):
         assert colors.shape == (n_points, 3), f"Colors shape error: {colors.shape}"
         assert normals.shape == (n_points, 3), f"Normals shape error: {normals.shape}"
         
-        pcd = BasicPointCloud(
-            points=points,
-            colors=colors,
-            normals=normals
-        )
+        # BasicPointCloud가 정의되지 않았을 경우를 대비한 fallback
+        try:
+            pcd = BasicPointCloud(
+                points=points,
+                colors=colors,
+                normals=normals
+            )
+        except NameError:
+            # BasicPointCloud가 정의되지 않았으면 간단한 클래스 생성
+            class BasicPointCloud:
+                def __init__(self, points, colors, normals):
+                    self.points = points
+                    self.colors = colors
+                    self.normals = normals
+            
+            pcd = BasicPointCloud(
+                points=points,
+                colors=colors,
+                normals=normals
+            )
         
         # 학습/테스트 분할
         train_cams = [c for c in cam_infos if not c.is_test]
