@@ -71,7 +71,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     # Early stopping variables
     best_test_psnr = 0.0
     best_iteration = 0
-    patience = 2  # Number of evaluations to wait before early stopping (5 → 2, 더 빠른 중단)
+    patience = 1  # Number of evaluations to wait before early stopping (5 → 2, 더 빠른 중단)
     patience_counter = 0
     early_stop_threshold = 0.1  # PSNR decrease threshold (0.3 → 0.1, 더 민감하게)
     min_improvement = 0.05  # Minimum improvement to reset patience (0.1 → 0.05, 더 작은 개선도 허용)
@@ -264,13 +264,6 @@ def prepare_output_and_logger(args):
     with open(os.path.join(args.model_path, "cfg_args"), 'w') as cfg_log_f:
         cfg_log_f.write(str(Namespace(**vars(args))))
 
-    # Create Tensorboard writer
-    tb_writer = None
-    if TENSORBOARD_FOUND:
-        tb_writer = SummaryWriter(args.model_path)
-    else:
-        print("Tensorboard not available: not logging progress")
-    return tb_writer
 
 def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, train_test_exp):
     if tb_writer:
