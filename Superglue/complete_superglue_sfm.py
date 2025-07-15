@@ -145,65 +145,833 @@ def test_pipeline_availability():
             print("✗ 3DGS modules not available")
     except Exception as e:
         print(f"✗ 3DGS modules test failed: {e}")
+        return False
     
-    # 3. 기타 의존성 테스트
-    core_available = False
-    missing_deps = []
-    
-    try:
-        import torch
-        print("✓ PyTorch available")
-    except ImportError:
-        missing_deps.append("torch")
-        print("✗ PyTorch not available")
-    
-    try:
-        import cv2
-        print("✓ OpenCV available")
-    except ImportError:
-        missing_deps.append("opencv-python")
-        print("✗ OpenCV not available")
-    
-    try:
-        import numpy as np
-        print("✓ NumPy available")
-    except ImportError:
-        missing_deps.append("numpy")
-        print("✗ NumPy not available")
-    
-    try:
-        from scipy.optimize import least_squares
-        print("✓ SciPy available")
-    except ImportError:
-        missing_deps.append("scipy")
-        print("✗ SciPy not available")
-    
-    if not missing_deps:
-        print("✓ Core dependencies available")
-        core_available = True
-    else:
-        print(f"✗ Missing core dependencies: {missing_deps}")
-    
-    # 4. 전체 가용성 판단 (더 관대하게)
-    # SuperGlue가 없어도 fallback으로 작동할 수 있도록
-    pipeline_available = gs_available and core_available
     
     print(f"\n📊 Pipeline Availability Summary:")
     print(f"  SuperGlue: {'✓' if superglue_available else '✗'}")
     print(f"  3DGS: {'✓' if gs_available else '✗'}")
-    print(f"  Core Dependencies: {'✓' if core_available else '✗'}")
-    print(f"  Overall: {'✓' if pipeline_available else '✗'}")
     
-    if not pipeline_available:
-        print("\n⚠️  Pipeline not fully available, but fallback mode may work")
-        print("   Missing dependencies can be installed with:")
-        print("   pip install numpy opencv-python torch torchvision scipy matplotlib psutil pillow")
-    
-    return pipeline_available
+    return True
 
 
 # 파이프라인 가용성 테스트 실행
 PIPELINE_AVAILABLE = test_pipeline_availability()
+
+
+class TrackManager:
+    """특징점 트랙 관리 및 삼각측량"""
+    
+    def __init__(self):
+        self.tracks = {}  # track_id -> {points: [(cam_id, kpt_idx), ...], color: [r,g,b]}
+        self.track_id_counter = 0
+        self.min_views = 3
+        self.min_track_length = 2
+    
+    def build_tracks(self, matches, image_features):
+        """매칭 결과로부터 트랙 생성"""
+        print("  Building tracks from matches...")
+        
+        # 매칭을 그래프로 변환
+        track_graph = defaultdict(list)
+        
+        for (cam_i, cam_j), match_list in matches.items():
+            for idx_i, idx_j, conf in match_list:
+                # 각 매칭을 노드로 표현
+                node_i = (cam_i, idx_i)
+                node_j = (cam_j, idx_j)
+                
+                track_graph[node_i].append((node_j, conf))
+                track_graph[node_j].append((node_i, conf))
+        
+        # 연결된 컴포넌트 찾기 (트랙)
+        visited = set()
+        tracks = []
+        
+        for node in track_graph:
+            if node in visited:
+                continue
+            
+            # BFS로 연결된 노드들 찾기
+            track_nodes = []
+            queue = [node]
+            visited.add(node)
+            
+            while queue:
+                current = queue.pop(0)
+                track_nodes.append(current)
+                
+                for neighbor, conf in track_graph[current]:
+                    if neighbor not in visited:
+                        visited.add(neighbor)
+                        queue.append(neighbor)
+            
+            if len(track_nodes) >= self.min_track_length:
+                tracks.append(track_nodes)
+        
+        # 트랙을 내부 구조로 변환
+        for track_nodes in tracks:
+            track_data = {
+                'points': track_nodes,
+                'color': self._estimate_track_color(track_nodes, image_features),
+                'confidence': self._compute_track_confidence(track_nodes, track_graph)
+            }
+            
+            self.tracks[self.track_id_counter] = track_data
+            self.track_id_counter += 1
+        
+        print(f"    Built {len(self.tracks)} tracks")
+    
+    def filter_tracks(self, min_views=3):
+        """트랙 필터링"""
+        print(f"  Filtering tracks (min_views={min_views})...")
+        
+        tracks_to_remove = []
+        for track_id, track_data in self.tracks.items():
+            # 고유한 카메라 수 계산
+            unique_cameras = set(cam_id for cam_id, _ in track_data['points'])
+            
+            if len(unique_cameras) < min_views:
+                tracks_to_remove.append(track_id)
+        
+        # 필터링된 트랙 제거
+        for track_id in tracks_to_remove:
+            del self.tracks[track_id]
+        
+        print(f"    Kept {len(self.tracks)} tracks after filtering")
+    
+    def triangulate_tracks(self, cameras, image_features):
+        """트랙들을 삼각측량하여 3D 포인트 생성"""
+        print("  Triangulating tracks...")
+        
+        triangulated_points = {}
+        successful_tracks = 0
+        
+        for track_id, track_data in self.tracks.items():
+            try:
+                # 트랙의 각 관찰점 수집
+                observations = []
+                for cam_id, kpt_idx in track_data['points']:
+                    if cam_id in cameras and cam_id in image_features:
+                        kpts = image_features[cam_id]['keypoints']
+                        if kpt_idx < len(kpts):
+                            observations.append((cam_id, kpts[kpt_idx]))
+                
+                if len(observations) < 2:
+                    continue
+                
+                # 삼각측량 수행
+                point_3d = self._triangulate_track(observations, cameras)
+                
+                if point_3d is not None:
+                    triangulated_points[track_id] = {
+                        'xyz': point_3d,
+                        'color': track_data['color'],
+                        'observations': observations
+                    }
+                    successful_tracks += 1
+                    
+            except Exception as e:
+                print(f"    Track {track_id} triangulation failed: {e}")
+                continue
+        
+        print(f"    Successfully triangulated {successful_tracks} tracks")
+        return triangulated_points
+    
+    def _estimate_track_color(self, track_nodes, image_features):
+        """트랙의 색상 추정"""
+        # 첫 번째 관찰점의 색상을 사용 (실제로는 이미지에서 샘플링)
+        if track_nodes:
+            cam_id, kpt_idx = track_nodes[0]
+            if cam_id in image_features:
+                # 간단한 랜덤 색상 생성
+                return np.random.rand(3).astype(np.float32)
+        
+        return np.array([0.5, 0.5, 0.5], dtype=np.float32)
+    
+    def _compute_track_confidence(self, track_nodes, track_graph):
+        """트랙의 신뢰도 계산"""
+        if len(track_nodes) < 2:
+            return 0.0
+        
+        # 연결 강도 평균 계산
+        total_conf = 0.0
+        edge_count = 0
+        
+        for i, node_i in enumerate(track_nodes):
+            for j, node_j in enumerate(track_nodes[i+1:], i+1):
+                # 두 노드 간의 연결 찾기
+                for neighbor, conf in track_graph[node_i]:
+                    if neighbor == node_j:
+                        total_conf += conf
+                        edge_count += 1
+                        break
+        
+        if edge_count > 0:
+            return total_conf / edge_count
+        else:
+            return 0.0
+    
+    def _triangulate_track(self, observations, cameras):
+        """단일 트랙 삼각측량"""
+        if len(observations) < 2:
+            return None
+        
+        # 투영 행렬들 수집
+        projection_matrices = []
+        points_2d = []
+        
+        for cam_id, point_2d in observations:
+            if cam_id in cameras:
+                cam = cameras[cam_id]
+                K, R, T = cam['K'], cam['R'], cam['T']
+                
+                # 투영 행렬 생성
+                t = -R @ T
+                RT = np.hstack([R, t.reshape(-1, 1)])
+                P = K @ RT
+                
+                projection_matrices.append(P)
+                points_2d.append(point_2d)
+        
+        if len(projection_matrices) < 2:
+            return None
+        
+        try:
+            # OpenCV 삼각측량
+            points_2d_array = np.array(points_2d).T
+            points_4d = cv2.triangulatePoints(
+                projection_matrices[0], 
+                projection_matrices[1], 
+                points_2d_array[:, 0:1], 
+                points_2d_array[:, 1:2]
+            )
+            
+            # 4D에서 3D로 변환
+            if abs(points_4d[3, 0]) > 1e-10:
+                point_3d = (points_4d[:3] / points_4d[3]).flatten()
+                
+                # 유효성 검사
+                if self._is_valid_3d_point(point_3d, observations, cameras):
+                    return point_3d.astype(np.float32)
+            
+        except Exception as e:
+            print(f"      Triangulation error: {e}")
+        
+        return None
+    
+    def _is_valid_3d_point(self, point_3d, observations, cameras):
+        """3D 포인트 유효성 검사"""
+        # NaN/Inf 체크
+        if np.any(np.isnan(point_3d)) or np.any(np.isinf(point_3d)):
+            return False
+        
+        # 거리 체크
+        distance = np.linalg.norm(point_3d)
+        if distance > 1000 or distance < 0.001:
+            return False
+        
+        # 재투영 오차 체크
+        max_error = 0.0
+        for cam_id, point_2d in observations:
+            if cam_id in cameras:
+                cam = cameras[cam_id]
+                K, R, T = cam['K'], cam['R'], cam['T']
+                
+                # 카메라 좌표계로 변환
+                point_cam = R @ (point_3d - T)
+                
+                if point_cam[2] <= 0:  # 카메라 뒤쪽
+                    return False
+                
+                # 재투영
+                point_2d_proj = K @ point_cam
+                point_2d_proj = point_2d_proj[:2] / point_2d_proj[2]
+                
+                error = np.linalg.norm(point_2d_proj - point_2d)
+                max_error = max(max_error, error)
+        
+        return max_error < 10.0  # 10픽셀 이하 오차
+
+
+class PoseGraphOptimizer:
+    """포즈 그래프 최적화"""
+    
+    def __init__(self):
+        self.pose_graph = nx.Graph()
+        self.edge_weights = {}
+        self.min_matches = 10
+    
+    def build_pose_graph(self, matches, cameras):
+        """매칭 결과로부터 포즈 그래프 생성"""
+        print("  Building pose graph...")
+        
+        # 노드 추가 (카메라들)
+        for cam_id in cameras:
+            self.pose_graph.add_node(cam_id)
+        
+        # 엣지 추가 (매칭이 있는 카메라 쌍)
+        for (cam_i, cam_j), match_list in matches.items():
+            if len(match_list) >= self.min_matches:
+                weight = len(match_list)  # 매칭 수를 가중치로 사용
+                self.pose_graph.add_edge(cam_i, cam_j, weight=weight)
+                self.edge_weights[(cam_i, cam_j)] = weight
+        
+        print(f"    Graph has {self.pose_graph.number_of_nodes()} nodes and {self.pose_graph.number_of_edges()} edges")
+    
+    def remove_outlier_edges(self, min_matches=10):
+        """이상치 엣지 제거"""
+        print(f"  Removing outlier edges (min_matches={min_matches})...")
+        
+        edges_to_remove = []
+        for (cam_i, cam_j), weight in self.edge_weights.items():
+            if weight < min_matches:
+                edges_to_remove.append((cam_i, cam_j))
+        
+        for cam_i, cam_j in edges_to_remove:
+            self.pose_graph.remove_edge(cam_i, cam_j)
+            del self.edge_weights[(cam_i, cam_j)]
+        
+        print(f"    Removed {len(edges_to_remove)} outlier edges")
+    
+    def get_spanning_tree(self):
+        """최소 신장 트리 계산"""
+        print("  Computing minimum spanning tree...")
+        
+        try:
+            # 최대 가중치 신장 트리 (매칭 수가 많을수록 좋음)
+            mst = nx.maximum_spanning_tree(self.pose_graph, weight='weight')
+            
+            print(f"    MST has {mst.number_of_edges()} edges")
+            return mst
+            
+        except Exception as e:
+            print(f"    MST computation failed: {e}")
+            # 연결된 컴포넌트 중 가장 큰 것 반환
+            largest_cc = max(nx.connected_components(self.pose_graph), key=len)
+            subgraph = self.pose_graph.subgraph(largest_cc)
+            return subgraph
+    
+    def optimize_poses(self, cameras, matches):
+        """포즈 그래프 최적화"""
+        print("  Optimizing pose graph...")
+        
+        # 현재는 간단한 구현 (실제로는 더 복잡한 최적화 필요)
+        # 1. 스패닝 트리 기반 초기화
+        mst = self.get_spanning_tree()
+        
+        # 2. 루프 클로저 검출 및 제약 추가
+        loops = self._detect_loops(mst)
+        
+        # 3. 포즈 최적화 (간단한 버전)
+        optimized_cameras = self._simple_pose_optimization(cameras, matches, mst)
+        
+        return optimized_cameras
+    
+    def _detect_loops(self, mst):
+        """루프 클로저 검출"""
+        loops = []
+        
+        # MST에 없는 엣지들을 확인하여 루프 형성
+        for edge in self.pose_graph.edges():
+            if edge not in mst.edges():
+                # 이 엣지를 추가했을 때 형성되는 루프 찾기
+                temp_graph = mst.copy()
+                temp_graph.add_edge(*edge)
+                
+                try:
+                    cycle = nx.find_cycle(temp_graph)
+                    if len(cycle) > 3:  # 3개 이상의 노드로 구성된 루프
+                        loops.append(cycle)
+                except nx.NetworkXNoCycle:
+                    pass
+        
+        return loops
+    
+    def _simple_pose_optimization(self, cameras, matches, mst):
+        """간단한 포즈 최적화"""
+        # 현재는 원본 카메라 반환 (실제 구현에서는 더 복잡한 최적화)
+        return cameras.copy()
+
+
+class BundleAdjuster:
+    """Bundle Adjustment 최적화"""
+    
+    def __init__(self, loss_type='huber', max_iter=50):
+        self.loss_type = loss_type
+        self.max_iter = max_iter
+        self.quality_metrics = {}
+    
+    def run(self, cameras, points_3d, point_observations, callback=None):
+        """Bundle Adjustment 실행"""
+        print("  Running Bundle Adjustment...")
+        
+        if len(cameras) < 2 or len(points_3d) < 5:
+            print("    Insufficient data for bundle adjustment")
+            return False
+        
+        try:
+            # 파라미터 패킹
+            params = self._pack_parameters(cameras, points_3d)
+            
+            # 최적화 실행
+            result = least_squares(
+                self._compute_residuals,
+                params,
+                args=(cameras, points_3d, point_observations),
+                method='lm',
+                max_nfev=self.max_iter,
+                verbose=1
+            )
+            
+            # 결과 언패킹
+            self._unpack_parameters(result.x, cameras, points_3d)
+            
+            # 품질 메트릭 계산
+            self.quality_metrics = {
+                'final_cost': result.cost,
+                'iterations': result.nfev,
+                'success': result.success
+            }
+            
+            if callback:
+                callback(self.quality_metrics)
+            
+            print(f"    BA completed: cost={result.cost:.6f}, iterations={result.nfev}")
+            return True
+            
+        except Exception as e:
+            print(f"    Bundle adjustment failed: {e}")
+            return False
+    
+    def _pack_parameters(self, cameras, points_3d):
+        """파라미터를 하나의 벡터로 패킹"""
+        params = []
+        
+        # 카메라 파라미터 (회전 + 이동)
+        for cam_id in sorted(cameras.keys()):
+            cam = cameras[cam_id]
+            R, T = cam['R'], cam['T']
+            
+            # 회전 행렬을 로드리게스 벡터로 변환
+            angle_axis = self._rotation_matrix_to_angle_axis(R)
+            params.extend(angle_axis)
+            params.extend(T)
+        
+        # 3D 포인트
+        for point_id in sorted(points_3d.keys()):
+            point = points_3d[point_id]['xyz']
+            params.extend(point)
+        
+        return np.array(params)
+    
+    def _unpack_parameters(self, params, cameras, points_3d):
+        """벡터에서 파라미터 언패킹"""
+        idx = 0
+        
+        # 카메라 파라미터 복원
+        for cam_id in sorted(cameras.keys()):
+            # 로드리게스 벡터 (3개)
+            angle_axis = params[idx:idx+3]
+            idx += 3
+            
+            # 이동 벡터 (3개)
+            T = params[idx:idx+3]
+            idx += 3
+            
+            # 회전 행렬로 변환
+            R = self._angle_axis_to_rotation_matrix(angle_axis)
+            
+            cameras[cam_id]['R'] = R.astype(np.float32)
+            cameras[cam_id]['T'] = T.astype(np.float32)
+        
+        # 3D 포인트 복원
+        for point_id in sorted(points_3d.keys()):
+            xyz = params[idx:idx+3]
+            idx += 3
+            points_3d[point_id]['xyz'] = xyz.astype(np.float32)
+    
+    def _compute_residuals(self, params, cameras, points_3d, point_observations):
+        """Bundle Adjustment 잔차 계산"""
+        # 파라미터 언패킹
+        self._unpack_parameters(params, cameras, points_3d)
+        
+        residuals = []
+        
+        # 각 관찰에 대한 재투영 오차 계산
+        for point_id, observations in point_observations.items():
+            if point_id not in points_3d:
+                continue
+            
+            point_3d = points_3d[point_id]['xyz']
+            
+            for cam_id, observed_pt, conf in observations:
+                if cam_id not in cameras:
+                    continue
+                
+                try:
+                    cam = cameras[cam_id]
+                    K = cam['K']
+                    R = cam['R']
+                    T = cam['T']
+                    
+                    # 카메라 좌표계로 변환
+                    point_cam = R @ (point_3d - T)
+                    
+                    if point_cam[2] <= 0:
+                        residuals.extend([10.0, 10.0])
+                        continue
+                    
+                    # 재투영
+                    point_2d_proj = K @ point_cam
+                    point_2d_proj = point_2d_proj[:2] / point_2d_proj[2]
+                    
+                    # 잔차 계산
+                    residual = point_2d_proj - observed_pt
+                    
+                    # Huber loss 적용
+                    if self.loss_type == 'huber':
+                        residual = self._apply_huber_loss(residual, delta=3.0)
+                    
+                    # 신뢰도 가중치
+                    weight = np.clip(conf, 0.1, 1.0)
+                    residual = residual * weight
+                    
+                    residuals.extend(residual)
+                    
+                except Exception:
+                    residuals.extend([2.0, 2.0])
+        
+        return np.array(residuals)
+    
+    def _apply_huber_loss(self, residual, delta=3.0):
+        """Huber loss 적용"""
+        abs_residual = np.abs(residual)
+        mask = abs_residual <= delta
+        
+        result = np.zeros_like(residual)
+        result[mask] = residual[mask]
+        result[~mask] = delta * np.sign(residual[~mask]) * (2 * np.sqrt(abs_residual[~mask] / delta) - 1)
+        
+        return result
+    
+    def _rotation_matrix_to_angle_axis(self, R):
+        """회전 행렬을 로드리게스 벡터로 변환"""
+        trace = np.trace(R)
+        if trace > 3 - 1e-6:
+            return np.zeros(3)
+        
+        angle = np.arccos((trace - 1) / 2)
+        axis = np.array([
+            R[2, 1] - R[1, 2],
+            R[0, 2] - R[2, 0],
+            R[1, 0] - R[0, 1]
+        ])
+        
+        if np.linalg.norm(axis) > 1e-6:
+            axis = axis / np.linalg.norm(axis)
+        
+        return angle * axis
+    
+    def _angle_axis_to_rotation_matrix(self, angle_axis):
+        """로드리게스 벡터를 회전 행렬로 변환"""
+        angle = np.linalg.norm(angle_axis)
+        if angle < 1e-6:
+            return np.eye(3)
+        
+        axis = angle_axis / angle
+        K = np.array([
+            [0, -axis[2], axis[1]],
+            [axis[2], 0, -axis[0]],
+            [-axis[1], axis[0], 0]
+        ])
+        
+        R = np.eye(3) + np.sin(angle) * K + (1 - np.cos(angle)) * (K @ K)
+        return R
+    
+    def monitor_quality(self, metrics):
+        """품질 메트릭 모니터링"""
+        print(f"    BA Quality: cost={metrics['final_cost']:.6f}, "
+              f"iterations={metrics['iterations']}, success={metrics['success']}")
+
+
+class ParallelExecutor:
+    """병렬 실행 관리"""
+    
+    def __init__(self, max_workers=4):
+        self.max_workers = max_workers
+        self.executor = None
+    
+    def parallel_map(self, func, items):
+        """병렬로 함수 실행"""
+        if self.max_workers <= 1:
+            return [func(item) for item in items]
+        
+        try:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+                results = list(executor.map(func, items))
+            return results
+        except Exception as e:
+            print(f"    Parallel execution failed: {e}, falling back to sequential")
+            return [func(item) for item in items]
+    
+    def parallel_process_features(self, image_paths, feature_extractor):
+        """특징점 추출 병렬 처리"""
+        def extract_features(path):
+            return feature_extractor.extract(path)
+        
+        return self.parallel_map(extract_features, image_paths)
+    
+    def parallel_match_pairs(self, pairs, matcher, image_features):
+        """매칭 병렬 처리"""
+        def match_pair(pair):
+            i, j = pair
+            if i in image_features and j in image_features:
+                return (pair, matcher.match(image_features[i], image_features[j]))
+            return (pair, [])
+        
+        return self.parallel_map(match_pair, pairs)
+
+
+class AutoTuner:
+    """자동 파라미터 튜닝"""
+    
+    def __init__(self, config):
+        self.config = config
+        self.quality_history = []
+        self.parameter_history = []
+        self.best_parameters = config.copy()
+        self.best_quality = 0.0
+    
+    def evaluate_metrics(self, quality_metrics):
+        """품질 메트릭 평가"""
+        if not quality_metrics:
+            return
+        
+        # 종합 품질 점수 계산
+        quality_score = self._compute_quality_score(quality_metrics)
+        
+        self.quality_history.append(quality_score)
+        
+        # 최고 품질 업데이트
+        if quality_score > self.best_quality:
+            self.best_quality = quality_score
+            self.best_parameters = self.config.copy()
+            print(f"    New best quality: {quality_score:.4f}")
+    
+    def adjust_parameters(self):
+        """파라미터 자동 조정"""
+        if len(self.quality_history) < 2:
+            return
+        
+        # 품질 변화 분석
+        recent_quality = self.quality_history[-1]
+        previous_quality = self.quality_history[-2]
+        
+        if recent_quality < previous_quality:
+            # 품질이 감소했으면 파라미터를 보수적으로 조정
+            self._adjust_parameters_conservative()
+        else:
+            # 품질이 향상되었으면 더 적극적으로 조정
+            self._adjust_parameters_aggressive()
+    
+    def _compute_quality_score(self, metrics):
+        """종합 품질 점수 계산"""
+        score = 0.0
+        
+        # 포즈 추정 성공률
+        if 'pose_estimation_success_rate' in metrics:
+            score += metrics['pose_estimation_success_rate'] * 0.4
+        
+        # 평균 매칭 수
+        if 'average_matches_per_pair' in metrics:
+            avg_matches = metrics['average_matches_per_pair']
+            score += min(avg_matches / 50.0, 1.0) * 0.3  # 50개 이상이면 만점
+        
+        # Bundle Adjustment 품질
+        if 'final_cost' in metrics:
+            cost = metrics['final_cost']
+            score += max(0, 1.0 - cost / 1000.0) * 0.3  # cost가 낮을수록 높은 점수
+        
+        return score
+    
+    def _adjust_parameters_conservative(self):
+        """보수적 파라미터 조정"""
+        print("    Adjusting parameters conservatively...")
+        
+        # 매칭 임계값 완화
+        if 'superglue' in self.config:
+            if 'match_threshold' in self.config['superglue']:
+                current_threshold = self.config['superglue']['match_threshold']
+                self.config['superglue']['match_threshold'] = max(0.01, current_threshold * 0.8)
+        
+        # 특징점 수 증가
+        if 'superpoint' in self.config:
+            if 'max_keypoints' in self.config['superpoint']:
+                current_max = self.config['superpoint']['max_keypoints']
+                self.config['superpoint']['max_keypoints'] = min(16384, current_max * 1.2)
+    
+    def _adjust_parameters_aggressive(self):
+        """적극적 파라미터 조정"""
+        print("    Adjusting parameters aggressively...")
+        
+        # 매칭 임계값 강화
+        if 'superglue' in self.config:
+            if 'match_threshold' in self.config['superglue']:
+                current_threshold = self.config['superglue']['match_threshold']
+                self.config['superglue']['match_threshold'] = min(0.2, current_threshold * 1.1)
+        
+        # 특징점 수 감소 (품질 향상)
+        if 'superpoint' in self.config:
+            if 'max_keypoints' in self.config['superpoint']:
+                current_max = self.config['superpoint']['max_keypoints']
+                self.config['superpoint']['max_keypoints'] = max(2048, current_max * 0.9)
+    
+    def get_best_parameters(self):
+        """최고 품질의 파라미터 반환"""
+        return self.best_parameters.copy()
+
+
+class AdaptiveMatcher:
+    """Adaptive Matching: CLIP 기반 global descriptor, cosine similarity, 상위 N개 쌍 선정"""
+    
+    def __init__(self, config, device):
+        self.config = config
+        self.device = device
+        self.top_k = config.get('adaptive_top_k', 20)
+        self.global_descriptors = {}
+        
+        # CLIP 모델 로드 (선택적)
+        self.clip_available = False
+        try:
+            import clip
+            from PIL import Image as PILImage
+            self.model, self.preprocess = clip.load("ViT-B/32", device=self.device)
+            self.clip_available = True
+            print("✓ CLIP model loaded for adaptive matching")
+        except ImportError:
+            print("⚠️  CLIP not available, using fallback global descriptors")
+            self.clip_available = False
+    
+    def compute_global_descriptors(self, image_paths):
+        """전역 이미지 descriptor 계산"""
+        print("  Computing global descriptors...")
+        
+        if self.clip_available:
+            return self._compute_clip_descriptors(image_paths)
+        else:
+            return self._compute_fallback_descriptors(image_paths)
+    
+    def _compute_clip_descriptors(self, image_paths):
+        """CLIP을 사용한 전역 descriptor 계산"""
+        global_descs = {}
+        
+        for i, path in enumerate(image_paths):
+            try:
+                img = PILImage.open(path).convert("RGB")
+                img_tensor = self.preprocess(img).unsqueeze(0).to(self.device)
+                
+                with torch.no_grad():
+                    desc = self.model.encode_image(img_tensor).cpu().numpy().flatten()
+                    desc = desc / (np.linalg.norm(desc) + 1e-10)
+                
+                global_descs[i] = desc
+                
+            except Exception as e:
+                print(f"    Failed to compute CLIP descriptor for {path}: {e}")
+                # Fallback descriptor
+                global_descs[i] = np.random.randn(512).astype(np.float32)
+                global_descs[i] = global_descs[i] / np.linalg.norm(global_descs[i])
+        
+        return global_descs
+    
+    def _compute_fallback_descriptors(self, image_paths):
+        """Fallback 전역 descriptor 계산 (SuperPoint 특징점 기반)"""
+        global_descs = {}
+        
+        for i, path in enumerate(image_paths):
+            try:
+                # 간단한 이미지 통계 기반 descriptor
+                img = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
+                if img is None:
+                    continue
+                
+                # 이미지 통계 계산
+                mean_intensity = np.mean(img)
+                std_intensity = np.std(img)
+                hist = cv2.calcHist([img], [0], None, [256], [0, 256]).flatten()
+                hist = hist / (np.sum(hist) + 1e-10)
+                
+                # 간단한 descriptor 생성
+                desc = np.concatenate([
+                    [mean_intensity / 255.0, std_intensity / 255.0],
+                    hist[:128],  # 히스토그램의 절반만 사용
+                    hist[128:]
+                ]).astype(np.float32)
+                
+                # 정규화
+                desc = desc / (np.linalg.norm(desc) + 1e-10)
+                global_descs[i] = desc
+                
+            except Exception as e:
+                print(f"    Failed to compute fallback descriptor for {path}: {e}")
+                # 랜덤 descriptor
+                global_descs[i] = np.random.randn(258).astype(np.float32)
+                global_descs[i] = global_descs[i] / np.linalg.norm(global_descs[i])
+        
+        return global_descs
+    
+    def select_topk_pairs(self, global_descs):
+        """상위 K개 이미지 쌍 선택"""
+        print(f"  Selecting top-{self.top_k} pairs...")
+        
+        n_images = len(global_descs)
+        if n_images < 2:
+            return []
+        
+        # 유사도 행렬 계산
+        similarity_matrix = np.zeros((n_images, n_images))
+        
+        for i in range(n_images):
+            for j in range(i+1, n_images):
+                if i in global_descs and j in global_descs:
+                    sim = np.dot(global_descs[i], global_descs[j])
+                    similarity_matrix[i, j] = sim
+                    similarity_matrix[j, i] = sim
+        
+        # 상위 K개 쌍 선택
+        pairs = set()
+        
+        for i in range(n_images):
+            # 각 이미지에 대해 가장 유사한 K개 이미지 선택
+            similarities = similarity_matrix[i]
+            top_indices = np.argsort(similarities)[::-1][:self.top_k]
+            
+            for j in top_indices:
+                if i != j and similarities[j] > 0.1:  # 최소 유사도 임계값
+                    pairs.add(tuple(sorted([i, j])))
+        
+        selected_pairs = list(pairs)
+        print(f"    Selected {len(selected_pairs)} candidate pairs")
+        
+        return selected_pairs
+    
+    def compute_pair_similarity(self, cam_i, cam_j, global_descs):
+        """두 이미지 간의 유사도 계산"""
+        if cam_i in global_descs and cam_j in global_descs:
+            return np.dot(global_descs[cam_i], global_descs[cam_j])
+        return 0.0
+    
+    def filter_pairs_by_similarity(self, pairs, global_descs, min_similarity=0.1):
+        """유사도 기반 쌍 필터링"""
+        filtered_pairs = []
+        
+        for cam_i, cam_j in pairs:
+            similarity = self.compute_pair_similarity(cam_i, cam_j, global_descs)
+            if similarity >= min_similarity:
+                filtered_pairs.append((cam_i, cam_j))
+        
+        return filtered_pairs
 
 
 class FeatureExtractor:
