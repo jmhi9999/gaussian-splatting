@@ -51,17 +51,19 @@ except ImportError as e:
             self.normals = normals
     
     class CameraInfo:
-        def __init__(self, uid, R, T, FovY, FovX, image, image_path, image_name, width, height):
+        def __init__(self, uid, R, T, FovY, FovX, depth_params, image_path, image_name, depth_path, width, height, is_test):
             self.uid = uid
             self.R = R
             self.T = T
             self.FovY = FovY
             self.FovX = FovX
-            self.image = image
+            self.depth_params = depth_params
             self.image_path = image_path
             self.image_name = image_name
+            self.depth_path = depth_path
             self.width = width
             self.height = height
+            self.is_test = is_test
     
     class SceneInfo:
         def __init__(self, point_cloud, train_cameras, test_cameras, nerf_normalization, ply_path):
@@ -296,15 +298,12 @@ class ImprovedHlocPipeline:
         """최적화된 특징점 추출"""
         print("🔍 Extracting SuperPoint features...")
         
-        # 특징점 추출 명령어 구성
+        # 특징점 추출 명령어 구성 (HLoc의 올바른 파라미터 사용)
         extract_cmd = [
             sys.executable, '-m', 'hloc.extract_features',
             '--image_dir', str(image_dir),
             '--export_dir', str(output_dir),
-            '--conf', self.config['feature_conf'],
-            '--max_num_features', str(self.config['max_features']),
-            '--detection_threshold', str(self.config['keypoint_threshold']),
-            '--nms_radius', str(self.config['nms_radius'])
+            '--conf', self.config['feature_conf']
         ]
         
         try:
@@ -535,11 +534,13 @@ class ImprovedHlocPipeline:
                         T=t,
                         FovY=np.arctan(camera.height / (2 * camera.params[1])) * 2 if hasattr(camera, 'params') else np.pi/3,
                         FovX=np.arctan(camera.width / (2 * camera.params[0])) * 2 if hasattr(camera, 'params') else np.pi/3,
-                        image=None,  # 나중에 로드
+                        depth_params={},  # 빈 딕셔너리
                         image_path=str(next((p for p in image_paths if p.name == image.name), "")),
                         image_name=getattr(image, 'name', f"image_{idx:04d}.jpg"),
+                        depth_path="",  # 빈 문자열
                         width=int(getattr(camera, 'width', 800)),
-                        height=int(getattr(camera, 'height', 600))
+                        height=int(getattr(camera, 'height', 600)),
+                        is_test=(idx not in train_indices)
                     )
                     
                     if idx in train_indices:
@@ -634,11 +635,13 @@ class ImprovedHlocPipeline:
                     T=t,
                     FovY=np.pi/3,  # 60도
                     FovX=np.pi/3,  # 60도  
-                    image=None,
+                    depth_params={},  # 빈 딕셔너리
                     image_path=str(img_path),
                     image_name=img_path.name,
+                    depth_path="",  # 빈 문자열
                     width=width,
-                    height=height
+                    height=height,
+                    is_test=(i >= n_train)
                 )
                 
                 if i < n_train:
@@ -868,11 +871,13 @@ def _create_fallback_scene_info(image_dir: Path):
                     T=t,
                     FovY=np.pi/3,  # 60도
                     FovX=np.pi/3,  # 60도  
-                    image=None,
+                    depth_params={},  # 빈 딕셔너리
                     image_path=str(img_path),
                     image_name=img_path.name,
+                    depth_path="",  # 빈 문자열
                     width=width,
-                    height=height
+                    height=height,
+                    is_test=(i >= int(n_images * 0.8))
                 )
                 
                 # 80% train, 20% test
@@ -905,7 +910,7 @@ def _create_fallback_scene_info(image_dir: Path):
             train_cameras=train_cameras,
             test_cameras=test_cameras,
             nerf_normalization={"translate": np.array([0., 0., 0.]), "radius": 1.0},
-            ply_path=""  # 빈 문자열로 설정
+            ply_path=""
         )
         
         print(f"✅ Fallback SceneInfo created: {len(train_cameras)} train, {len(test_cameras)} test")
