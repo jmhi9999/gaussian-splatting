@@ -105,11 +105,50 @@ class SuperGlue3DGSPipeline:
         # 6. 🔧 FIX: 카메라 포즈 추정 (누락된 단계 추가)
         print("  Estimating camera poses...")
         self._estimate_camera_poses_robust()
+        
+        # 🔧 DEBUG: 카메라 포즈 추정 결과 확인
+        print(f"    DEBUG: After pose estimation, cameras dictionary has {len(self.cameras)} cameras")
+        if len(self.cameras) > 0:
+            print(f"    DEBUG: First camera keys: {list(self.cameras[0].keys()) if 0 in self.cameras else 'Camera 0 not found'}")
+        else:
+            print("    DEBUG: ⚠️ Cameras dictionary is empty! This will cause triangulation to fail.")
+            print("    DEBUG: Creating basic camera poses as fallback...")
+            # 🔧 FIX: 기본 카메라 포즈 생성
+            for cam_id in range(len(self.image_features)):
+                angle = cam_id * (2 * np.pi / len(self.image_features))
+                radius = 3.0
+                
+                R = np.array([[np.cos(angle), 0, np.sin(angle)],
+                             [0, 1, 0],
+                             [-np.sin(angle), 0, np.cos(angle)]], dtype=np.float32)
+                T = np.array([radius * np.sin(angle), 0, radius * (1 - np.cos(angle))], dtype=np.float32)
+                
+                self.cameras[cam_id] = {
+                    'R': R,
+                    'T': T,
+                    'K': self._estimate_intrinsics(cam_id)
+                }
+            print(f"    DEBUG: Created {len(self.cameras)} fallback camera poses")
 
         # 7. Multi-view Triangulation (이제 카메라 포즈가 있음)
+        print("  Triangulating tracks...")
         triangulated_points = self.track_manager.triangulate_tracks(self.cameras, self.image_features)
         # triangulated_points를 self.points_3d에 반영
         self.points_3d.update(triangulated_points)
+        
+        # 🔧 DEBUG: 삼각측량 결과 확인
+        print(f"    DEBUG: Triangulation returned {len(triangulated_points)} points")
+        if len(triangulated_points) == 0:
+            print("    DEBUG: ⚠️ No points triangulated! Using fallback method...")
+            # 🔧 FIX: 기존 방식의 삼각측량 사용
+            n_points = self._triangulate_all_points_robust()
+            print(f"    DEBUG: Fallback triangulation created {n_points} points")
+            
+            # 🔧 FIX: 포인트 관찰 데이터 설정
+            if len(self.points_3d) > 0:
+                for point_id, point_data in self.points_3d.items():
+                    if point_id not in self.point_observations:
+                        self.point_observations[point_id] = point_data.get('observations', [])
 
         # 7.5. 🔧 FIX: Point observations 설정 (Bundle Adjustment용)
         print("  Setting up point observations...")
@@ -1555,6 +1594,11 @@ class SuperGlue3DGSPipeline:
     def _estimate_camera_poses_robust(self):
         """개선된 카메라 포즈 추정 - 더 강력한 연결성"""
         
+        # 🔧 DEBUG: 포즈 추정 시작 상태 확인
+        print(f"    DEBUG: Starting pose estimation with {len(self.matches)} matches")
+        print(f"    DEBUG: Camera graph has {len(self.camera_graph)} nodes")
+        print(f"    DEBUG: Image features for {len(self.image_features)} images")
+        
         # 첫 번째 카메라를 원점으로 설정
         self.cameras[0] = {
             'R': np.eye(3, dtype=np.float32),
@@ -1683,6 +1727,17 @@ class SuperGlue3DGSPipeline:
         print(f"  Estimated poses for {len(estimated_cameras)} cameras")
         print(f"  Used default poses for {unconnected_count} cameras")
         print(f"  Total cameras with poses: {len(self.cameras)}")
+        
+        # 🔧 DEBUG: 포즈 추정 완료 상태 확인
+        print(f"    DEBUG: Final cameras dictionary has {len(self.cameras)} entries")
+        if len(self.cameras) > 0:
+            sample_cam = list(self.cameras.keys())[0]
+            print(f"    DEBUG: Sample camera {sample_cam} has keys: {list(self.cameras[sample_cam].keys())}")
+            print(f"    DEBUG: Sample camera R shape: {self.cameras[sample_cam]['R'].shape}")
+            print(f"    DEBUG: Sample camera T shape: {self.cameras[sample_cam]['T'].shape}")
+            print(f"    DEBUG: Sample camera K shape: {self.cameras[sample_cam]['K'].shape}")
+        else:
+            print(f"    DEBUG: ⚠️ No cameras in dictionary after pose estimation!")
     
     def _estimate_relative_pose_robust(self, cam_i, cam_j, pair_key):
         """개선된 두 카메라 간 상대 포즈 추정 - 극도로 완화된 버전"""
