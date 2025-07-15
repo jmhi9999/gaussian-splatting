@@ -3571,7 +3571,24 @@ class SuperGlue3DGSPipeline:
         print(f"    Using cameras {cam_i} and {cam_j} as reference pair")
         
         # 2. 기준 카메라 쌍 초기화
-        self._initialize_reference_cameras(cam_i, cam_j)
+        success = self._initialize_reference_cameras(cam_i, cam_j)
+        
+        # 기준 쌍 초기화 실패 시 다른 쌍들 시도
+        if not success:
+            print("    Trying alternative camera pairs...")
+            alternative_pairs = self._find_alternative_camera_pairs(exclude_pair=best_pair)
+            
+            for alt_cam_i, alt_cam_j in alternative_pairs[:3]:  # 최대 3개까지 시도
+                print(f"    Trying cameras {alt_cam_i} and {alt_cam_j} as reference pair")
+                success = self._initialize_reference_cameras(alt_cam_i, alt_cam_j)
+                if success:
+                    cam_i, cam_j = alt_cam_i, alt_cam_j
+                    break
+            
+            if not success:
+                print("    All reference pairs failed, using default poses")
+                self._create_default_camera_poses()
+                return
         
         # 3. 점진적 카메라 등록 (Incremental SfM)
         self._incremental_camera_registration()
@@ -3590,7 +3607,7 @@ class SuperGlue3DGSPipeline:
         best_score = 0
         
         for (cam_i, cam_j), matches in self.matches.items():
-            if len(matches) < 20:  # 최소 매칭 수
+            if len(matches) < 10:  # 최소 매칭 수 (20 → 10으로 완화)
                 continue
             
             # 매칭 품질 점수 계산
@@ -3604,6 +3621,31 @@ class SuperGlue3DGSPipeline:
         
         return best_pair
     
+    def _find_alternative_camera_pairs(self, exclude_pair=None):
+        """대안 카메라 쌍들을 품질 순으로 찾기"""
+        pairs_with_scores = []
+        
+        for (cam_i, cam_j), matches in self.matches.items():
+            if len(matches) < 5:  # 더 완화된 최소 매칭 수
+                continue
+            
+            # 제외할 쌍 건너뛰기
+            if exclude_pair and (cam_i, cam_j) == exclude_pair:
+                continue
+            
+            # 매칭 품질 점수 계산
+            confidences = [conf for _, _, conf in matches]
+            avg_confidence = np.mean(confidences)
+            match_score = len(matches) * avg_confidence
+            
+            pairs_with_scores.append(((cam_i, cam_j), match_score))
+        
+        # 점수 순으로 정렬
+        pairs_with_scores.sort(key=lambda x: x[1], reverse=True)
+        
+        # 상위 10개 쌍 반환
+        return [pair for pair, score in pairs_with_scores[:10]]
+    
     def _initialize_reference_cameras(self, cam_i, cam_j):
         """기준 카메라 쌍 초기화"""
         # 첫 번째 카메라를 원점으로 설정
@@ -3613,8 +3655,10 @@ class SuperGlue3DGSPipeline:
             'K': self._estimate_intrinsics(cam_i)
         }
         
-        # 두 번째 카메라 포즈 추정
+        # 두 번째 카메라 포즈 추정 (기준 쌍에는 관대한 방식 사용)
         pair_key = (cam_i, cam_j) if cam_i < cam_j else (cam_j, cam_i)
+        
+        # 먼저 엄격한 방식 시도
         R_rel, T_rel = self._estimate_relative_pose_strict(cam_i, cam_j, pair_key)
         
         if R_rel is not None and T_rel is not None:
@@ -3623,9 +3667,24 @@ class SuperGlue3DGSPipeline:
                 'T': T_rel.astype(np.float32),
                 'K': self._estimate_intrinsics(cam_j)
             }
-            print(f"    Initialized reference pair: cameras {cam_i} and {cam_j}")
+            print(f"    Initialized reference pair: cameras {cam_i} and {cam_j} (strict method)")
+            return True
         else:
-            print(f"    Failed to initialize reference pair")
+            # 엄격한 방식 실패 시 기존 관대한 방식 사용
+            print(f"    Strict method failed, trying robust method for reference pair...")
+            R_rel, T_rel = self._estimate_relative_pose_robust(cam_i, cam_j, pair_key)
+            
+            if R_rel is not None and T_rel is not None:
+                self.cameras[cam_j] = {
+                    'R': R_rel.astype(np.float32),
+                    'T': T_rel.astype(np.float32),
+                    'K': self._estimate_intrinsics(cam_j)
+                }
+                print(f"    Initialized reference pair: cameras {cam_i} and {cam_j} (robust method)")
+                return True
+            else:
+                print(f"    Failed to initialize reference pair with both methods")
+                return False
     
     def _estimate_relative_pose_strict(self, cam_i, cam_j, pair_key):
         """더 엄격한 상대 포즈 추정"""
@@ -3784,8 +3843,12 @@ class SuperGlue3DGSPipeline:
                     pair_key = (min(cam_id, registered_cam), max(cam_id, registered_cam))
                     
                     if pair_key in self.matches:
-                        # 상대 포즈 추정
+                        # 상대 포즈 추정 (먼저 엄격한 방식 시도)
                         R_rel, T_rel = self._estimate_relative_pose_strict(registered_cam, cam_id, pair_key)
+                        
+                        if R_rel is None or T_rel is None:
+                            # 엄격한 방식 실패 시 관대한 방식 사용
+                            R_rel, T_rel = self._estimate_relative_pose_robust(registered_cam, cam_id, pair_key)
                         
                         if R_rel is not None and T_rel is not None:
                             # 절대 포즈 계산
