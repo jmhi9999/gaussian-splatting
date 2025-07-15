@@ -20,6 +20,15 @@ from scipy.spatial.distance import cdist
 import concurrent.futures
 import networkx as nx
 
+# CLIP 관련 imports (선택적)
+try:
+    import clip
+    from PIL import Image as PILImage
+    CLIP_AVAILABLE = True
+except ImportError:
+    CLIP_AVAILABLE = False
+    print("⚠️  CLIP not available. AdaptiveMatcher will use fallback descriptors.")
+
 # SuperGlue 관련 imports
 from models.matching import Matching
 from models.utils import frame2tensor
@@ -842,16 +851,16 @@ class AdaptiveMatcher:
         self.global_descriptors = {}
         
         # CLIP 모델 로드 (선택적)
-        self.clip_available = False
-        try:
-            import clip
-            from PIL import Image as PILImage
-            self.model, self.preprocess = clip.load("ViT-B/32", device=self.device)
-            self.clip_available = True
-            print("✓ CLIP model loaded for adaptive matching")
-        except ImportError:
+        self.clip_available = CLIP_AVAILABLE
+        if self.clip_available:
+            try:
+                self.model, self.preprocess = clip.load("ViT-B/32", device=self.device)
+                print("✓ CLIP model loaded for adaptive matching")
+            except Exception as e:
+                print(f"⚠️  CLIP model loading failed: {e}, using fallback descriptors")
+                self.clip_available = False
+        else:
             print("⚠️  CLIP not available, using fallback global descriptors")
-            self.clip_available = False
     
     def compute_global_descriptors(self, image_paths):
         """전역 이미지 descriptor 계산"""
