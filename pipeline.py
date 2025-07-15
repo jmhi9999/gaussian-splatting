@@ -123,10 +123,12 @@ def export_superglue2colmap_format(features_path, matches_path, colmap_desc_dir,
     # 2. 전체 쌍에 대해 matches.txt 생성 (쌍별로 실제 이미지명 사용)
     with open(matches_txt_path, 'w') as f:
         for (im1, im2), matches in matches_dict.items():
+            valid_matches = [(i, int(m)) for i, m in enumerate(matches) if m != -1]
+            if len(valid_matches) < 5:
+                continue  # 매칭 5개 미만 쌍은 기록하지 않음
             f.write(f"{im1} {im2}\n")
-            for i, m in enumerate(matches):
-                if m != -1:
-                    f.write(f"{i} {int(m)}\n")
+            for i, m in valid_matches:
+                f.write(f"{i} {m}\n")
             f.write("\n\n")
 
 def validate_data(features_path, matches_path, image_dir, desc_dir, num_visualize=3):
