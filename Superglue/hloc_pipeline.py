@@ -332,13 +332,23 @@ class ImprovedHlocPipeline:
             # 특징점 품질 검증
             features_path = output_dir / f"feats-{self.config['feature_conf']}.h5"
             if not features_path.exists():
-                print(f"  ⚠️  Feature file not found: {features_path}")
+                print(f"  ⚠️  Expected feature file not found: {features_path}")
                 print(f"  📁 Checking output directory: {output_dir}")
                 if output_dir.exists():
                     print(f"  📂 Files in output directory:")
                     for file in output_dir.iterdir():
                         print(f"    - {file.name}")
-                return False
+                    
+                    # Look for actual HLoc feature files
+                    feature_files = list(output_dir.glob("feats-*.h5"))
+                    if feature_files:
+                        features_path = feature_files[0]  # Use the first feature file found
+                        print(f"  ✅ Found feature file: {features_path.name}")
+                    else:
+                        print(f"  ❌ No feature files found")
+                        return False
+                else:
+                    return False
             
             if not self.verifier.verify_features(features_path):
                 print("  ⚠️  Low quality features detected")
@@ -372,8 +382,17 @@ class ImprovedHlocPipeline:
         """Robust 특징점 매칭"""
         print("🔗 Matching features with SuperGlue...")
         
-        features_name = f"feats-{self.config['feature_conf']}"
+        # Find the actual feature file
+        feature_files = list(output_dir.glob("feats-*.h5"))
+        if not feature_files:
+            print("  ❌ No feature files found for matching")
+            return False
+        
+        features_name = feature_files[0].stem  # Remove .h5 extension
         matches_name = f"{features_name}_matches-{self.config['matcher_conf']}_adaptive.h5"
+        
+        print(f"  📄 Using feature file: {features_name}")
+        print(f"  📄 Creating matches file: {matches_name}")
         
         match_cmd = [
             sys.executable, '-m', 'hloc.match_features',
@@ -417,8 +436,17 @@ class ImprovedHlocPipeline:
         sfm_dir = output_dir / 'sfm'
         sfm_dir.mkdir(exist_ok=True)
         
-        features_name = f"feats-{self.config['feature_conf']}"
+        # Find the actual feature and match files
+        feature_files = list(output_dir.glob("feats-*.h5"))
+        if not feature_files:
+            print("  ❌ No feature files found for reconstruction")
+            return False
+        
+        features_name = feature_files[0].stem  # Remove .h5 extension
         matches_name = f"{features_name}_matches-{self.config['matcher_conf']}_adaptive.h5"
+        
+        print(f"  📄 Using feature file: {features_name}")
+        print(f"  📄 Using matches file: {matches_name}")
         
         reconstruction_cmd = [
             sys.executable, '-m', 'hloc.reconstruction',
@@ -476,8 +504,18 @@ class ImprovedHlocPipeline:
         
         # 매우 관대한 파라미터로 재구성
         sfm_dir = output_dir / 'sfm'
-        features_name = f"feats-{self.config['feature_conf']}"
+        
+        # Find the actual feature and match files
+        feature_files = list(output_dir.glob("feats-*.h5"))
+        if not feature_files:
+            print("    ❌ No feature files found for fallback reconstruction")
+            return False
+        
+        features_name = feature_files[0].stem  # Remove .h5 extension
         matches_name = f"{features_name}_matches-{self.config['matcher_conf']}_adaptive.h5"
+        
+        print(f"    📄 Using feature file: {features_name}")
+        print(f"    📄 Using matches file: {matches_name}")
         
         fallback_cmd = [
             sys.executable, '-m', 'hloc.reconstruction',
