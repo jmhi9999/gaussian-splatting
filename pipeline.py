@@ -87,7 +87,7 @@ def match_superglue(features_path, image_dir, output_path, superglue_config=None
     np.savez(output_path, matches=matches_dict)
     print(f"SuperGlue matches saved to {output_path}")
 
-def write_colmap_files(features_path, matches_path, desc_dir, matches_txt_path, img_format='.jpg'):
+def write_colmap_files(features_path, matches_path, desc_dir, matches_txt_path, img_format='.jpg', min_matches_per_pair=10):
     print("Step 3: Convert SuperGlue results to COLMAP .txt format (내장 구현)")
     os.makedirs(desc_dir, exist_ok=True)
     features = np.load(features_path, allow_pickle=True)
@@ -96,25 +96,27 @@ def write_colmap_files(features_path, matches_path, desc_dir, matches_txt_path, 
     matches_dict = matches_data['matches'].item()
     # 1. 각 이미지별 COLMAP keypoint 텍스트 파일 생성
     for img_name, kps in keypoints.items():
-        # 이미지 이름을 소문자 및 strip 처리 (DB와 일치 보장)
         img_name_clean = img_name.strip().lower()
         desc_file = os.path.join(desc_dir, f"{img_name_clean}.txt")
         with open(desc_file, 'w') as f:
             f.write(f"{kps.shape[0]} 128\n")
             for r in range(kps.shape[0]):
-                # scale=1.0, orientation=0.0으로 저장 (COLMAP SIFT txt 포맷)
                 f.write(f"{kps[r,0]} {kps[r,1]} 1.0 0.0\n")
-    # 2. 쌍별 matches.txt 생성
+    # 2. 쌍별 matches.txt 생성 (매칭 개수 min_matches_per_pair 미만 쌍은 제외)
     with open(matches_txt_path, 'w') as f:
+        filtered = 0
         for (im1, im2), matches in matches_dict.items():
+            valid_matches = [(i, int(m)) for i, m in enumerate(matches) if m != -1]
+            if len(valid_matches) < min_matches_per_pair:
+                filtered += 1
+                continue
             im1_clean = im1.strip().lower()
             im2_clean = im2.strip().lower()
             f.write(f"{im1_clean} {im2_clean}\n")
-            for i, m in enumerate(matches):
-                if m != -1:
-                    f.write(f"{i} {int(m)}\n")
+            for i, m in valid_matches:
+                f.write(f"{i} {m}\n")
             f.write("\n\n")
-    print(f"COLMAP keypoints saved to {desc_dir}, matches saved to {matches_txt_path}")
+    print(f"COLMAP keypoints saved to {desc_dir}, matches saved to {matches_txt_path} (filtered {filtered} pairs with <{min_matches_per_pair} matches)")
 
 def validate_data(features_path, matches_path, image_dir, desc_dir, num_visualize=3):
     print("\n[Validation] Checking data consistency and match quality...")
@@ -132,7 +134,6 @@ def validate_data(features_path, matches_path, image_dir, desc_dir, num_visualiz
     for k in matches_dict.keys():
         matches_imgs.add(k[0].strip().lower())
         matches_imgs.add(k[1].strip().lower())
-    # 1. 이미지 이름 일치 체크
     print(f"- Images in folder: {len(image_list_clean)}")
     print(f"- Images in keypoints: {len(keypoints_imgs)}")
     print(f"- Images in desc_dir: {len(desc_imgs)}")
@@ -146,16 +147,14 @@ def validate_data(features_path, matches_path, image_dir, desc_dir, num_visualiz
         print(f"[WARNING] Images missing in desc_dir: {missing_in_desc}")
     if missing_in_matches:
         print(f"[WARNING] Images missing in matches: {missing_in_matches}")
-    # 2. keypoint/matches 개수
     print(f"- Total keypoints files: {len(keypoints)}")
     print(f"- Total matches pairs: {len(matches_dict)}")
-    # 3. 매칭 통계
     match_counts = [np.sum(np.array(m) != -1) for m in matches_dict.values()]
     if match_counts:
         print(f"- Match count per pair: min={np.min(match_counts)}, max={np.max(match_counts)}, mean={np.mean(match_counts):.1f}")
     else:
         print("[WARNING] No matches found!")
-    # 4. 랜덤 매칭 시각화
+    # 4. 랜덤 매칭 시각화 (실제 매칭된 점을 선으로 연결)
     if num_visualize > 0 and len(matches_dict) > 0:
         pairs = list(matches_dict.keys())
         for i in range(min(num_visualize, len(pairs))):
@@ -172,14 +171,20 @@ def validate_data(features_path, matches_path, image_dir, desc_dir, num_visualiz
             matches = matches_dict[pair]
             img0_pil = Image.open(img0_path).convert('RGB')
             img1_pil = Image.open(img1_path).convert('RGB')
-            # Draw matches
-            fig, ax = plt.subplots(1,2,figsize=(10,5))
-            ax[0].imshow(img0_pil)
-            ax[0].scatter(kpts0[:,0], kpts0[:,1], s=2, c='r')
-            ax[0].set_title(img0)
-            ax[1].imshow(img1_pil)
-            ax[1].scatter(kpts1[:,0], kpts1[:,1], s=2, c='b')
-            ax[1].set_title(img1)
+            fig, axes = plt.subplots(1,2,figsize=(12,6))
+            axes[0].imshow(img0_pil)
+            axes[0].scatter(kpts0[:,0], kpts0[:,1], s=2, c='r')
+            axes[0].set_title(img0)
+            axes[1].imshow(img1_pil)
+            axes[1].scatter(kpts1[:,0], kpts1[:,1], s=2, c='b')
+            axes[1].set_title(img1)
+            # 매칭된 점을 선으로 연결
+            for idx0, idx1 in [(i, int(m)) for i, m in enumerate(matches) if m != -1]:
+                x0, y0 = kpts0[idx0]
+                x1, y1 = kpts1[idx1]
+                con = plt.ConnectionPatch(xyA=(x1, y1), xyB=(x0, y0), coordsA="data", coordsB="data",
+                                         axesA=axes[1], axesB=axes[0], color="lime", linewidth=1, alpha=0.7)
+                axes[1].add_artist(con)
             plt.suptitle(f"Sample match: {img0} <-> {img1} (matches: {np.sum(np.array(matches)!=-1)})")
             plt.tight_layout()
             out_path = f"validation_match_{i}_{img0_clean}_{img1_clean}.png"
@@ -223,16 +228,20 @@ def run_colmap_matches_importer(database_path, matches_path):
     ], check=True)
 
 if __name__ == "__main__":
-    extract_superpoint_features("ImageInputs/images", "ImageInputs/superpoint_features.npz")
-    match_superglue("ImageInputs/superpoint_features.npz", "ImageInputs/images", "ImageInputs/superglue_matches.npz")
+    # 파라미터 쉽게 조정
+    superpoint_config = {}
+    superglue_config = {'match_threshold': 0.2}  # 원하는 값으로 조정
+    min_matches_per_pair = 10  # 원하는 값으로 조정
+    extract_superpoint_features("ImageInputs/images", "ImageInputs/superpoint_features.npz", config=superpoint_config)
+    match_superglue("ImageInputs/superpoint_features.npz", "ImageInputs/images", "ImageInputs/superglue_matches.npz", superglue_config=superglue_config)
     write_colmap_files(
         "ImageInputs/superpoint_features.npz",
         "ImageInputs/superglue_matches.npz",
         "ImageInputs/colmap_desc",
         "ImageInputs/superglue_matches.txt",
-        img_format='.jpg'
+        img_format='.jpg',
+        min_matches_per_pair=min_matches_per_pair
     )
-    # 데이터 유효성 검증
     validate_data(
         "ImageInputs/superpoint_features.npz",
         "ImageInputs/superglue_matches.npz",
