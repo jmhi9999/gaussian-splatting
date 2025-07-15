@@ -31,19 +31,26 @@ def extract_superpoint_features(image_dir, output_path, config=None):
     np.savez(output_path, keypoints=all_keypoints, descriptors=all_descriptors, scores=all_scores)
     print(f"SuperPoint features saved to {output_path}")
 
-def generate_image_pairs(image_list):
+def generate_image_pairs(image_list, partial_gap=5):
     pairs = []
-    for i in range(len(image_list)):
+    # Sequential pairs
+    for i in range(len(image_list) - 1):
+        pairs.append((image_list[i], image_list[i+1]))
+    # Partial exhaustive: every partial_gap-th image와 모든 이미지 쌍
+    for i in range(0, len(image_list), partial_gap):
         for j in range(i+1, len(image_list)):
             pairs.append((image_list[i], image_list[j]))
     return pairs
 
-def match_superglue(features_path, image_dir, output_path, superglue_config=None, partial_gap=10):
+def match_superglue(features_path, image_dir, output_path, superglue_config=None, partial_gap=5):
     print("Step 2: SuperGlue feature matching (direct, GPU 지원)")
     import torch
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     if superglue_config is None:
-        superglue_config = {}
+        superglue_config = {'match_threshold': 0.1}
+    else:
+        if 'match_threshold' not in superglue_config:
+            superglue_config['match_threshold'] = 0.1
     model = SuperGlue(superglue_config).to(device)
     model.eval()
     data = np.load(features_path, allow_pickle=True)
@@ -51,7 +58,7 @@ def match_superglue(features_path, image_dir, output_path, superglue_config=None
     descriptors = data['descriptors'].item()
     scores = data['scores'].item()
     image_list = sorted(keypoints.keys())
-    pairs = generate_image_pairs(image_list)
+    pairs = generate_image_pairs(image_list, partial_gap=partial_gap)
     matches_dict = {}
     for img0, img1 in pairs:
         kpts0 = torch.from_numpy(keypoints[img0])[None].to(device)
@@ -60,7 +67,6 @@ def match_superglue(features_path, image_dir, output_path, superglue_config=None
         desc1 = torch.from_numpy(descriptors[img1])[None].to(device)
         scores0 = torch.from_numpy(scores[img0])[None].to(device)
         scores1 = torch.from_numpy(scores[img1])[None].to(device)
-        # 더미 이미지 텐서 (정규화용, 실제 매칭에는 영향 없음)
         img0_tensor = torch.zeros((1, 1, 240, 320), device=device)
         img1_tensor = torch.zeros((1, 1, 240, 320), device=device)
         with torch.no_grad():
@@ -74,7 +80,7 @@ def match_superglue(features_path, image_dir, output_path, superglue_config=None
                 'image0': img0_tensor,
                 'image1': img1_tensor,
             })
-        matches0 = result['matches0'][0].cpu().numpy() # (N0,) - img0의 각 keypoint가 img1의 몇 번째와 매칭되는지, -1은 매칭 없음
+        matches0 = result['matches0'][0].cpu().numpy()
         matches_dict[(img0, img1)] = matches0
     np.savez(output_path, matches=matches_dict)
     print(f"SuperGlue matches saved to {output_path}")
