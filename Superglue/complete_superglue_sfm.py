@@ -77,52 +77,56 @@ class SuperGlue3DGSPipeline:
     
     def process_images_to_3dgs(self, image_dir, output_dir, max_images=120):
         """이미지들을 3DGS 형식으로 처리 (구조화/리팩토링 버전)"""
+        # 시작 시간 기록
+        self.start_time = time.time()
+        
         # 1. 이미지 수집
         image_paths = self._collect_images(image_dir, max_images)
         if not image_paths:
             raise RuntimeError("No images found")
         print(f"Found {len(image_paths)} images")
 
-        # 2. 특징점 추출 (병렬화 예시)
-        def extract_features_for_path(path):
-            img = self._load_image(path)
-            return self.feature_extractor.extract(img)
-        features_list = self.parallel_executor.parallel_map(extract_features_for_path, image_paths)
-        for i, feat in enumerate(features_list):
-            self.image_features[i] = feat
+        # 2. 특징점 추출
+        print("  Extracting features...")
+        self._extract_all_features(image_paths)
 
-        # 3. Adaptive Matching (global descriptor 기반 후보 쌍 선정)
-        global_descs = self.adaptive_matcher.compute_global_descriptors(image_paths)
-        candidate_pairs = self.adaptive_matcher.select_topk_pairs(global_descs)
+        # 3. 매칭 
+        print("  Matching images...")
+        self._intelligent_matching()
 
-        # 4. 매칭 (병렬화 예시)
-        def match_pair(pair):
-            i, j = pair
-            return (pair, self.matcher.match(self.image_features[i], self.image_features[j]))
-        match_results = self.parallel_executor.parallel_map(match_pair, candidate_pairs)
-        for pair, matches in match_results:
-            self.matches[pair] = matches
-
-        # 5. Track 생성 및 Multi-view Triangulation
+        # 4. Track 생성 및 필터링
         self.track_manager.build_tracks(self.matches, self.image_features)
         self.track_manager.filter_tracks(min_views=3)
-        triangulated_points = self.track_manager.triangulate_tracks(self.cameras, self.image_features)
-        # triangulated_points를 self.points_3d에 반영 (실제 구현 필요)
 
-        # 6. Pose Graph Optimization
+        # 5. 🔧 FIX: 카메라 그래프 구축 (매칭 결과로부터)
+        print("  Building camera graph from matches...")
+        self._build_camera_graph_from_matches()
+
+        # 6. 🔧 FIX: 카메라 포즈 추정 (누락된 단계 추가)
+        print("  Estimating camera poses...")
+        self._estimate_camera_poses_robust()
+
+        # 7. Multi-view Triangulation (이제 카메라 포즈가 있음)
+        triangulated_points = self.track_manager.triangulate_tracks(self.cameras, self.image_features)
+        # triangulated_points를 self.points_3d에 반영
+        self.points_3d.update(triangulated_points)
+
+        # 7.5. 🔧 FIX: Point observations 설정 (Bundle Adjustment용)
+        print("  Setting up point observations...")
+        self._setup_point_observations_from_triangulation(triangulated_points)
+
+        # 8. Pose Graph Optimization
         self.pose_graph_optimizer.build_pose_graph(self.matches, self.cameras)
         self.pose_graph_optimizer.remove_outlier_edges(min_matches=10)
         pose_tree = self.pose_graph_optimizer.get_spanning_tree()
-        # pose_tree를 이용해 global pose 초기화 (실제 구현 필요)
 
-        # 7. Bundle Adjustment
+        # 9. Bundle Adjustment
         ba_result = self.bundle_adjuster.run(self.cameras, self.points_3d, self.point_observations, callback=self.bundle_adjuster.monitor_quality)
 
-        # 8. Auto-tuning (품질 메트릭 평가 및 파라미터 조정)
-        self.auto_tuner.evaluate_metrics(self.quality_metrics)
-        self.auto_tuner.adjust_parameters()
+        # 10. 품질 메트릭 계산
+        self._compute_quality_metrics()
 
-        # 9. 결과 저장 및 마무리
+        # 11. 결과 저장 및 마무리
         scene_info = self._create_3dgs_scene_info(image_paths)
         self._save_3dgs_format(scene_info, output_dir)
         self._cleanup_memory()
@@ -1241,39 +1245,295 @@ class SuperGlue3DGSPipeline:
             return self._match_pair_fallback(cam_i, cam_j)
     
     def _match_pair_fallback(self, cam_i, cam_j):
-        """SuperGlue가 없을 때 사용하는 fallback 매칭"""
+        """SuperGlue가 없을 때 사용하는 정교한 fallback 매칭"""
         try:
             feat_i = self.image_features[cam_i]
             feat_j = self.image_features[cam_j]
             
-            # 간단한 descriptor 매칭
-            desc_i = feat_i['descriptors'].T  # (N, D)
-            desc_j = feat_j['descriptors'].T  # (M, D)
+            # 1단계: 다중 descriptor 매칭
+            matches_stage1 = self._multi_descriptor_matching(feat_i, feat_j)
             
-            # 코사인 유사도 계산
+            # 2단계: 기하학적 필터링
+            matches_stage2 = self._advanced_geometric_filtering(matches_stage1, feat_i, feat_j)
+            
+            # 3단계: 신뢰도 기반 재순위
+            matches_stage3 = self._confidence_reranking(matches_stage2, feat_i, feat_j)
+            
+            # 4단계: 상호 일관성 검증
+            final_matches = self._mutual_consistency_check(matches_stage3, feat_i, feat_j)
+            
+            return final_matches
+            
+        except Exception as e:
+            print(f"    Advanced fallback matching failed for pair {cam_i}-{cam_j}: {e}")
+            return self._basic_fallback_matching(cam_i, cam_j)
+    
+    def _multi_descriptor_matching(self, feat_i, feat_j):
+        """다중 descriptor 매칭"""
+        desc_i = feat_i['descriptors'].T  # (N, D)
+        desc_j = feat_j['descriptors'].T  # (M, D)
+        
+        # 방법 1: 코사인 유사도
+        desc_i_norm = desc_i / (np.linalg.norm(desc_i, axis=1, keepdims=True) + 1e-10)
+        desc_j_norm = desc_j / (np.linalg.norm(desc_j, axis=1, keepdims=True) + 1e-10)
+        cosine_sim = desc_i_norm @ desc_j_norm.T
+        
+        # 방법 2: 유클리드 거리
+        euclidean_dist = np.linalg.norm(desc_i[:, np.newaxis] - desc_j[np.newaxis, :], axis=2)
+        euclidean_sim = 1.0 / (1.0 + euclidean_dist)
+        
+        # 방법 3: 해밍 거리 (이진 특징의 경우)
+        # SIFT descriptor를 이진화하여 사용
+        binary_i = (desc_i > np.median(desc_i, axis=1, keepdims=True)).astype(np.uint8)
+        binary_j = (desc_j > np.median(desc_j, axis=1, keepdims=True)).astype(np.uint8)
+        hamming_dist = np.sum(binary_i[:, np.newaxis] != binary_j[np.newaxis, :], axis=2)
+        hamming_sim = 1.0 - hamming_dist / desc_i.shape[1]
+        
+        # 가중 조합
+        combined_sim = (0.5 * cosine_sim + 0.3 * euclidean_sim + 0.2 * hamming_sim)
+        
+        # 초기 매칭 후보 선택
+        matches = []
+        threshold = 0.6  # 더 엄격한 초기 임계값
+        
+        for i in range(len(desc_i)):
+            # 상위 3개 후보 선택
+            top_indices = np.argsort(combined_sim[i])[-3:][::-1]
+            for j in top_indices:
+                if combined_sim[i, j] > threshold:
+                    # Lowe's ratio test
+                    if len(top_indices) > 1:
+                        ratio = combined_sim[i, top_indices[0]] / (combined_sim[i, top_indices[1]] + 1e-10)
+                        if ratio > 0.8:  # 더 엄격한 ratio test
+                            continue
+                    
+                    matches.append((i, j, combined_sim[i, j]))
+        
+        return matches
+    
+    def _advanced_geometric_filtering(self, matches, feat_i, feat_j):
+        """고급 기하학적 필터링"""
+        if len(matches) < 8:
+            return matches
+        
+        kpts_i = feat_i['keypoints']
+        kpts_j = feat_j['keypoints']
+        
+        # 매칭점 좌표 추출
+        pts_i = np.array([kpts_i[m[0]] for m in matches])
+        pts_j = np.array([kpts_j[m[1]] for m in matches])
+        
+        # 1. 호모그래피 기반 필터링
+        filtered_matches = []
+        try:
+            H, mask = cv2.findHomography(pts_i, pts_j, cv2.RANSAC, 3.0)
+            if H is not None:
+                for i, is_inlier in enumerate(mask.flatten()):
+                    if is_inlier:
+                        filtered_matches.append(matches[i])
+        except:
+            filtered_matches = matches
+        
+        # 2. 에피폴라 제약 필터링 (추가)
+        if len(filtered_matches) >= 8:
+            try:
+                pts_i_filtered = np.array([kpts_i[m[0]] for m in filtered_matches])
+                pts_j_filtered = np.array([kpts_j[m[1]] for m in filtered_matches])
+                
+                F, mask = cv2.findFundamentalMat(pts_i_filtered, pts_j_filtered, cv2.FM_RANSAC)
+                if F is not None:
+                    epi_filtered = []
+                    for i, is_inlier in enumerate(mask.flatten()):
+                        if is_inlier:
+                            epi_filtered.append(filtered_matches[i])
+                    
+                    if len(epi_filtered) >= 8:
+                        filtered_matches = epi_filtered
+            except:
+                pass
+        
+        # 3. 지역적 일관성 검사
+        if len(filtered_matches) >= 10:
+            filtered_matches = self._local_consistency_check(filtered_matches, kpts_i, kpts_j)
+        
+        return filtered_matches
+    
+    def _local_consistency_check(self, matches, kpts_i, kpts_j):
+        """지역적 일관성 검사"""
+        if len(matches) < 10:
+            return matches
+        
+        # 각 매칭에 대해 지역적 이웃 검사
+        consistent_matches = []
+        
+        for idx, (i, j, conf) in enumerate(matches):
+            pt_i = kpts_i[i]
+            pt_j = kpts_j[j]
+            
+            # 주변 매칭들 찾기
+            neighbor_votes = 0
+            total_neighbors = 0
+            
+            for other_idx, (other_i, other_j, _) in enumerate(matches):
+                if idx == other_idx:
+                    continue
+                
+                other_pt_i = kpts_i[other_i]
+                other_pt_j = kpts_j[other_j]
+                
+                # 거리 계산
+                dist_i = np.linalg.norm(pt_i - other_pt_i)
+                dist_j = np.linalg.norm(pt_j - other_pt_j)
+                
+                if dist_i < 50 and dist_j < 50:  # 지역적 이웃
+                    total_neighbors += 1
+                    
+                    # 거리 비율 일관성 검사
+                    if dist_i > 0 and dist_j > 0:
+                        ratio = dist_j / dist_i
+                        if 0.5 < ratio < 2.0:  # 합리적인 스케일 비율
+                            neighbor_votes += 1
+            
+            # 지역적 일관성 점수
+            if total_neighbors > 0:
+                consistency_score = neighbor_votes / total_neighbors
+                if consistency_score > 0.3:  # 30% 이상 일관성
+                    consistent_matches.append((i, j, conf * consistency_score))
+        
+        return consistent_matches
+    
+    def _confidence_reranking(self, matches, feat_i, feat_j):
+        """신뢰도 기반 재순위"""
+        if len(matches) < 5:
+            return matches
+        
+        enhanced_matches = []
+        
+        for i, j, base_conf in matches:
+            # 다양한 신뢰도 지표 계산
+            
+            # 1. 특징점 강도 (response)
+            score_i = feat_i['scores'][i] if i < len(feat_i['scores']) else 0.5
+            score_j = feat_j['scores'][j] if j < len(feat_j['scores']) else 0.5
+            response_conf = np.sqrt(score_i * score_j)
+            
+            # 2. 이미지 중심으로부터 거리 (중심부 특징점 선호)
+            h_i, w_i = feat_i['image_size']
+            h_j, w_j = feat_j['image_size']
+            
+            center_i = np.array([w_i/2, h_i/2])
+            center_j = np.array([w_j/2, h_j/2])
+            
+            dist_i = np.linalg.norm(feat_i['keypoints'][i] - center_i)
+            dist_j = np.linalg.norm(feat_j['keypoints'][j] - center_j)
+            
+            max_dist_i = np.sqrt(w_i**2 + h_i**2) / 2
+            max_dist_j = np.sqrt(w_j**2 + h_j**2) / 2
+            
+            center_conf = (1.0 - dist_i/max_dist_i) * (1.0 - dist_j/max_dist_j)
+            
+            # 3. 경계 근처 페널티
+            border_penalty = 1.0
+            border_size = 10
+            
+            if (feat_i['keypoints'][i][0] < border_size or 
+                feat_i['keypoints'][i][0] > w_i - border_size or
+                feat_i['keypoints'][i][1] < border_size or 
+                feat_i['keypoints'][i][1] > h_i - border_size):
+                border_penalty *= 0.8
+            
+            if (feat_j['keypoints'][j][0] < border_size or 
+                feat_j['keypoints'][j][0] > w_j - border_size or
+                feat_j['keypoints'][j][1] < border_size or 
+                feat_j['keypoints'][j][1] > h_j - border_size):
+                border_penalty *= 0.8
+            
+            # 종합 신뢰도 계산
+            final_conf = (0.4 * base_conf + 
+                         0.3 * response_conf + 
+                         0.2 * center_conf + 
+                         0.1) * border_penalty
+            
+            enhanced_matches.append((i, j, final_conf))
+        
+        # 신뢰도 순으로 정렬
+        enhanced_matches.sort(key=lambda x: x[2], reverse=True)
+        
+        # 상위 N개만 선택 (품질 보장)
+        max_matches = min(len(enhanced_matches), 200)
+        return enhanced_matches[:max_matches]
+    
+    def _mutual_consistency_check(self, matches, feat_i, feat_j):
+        """상호 일관성 검증"""
+        if len(matches) < 10:
+            return matches
+        
+        # 역방향 매칭 수행
+        desc_i = feat_i['descriptors'].T
+        desc_j = feat_j['descriptors'].T
+        
+        # 정규화
+        desc_i_norm = desc_i / (np.linalg.norm(desc_i, axis=1, keepdims=True) + 1e-10)
+        desc_j_norm = desc_j / (np.linalg.norm(desc_j, axis=1, keepdims=True) + 1e-10)
+        
+        # 유사도 행렬
+        similarity = desc_i_norm @ desc_j_norm.T
+        
+        # 상호 일관성 검증
+        consistent_matches = []
+        
+        for i, j, conf in matches:
+            # 순방향 최적 매칭
+            best_j_for_i = np.argmax(similarity[i])
+            
+            # 역방향 최적 매칭
+            best_i_for_j = np.argmax(similarity[:, j])
+            
+            # 상호 일관성 검사
+            if best_j_for_i == j and best_i_for_j == i:
+                # 추가 검증: 2차 후보와의 격차
+                sorted_j = np.argsort(similarity[i])[::-1]
+                sorted_i = np.argsort(similarity[:, j])[::-1]
+                
+                if len(sorted_j) > 1 and len(sorted_i) > 1:
+                    gap_j = similarity[i, sorted_j[0]] - similarity[i, sorted_j[1]]
+                    gap_i = similarity[sorted_i[0], j] - similarity[sorted_i[1], j]
+                    
+                    if gap_j > 0.1 and gap_i > 0.1:  # 충분한 격차
+                        consistent_matches.append((i, j, conf * (gap_j + gap_i)))
+        
+        return consistent_matches
+    
+    def _basic_fallback_matching(self, cam_i, cam_j):
+        """기본 fallback 매칭 (최후의 수단)"""
+        try:
+            feat_i = self.image_features[cam_i]
+            feat_j = self.image_features[cam_j]
+            
+            desc_i = feat_i['descriptors'].T
+            desc_j = feat_j['descriptors'].T
+            
+            # 단순 코사인 유사도 매칭
             desc_i_norm = desc_i / (np.linalg.norm(desc_i, axis=1, keepdims=True) + 1e-10)
             desc_j_norm = desc_j / (np.linalg.norm(desc_j, axis=1, keepdims=True) + 1e-10)
             
-            similarity = desc_i_norm @ desc_j_norm.T  # (N, M)
+            similarity = desc_i_norm @ desc_j_norm.T
             
-            # 상위 매칭 찾기
             matches = []
-            threshold = 0.5  # 유사도 임계값
+            threshold = 0.5
             
             for i in range(len(desc_i)):
                 best_j = np.argmax(similarity[i])
                 if similarity[i, best_j] > threshold:
-                    # 상호 매칭 확인
                     if np.argmax(similarity[:, best_j]) == i:
-                        confidence = similarity[i, best_j]
-                        matches.append((i, best_j, confidence))
+                        matches.append((i, best_j, similarity[i, best_j]))
             
             return matches
             
         except Exception as e:
-            print(f"    Fallback matching failed for pair {cam_i}-{cam_j}: {e}")
+            print(f"    Basic fallback matching failed: {e}")
             return []
-
+    
     def _geometric_filtering_relaxed(self, matches, kpts_i, kpts_j):
         """완화된 기하학적 필터링 (NEW METHOD)"""
         try:
@@ -2282,39 +2542,94 @@ class SuperGlue3DGSPipeline:
         print(f"    Expanded observations: {original_obs} → {expanded_obs}")
     
     def _rotation_matrix_to_angle_axis(self, R):
-        """회전 행렬을 로드리게스 벡터로 변환"""
-        # 간단한 구현 (실제로는 더 정확한 변환이 필요)
+        """회전 행렬을 로드리게스 벡터로 변환 (정교한 구현)"""
+        # 수치적으로 안정한 변환
         trace = np.trace(R)
-        if trace > 3 - 1e-6:
-            return np.zeros(3)
         
-        angle = np.arccos((trace - 1) / 2)
+        # 단위 행렬인 경우 (회전 없음)
+        if trace > 3.0 - 1e-6:
+            return np.zeros(3, dtype=np.float32)
+        
+        # 180도 회전인 경우 (특수 처리)
+        if trace < -1.0 + 1e-6:
+            # 가장 큰 대각선 원소 찾기
+            k = np.argmax(np.diag(R))
+            
+            # 회전축 계산
+            axis = np.zeros(3)
+            axis[k] = np.sqrt((R[k, k] + 1.0) / 2.0)
+            
+            for i in range(3):
+                if i != k:
+                    axis[i] = R[k, i] / (2.0 * axis[k])
+            
+            return axis * np.pi
+        
+        # 일반적인 경우
+        angle = np.arccos(np.clip((trace - 1.0) / 2.0, -1.0, 1.0))
+        
+        # 회전축 계산 (안정적인 방법)
+        if angle < 1e-6:
+            return np.zeros(3, dtype=np.float32)
+        
+        # 반대칭 행렬에서 축 추출
         axis = np.array([
             R[2, 1] - R[1, 2],
             R[0, 2] - R[2, 0],
             R[1, 0] - R[0, 1]
         ])
         
-        if np.linalg.norm(axis) > 1e-6:
-            axis = axis / np.linalg.norm(axis)
+        # 축 정규화
+        axis_norm = np.linalg.norm(axis)
+        if axis_norm < 1e-6:
+            return np.zeros(3, dtype=np.float32)
         
-        return angle * axis
+        axis = axis / axis_norm
+        
+        # 각도 스케일링
+        sin_angle = axis_norm / 2.0
+        
+        # 안정적인 각도 계산
+        if sin_angle > 1e-6:
+            angle = np.arcsin(np.clip(sin_angle, -1.0, 1.0))
+            if trace < 1.0:
+                angle = np.pi - angle
+        
+        return (axis * angle).astype(np.float32)
     
     def _angle_axis_to_rotation_matrix(self, angle_axis):
-        """로드리게스 벡터를 회전 행렬로 변환"""
+        """로드리게스 벡터를 회전 행렬로 변환 (정교한 구현)"""
         angle = np.linalg.norm(angle_axis)
-        if angle < 1e-6:
-            return np.eye(3)
         
+        # 회전이 없는 경우
+        if angle < 1e-8:
+            return np.eye(3, dtype=np.float32)
+        
+        # 회전축 정규화
         axis = angle_axis / angle
-        K = np.array([
+        
+        # 로드리게스 공식 사용
+        cos_angle = np.cos(angle)
+        sin_angle = np.sin(angle)
+        one_minus_cos = 1.0 - cos_angle
+        
+        # 외적 행렬
+        outer = np.outer(axis, axis)
+        
+        # 반대칭 행렬 (교차곱 행렬)
+        cross = np.array([
             [0, -axis[2], axis[1]],
             [axis[2], 0, -axis[0]],
             [-axis[1], axis[0], 0]
         ])
         
-        R = np.eye(3) + np.sin(angle) * K + (1 - np.cos(angle)) * (K @ K)
-        return R
+        # 로드리게스 공식: R = I + sin(θ)[K] + (1-cos(θ))[K]²
+        # 여기서 [K]는 반대칭 행렬, [K]² = axis*axis^T - I
+        R = (cos_angle * np.eye(3) + 
+             sin_angle * cross + 
+             one_minus_cos * outer)
+        
+        return R.astype(np.float32)
     
     def _refine_point_cloud(self):
         """포인트 클라우드 정제 (더 완화된 버전)"""
@@ -3165,6 +3480,25 @@ class SuperGlue3DGSPipeline:
             xyz = params[idx:idx+3]
             idx += 3
             self.points_3d[point_id]['xyz'] = xyz.astype(np.float32)
+
+    def _build_camera_graph_from_matches(self):
+        """매칭 결과로부터 카메라 그래프 구축"""
+        for (cam_i, cam_j), matches in self.matches.items():
+            if cam_i not in self.camera_graph:
+                self.camera_graph[cam_i] = []
+            if cam_j not in self.camera_graph:
+                self.camera_graph[cam_j] = []
+            if cam_i != cam_j:
+                self.camera_graph[cam_i].append(cam_j)
+                self.camera_graph[cam_j].append(cam_i)
+
+    def _setup_point_observations_from_triangulation(self, triangulated_points):
+        """Triangulation 결과로부터 Point observations 설정"""
+        for point_id, point_data in triangulated_points.items():
+            if point_id not in self.point_observations:
+                self.point_observations[point_id] = []
+            for cam_id, observed_pt, confidence in point_data['observations']:
+                self.point_observations[point_id].append((cam_id, observed_pt, confidence))
 
 
 def readSuperGlueSceneInfo(path, images, eval, train_test_exp=False, llffhold=8, 
