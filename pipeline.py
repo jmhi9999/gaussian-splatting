@@ -30,6 +30,7 @@ def extract_superpoint_features(image_dir, output_path, config=None):
         all_keypoints[img_name] = result['keypoints'][0].cpu().numpy()
         all_descriptors[img_name] = result['descriptors'][0].cpu().numpy()
         all_scores[img_name] = result['scores'][0].cpu().numpy()
+        print(f"Keypoints saved for {img_name} - {all_keypoints[img_name].shape[0]} keypoints")
     np.savez(output_path, keypoints=all_keypoints, descriptors=all_descriptors, scores=all_scores)
     print(f"SuperPoint features saved to {output_path}")
 
@@ -84,39 +85,57 @@ def match_superglue(features_path, image_dir, output_path, superglue_config=None
             })
         matches0 = result['matches0'][0].cpu().numpy()
         matches_dict[(img0, img1)] = matches0
+        print(f"Matches saved for {img0} and {img1} - {matches0.shape[0]} matches")
     np.savez(output_path, matches=matches_dict)
     print(f"SuperGlue matches saved to {output_path}")
 
-def write_colmap_files(features_path, matches_path, desc_dir, matches_txt_path, img_format='.jpg', min_matches_per_pair=10):
-    print("Step 3: Convert SuperGlue results to COLMAP .txt format (내장 구현)")
-    os.makedirs(desc_dir, exist_ok=True)
+def export_superglue2colmap_format(features_path, matches_path, npz_dir, colmap_desc_dir, matches_txt_path, img_format=".JPG"):
+    """
+    features_path: superpoint_features.npz
+    matches_path: superglue_matches.npz
+    npz_dir: 쌍별 npz 저장 폴더 (desc/)
+    colmap_desc_dir: COLMAP keypoint txt 저장 폴더 (colmap_desc/)
+    matches_txt_path: COLMAP matches.txt 저장 경로
+    img_format: 이미지 확장자 (대문자)
+    """
+    import numpy as np
+    import os
+    os.makedirs(npz_dir, exist_ok=True)
+    os.makedirs(colmap_desc_dir, exist_ok=True)
     features = np.load(features_path, allow_pickle=True)
     matches_data = np.load(matches_path, allow_pickle=True)
     keypoints = features['keypoints'].item()
     matches_dict = matches_data['matches'].item()
-    # 1. 각 이미지별 COLMAP keypoint 텍스트 파일 생성
+
+    # 1. 각 쌍별 npz 파일 생성
+    for (im1, im2), matches in matches_dict.items():
+        im1_base = os.path.splitext(im1)[0]
+        im2_base = os.path.splitext(im2)[0]
+        np.savez(
+            os.path.join(npz_dir, f"{im1_base}_{im2_base}.npz"),
+            keypoints0=keypoints[im1],
+            keypoints1=keypoints[im2],
+            matches=matches
+        )
+
+    # 2. 각 이미지별 COLMAP keypoint txt 생성
     for img_name, kps in keypoints.items():
-        img_name_clean = img_name.strip().lower()
-        desc_file = os.path.join(desc_dir, f"{img_name_clean}.txt")
-        with open(desc_file, 'w') as f:
+        img_base = os.path.splitext(img_name)[0]
+        with open(os.path.join(colmap_desc_dir, f"{img_base}{img_format}.txt"), 'w') as f:
             f.write(f"{kps.shape[0]} 128\n")
             for r in range(kps.shape[0]):
-                f.write(f"{kps[r,0]} {kps[r,1]} 1.0 0.0\n")
-    # 2. 쌍별 matches.txt 생성 (매칭 개수 min_matches_per_pair 미만 쌍은 제외)
+                f.write(f"{kps[r,0]} {kps[r,1]} 0.00 0.00\n")
+
+    # 3. 전체 쌍에 대해 matches.txt 생성
     with open(matches_txt_path, 'w') as f:
-        filtered = 0
         for (im1, im2), matches in matches_dict.items():
-            valid_matches = [(i, int(m)) for i, m in enumerate(matches) if m != -1]
-            if len(valid_matches) < min_matches_per_pair:
-                filtered += 1
-                continue
-            im1_clean = im1.strip().lower()
-            im2_clean = im2.strip().lower()
-            f.write(f"{im1_clean} {im2_clean}\n")
-            for i, m in valid_matches:
-                f.write(f"{i} {m}\n")
+            im1_base = os.path.splitext(im1)[0]
+            im2_base = os.path.splitext(im2)[0]
+            f.write(f"{im1_base}{img_format} {im2_base}{img_format}\n")
+            for i, m in enumerate(matches):
+                if m != -1:
+                    f.write(f"{i} {int(m)}\n")
             f.write("\n\n")
-    print(f"COLMAP keypoints saved to {desc_dir}, matches saved to {matches_txt_path} (filtered {filtered} pairs with <{min_matches_per_pair} matches)")
 
 def validate_data(features_path, matches_path, image_dir, desc_dir, num_visualize=3):
     print("\n[Validation] Checking data consistency and match quality...")
@@ -234,13 +253,13 @@ if __name__ == "__main__":
     min_matches_per_pair = 10  # 원하는 값으로 조정
     extract_superpoint_features("ImageInputs/images", "ImageInputs/superpoint_features.npz", config=superpoint_config)
     match_superglue("ImageInputs/superpoint_features.npz", "ImageInputs/images", "ImageInputs/superglue_matches.npz", superglue_config=superglue_config)
-    write_colmap_files(
-        "ImageInputs/superpoint_features.npz",
-        "ImageInputs/superglue_matches.npz",
-        "ImageInputs/colmap_desc",
-        "ImageInputs/superglue_matches.txt",
-        img_format='.jpg',
-        min_matches_per_pair=min_matches_per_pair
+    export_superglue2colmap_format(
+        features_path="ImageInputs/superpoint_features.npz",
+        matches_path="ImageInputs/superglue_matches.npz",
+        npz_dir="ImageInputs/desc",
+        colmap_desc_dir="ImageInputs/colmap_desc",
+        matches_txt_path="ImageInputs/superglue_matches.txt",
+        img_format=".JPG"
     )
     validate_data(
         "ImageInputs/superpoint_features.npz",
@@ -252,4 +271,4 @@ if __name__ == "__main__":
     run_colmap_feature_importer("ImageInputs/database.db", "ImageInputs/images", "ImageInputs/colmap_desc")
     run_colmap_matches_importer("ImageInputs/database.db", "ImageInputs/superglue_matches.txt")
     run_colmap_mapper("ImageInputs/database.db", "ImageInputs/images", "ImageInputs/sparse")
-    run_train_py() 
+    #run_train_py() 
