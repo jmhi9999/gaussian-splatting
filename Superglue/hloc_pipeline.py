@@ -389,7 +389,7 @@ class ImprovedHlocPipeline:
             return False
         
         features_name = feature_files[0].stem  # Remove .h5 extension
-        matches_name = f"{features_name}_matches-{self.config['matcher_conf']}_adaptive.h5"
+        matches_name = f"{features_name}_matches-{self.config['matcher_conf']}.h5"  # Simpler name
         
         print(f"  📄 Using feature file: {features_name}")
         print(f"  📄 Creating matches file: {matches_name}")
@@ -415,13 +415,23 @@ class ImprovedHlocPipeline:
             # 매칭 품질 검증
             matches_path = output_dir / matches_name
             if not matches_path.exists():
-                print(f"  ⚠️  Matches file not found: {matches_path}")
+                print(f"  ⚠️  Expected matches file not found: {matches_path}")
                 print(f"  📁 Checking output directory: {output_dir}")
                 if output_dir.exists():
                     print(f"  📂 Files in output directory:")
                     for file in output_dir.iterdir():
                         print(f"    - {file.name}")
-                return False
+                    
+                    # Look for actual HLoc matches files
+                    matches_files = list(output_dir.glob(f"{features_name}_matches-*.h5"))
+                    if matches_files:
+                        matches_path = matches_files[0]  # Use the first matches file found
+                        print(f"  ✅ Found matches file: {matches_path.name}")
+                    else:
+                        print(f"  ❌ No matches files found")
+                        return False
+                else:
+                    return False
             
             if not self.verifier.verify_matches(matches_path):
                 print("  ⚠️  Low quality matches detected")
@@ -451,7 +461,14 @@ class ImprovedHlocPipeline:
             return False
         
         features_name = feature_files[0].stem  # Remove .h5 extension
-        matches_name = f"{features_name}_matches-{self.config['matcher_conf']}_adaptive.h5"
+        
+        # Find the actual matches file
+        matches_files = list(output_dir.glob(f"{features_name}_matches-*.h5"))
+        if not matches_files:
+            print("  ❌ No matches files found for reconstruction")
+            return False
+        
+        matches_name = matches_files[0].name  # Use the actual matches file name
         
         print(f"  📄 Using feature file: {features_name}")
         print(f"  📄 Using matches file: {matches_name}")
@@ -520,7 +537,14 @@ class ImprovedHlocPipeline:
             return False
         
         features_name = feature_files[0].stem  # Remove .h5 extension
-        matches_name = f"{features_name}_matches-{self.config['matcher_conf']}_adaptive.h5"
+        
+        # Find the actual matches file
+        matches_files = list(output_dir.glob(f"{features_name}_matches-*.h5"))
+        if not matches_files:
+            print("    ❌ No matches files found for fallback reconstruction")
+            return False
+        
+        matches_name = matches_files[0].name  # Use the actual matches file name
         
         print(f"    📄 Using feature file: {features_name}")
         print(f"    📄 Using matches file: {matches_name}")
