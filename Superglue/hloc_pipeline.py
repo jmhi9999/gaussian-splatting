@@ -66,12 +66,13 @@ except ImportError as e:
             self.is_test = is_test
     
     class SceneInfo:
-        def __init__(self, point_cloud, train_cameras, test_cameras, nerf_normalization, ply_path):
+        def __init__(self, point_cloud, train_cameras, test_cameras, nerf_normalization, ply_path, is_nerf_synthetic=False):
             self.point_cloud = point_cloud
             self.train_cameras = train_cameras
             self.test_cameras = test_cameras
             self.nerf_normalization = nerf_normalization
             self.ply_path = ply_path
+            self.is_nerf_synthetic = is_nerf_synthetic
     
     # Fallback COLMAP loader functions
     def read_extrinsics_binary(path):
@@ -298,6 +299,19 @@ class ImprovedHlocPipeline:
         """최적화된 특징점 추출"""
         print("🔍 Extracting SuperPoint features...")
         
+        # HLoc 모듈 사용 가능 여부 확인
+        try:
+            import hloc
+            print(f"  ✅ HLoc version: {hloc.__version__ if hasattr(hloc, '__version__') else 'unknown'}")
+        except ImportError:
+            print("  ❌ HLoc not found. Please install HLoc:")
+            print("     pip install hloc")
+            print("     or")
+            print("     git clone https://github.com/cvg/Hierarchical-Localization.git")
+            print("     cd Hierarchical-Localization")
+            print("     pip install -e .")
+            return False
+        
         # 특징점 추출 명령어 구성 (HLoc의 올바른 파라미터 사용)
         extract_cmd = [
             sys.executable, '-m', 'hloc.extract_features',
@@ -307,14 +321,25 @@ class ImprovedHlocPipeline:
         ]
         
         try:
+            print(f"  🚀 Running: {' '.join(extract_cmd)}")
             result = subprocess.run(extract_cmd, capture_output=True, text=True, timeout=1200)
             
             if result.returncode != 0:
                 print(f"  ❌ Feature extraction failed: {result.stderr}")
+                print(f"  📄 Command output: {result.stdout}")
                 return False
             
             # 특징점 품질 검증
             features_path = output_dir / f"feats-{self.config['feature_conf']}.h5"
+            if not features_path.exists():
+                print(f"  ⚠️  Feature file not found: {features_path}")
+                print(f"  📁 Checking output directory: {output_dir}")
+                if output_dir.exists():
+                    print(f"  📂 Files in output directory:")
+                    for file in output_dir.iterdir():
+                        print(f"    - {file.name}")
+                return False
+            
             if not self.verifier.verify_features(features_path):
                 print("  ⚠️  Low quality features detected")
                 return False
@@ -577,7 +602,8 @@ class ImprovedHlocPipeline:
                 train_cameras=train_cameras,
                 test_cameras=test_cameras,
                 nerf_normalization={"translate": np.mean(xyz, axis=0), "radius": 1.0},
-                ply_path=""
+                ply_path="",
+                is_nerf_synthetic=False
             )
             
             print(f"  ✅ Created SceneInfo: {len(train_cameras)} train, {len(test_cameras)} test cameras")
@@ -669,7 +695,8 @@ class ImprovedHlocPipeline:
             train_cameras=train_cameras,
             test_cameras=test_cameras,
             nerf_normalization={"translate": np.array([0., 0., 0.]), "radius": 1.0},
-            ply_path=""
+            ply_path="",
+            is_nerf_synthetic=False
         )
         
         print(f"    ✅ Synthetic SceneInfo: {len(train_cameras)} train, {len(test_cameras)} test")
@@ -704,8 +731,16 @@ class ImprovedHlocPipeline:
             
             # 3. 특징점 추출
             print(f"\n[3/6] 특징점 추출...")
-            if not self.extract_features_optimized(image_dir, output_dir):
-                raise RuntimeError("Feature extraction failed")
+            feature_extraction_success = self.extract_features_optimized(image_dir, output_dir)
+            if not feature_extraction_success:
+                print("  ⚠️  Feature extraction failed, continuing with fallback...")
+                # Fallback: create synthetic scene directly
+                scene_info = self._create_synthetic_scene_info(image_paths, train_test_ratio=0.8)
+                if scene_info:
+                    print("  ✅ Created fallback synthetic scene")
+                    return scene_info
+                else:
+                    raise RuntimeError("Both feature extraction and fallback failed")
             
             # 4. 적응적 이미지 쌍 생성
             print(f"\n[4/6] 적응적 이미지 쌍 생성...")
@@ -910,7 +945,8 @@ def _create_fallback_scene_info(image_dir: Path):
             train_cameras=train_cameras,
             test_cameras=test_cameras,
             nerf_normalization={"translate": np.array([0., 0., 0.]), "radius": 1.0},
-            ply_path=""
+            ply_path="",
+            is_nerf_synthetic=False
         )
         
         print(f"✅ Fallback SceneInfo created: {len(train_cameras)} train, {len(test_cameras)} test")
