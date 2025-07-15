@@ -13,7 +13,6 @@ from PIL import Image
 import subprocess
 from typing import Optional, List, NamedTuple
 
-# scipy import 추가 (pycolmap 최신 버전 지원용)
 try:
     from scipy.spatial.transform import Rotation
     SCIPY_AVAILABLE = True
@@ -448,8 +447,8 @@ def colmap_to_scene_info(model, image_paths: List[Path]) -> SceneInfo:
     
     # 카메라가 처리되지 않았다면 기본 시나리오 생성
     if len(cam_infos) == 0:
-        print("⚠️  No cameras processed from COLMAP - creating fallback scenario")
-        return create_fallback_scene_info(image_paths)
+        print("⚠️  No cameras processed from COLMAP")
+        return False
     
     # 3D 포인트 클라우드
     if len(model.points3D) > 0:
@@ -500,101 +499,6 @@ def colmap_to_scene_info(model, image_paths: List[Path]) -> SceneInfo:
         is_nerf_synthetic=False
     )
 
-def create_fallback_scene_info(image_paths: List[Path]) -> SceneInfo:
-    """COLMAP 실패시 fallback SceneInfo 생성"""
-    print("🛠️  Creating fallback SceneInfo with circular camera arrangement...")
-    
-    cam_infos = []
-    for i, image_path in enumerate(image_paths):
-        try:
-            # 이미지 크기
-            with Image.open(image_path) as img:
-                width, height = img.size
-            
-            # 기본 카메라 매트릭스
-            fx = fy = max(width, height) * 0.8
-            FovX = focal2fov(fx, width)
-            FovY = focal2fov(fy, height)
-            
-            # 원형 배치
-            angle = 2 * np.pi * i / len(image_paths)
-            radius = 3.0
-            
-            # 카메라 위치
-            camera_pos = np.array([
-                radius * np.cos(angle),
-                radius * np.sin(angle),
-                0.0
-            ], dtype=np.float32)
-            
-            # 원점을 바라보는 방향
-            look_at = np.array([0.0, 0.0, 0.0], dtype=np.float32)
-            up = np.array([0.0, 0.0, 1.0], dtype=np.float32)
-            
-            # View 행렬 계산
-            forward = look_at - camera_pos
-            forward = forward / (np.linalg.norm(forward) + 1e-8)
-            
-            right = np.cross(forward, up)
-            right = right / (np.linalg.norm(right) + 1e-8)
-            
-            up = np.cross(right, forward)
-            up = up / (np.linalg.norm(up) + 1e-8)
-            
-            # 회전 행렬 (카메라 -> 월드)
-            R = np.column_stack([right, up, -forward]).T.astype(np.float32)
-            T = camera_pos.astype(np.float32)
-            
-            cam_info = CameraInfo(
-                uid=i,
-                R=R,
-                T=T,
-                FovY=float(FovY),
-                FovX=float(FovX),
-                image_path=str(image_path),
-                image_name=image_path.name,
-                width=width,
-                height=height,
-                depth_params=None,
-                depth_path="",
-                is_test=(i % 8 == 0)
-            )
-            cam_infos.append(cam_info)
-            
-        except Exception as e:
-            print(f"⚠️  Failed to process fallback {image_path}: {e}")
-            continue
-    
-    if len(cam_infos) == 0:
-        raise RuntimeError("Failed to create any cameras in fallback mode")
-    
-    # 기본 포인트 클라우드
-    n_points = 10000
-    points = np.random.randn(n_points, 3).astype(np.float32) * 2
-    colors = np.random.rand(n_points, 3).astype(np.float32)
-    normals = np.random.randn(n_points, 3).astype(np.float32)
-    normals = normals / (np.linalg.norm(normals, axis=1, keepdims=True) + 1e-8)
-    
-    pcd = BasicPointCloud(points=points, colors=colors, normals=normals)
-    
-    train_cams = [c for c in cam_infos if not c.is_test]
-    test_cams = [c for c in cam_infos if c.is_test]
-    
-    # NeRF 정규화
-    center = np.zeros(3)
-    radius = 5.0
-    nerf_norm = {"translate": -center, "radius": radius}
-    
-    print(f"✅ Fallback SceneInfo: {len(train_cams)} train, {len(test_cams)} test cameras")
-    
-    return SceneInfo(
-        point_cloud=pcd,
-        train_cameras=train_cams,
-        test_cameras=test_cams,
-        nerf_normalization=nerf_norm,
-        ply_path="",
-        is_nerf_synthetic=False
-    )
 
 def readHlocSceneInfo(path: str, 
                      images: str = "images", 
@@ -650,16 +554,7 @@ def readHlocSceneInfo(path: str,
             traceback.print_exc()
     else:
         print("⚠️  pycolmap not available")
-    
-    # Fallback: 기본 시나리오 생성
-    print("🛠️  Using fallback scenario (circular camera arrangement)")
-    try:
-        scene_info = create_fallback_scene_info(image_paths)
-        print("✅ Fallback scenario created successfully!")
-        return scene_info
-    except Exception as e:
-        print(f"❌ Fallback scenario failed: {e}")
-        raise RuntimeError(f"All reconstruction methods failed: {e}")
+        return False
 
 if __name__ == "__main__":
     # 테스트
