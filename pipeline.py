@@ -94,15 +94,20 @@ def write_colmap_files(features_path, matches_path, desc_dir, matches_txt_path, 
     matches_dict = matches_data['matches'].item()
     # 1. 각 이미지별 COLMAP keypoint 텍스트 파일 생성
     for img_name, kps in keypoints.items():
-        desc_file = os.path.join(desc_dir, f"{img_name}.txt")
+        # 이미지 이름을 소문자 및 strip 처리 (DB와 일치 보장)
+        img_name_clean = img_name.strip().lower()
+        desc_file = os.path.join(desc_dir, f"{img_name_clean}.txt")
         with open(desc_file, 'w') as f:
             f.write(f"{kps.shape[0]} 128\n")
             for r in range(kps.shape[0]):
-                f.write(f"{kps[r,0]} {kps[r,1]} 0.00 0.00\n")
+                # scale=1.0, orientation=-1.0으로 저장
+                f.write(f"{kps[r,0]} {kps[r,1]} 1.0 -1.0\n")
     # 2. 쌍별 matches.txt 생성
     with open(matches_txt_path, 'w') as f:
         for (im1, im2), matches in matches_dict.items():
-            f.write(f"{im1} {im2}\n")
+            im1_clean = im1.strip().lower()
+            im2_clean = im2.strip().lower()
+            f.write(f"{im1_clean} {im2_clean}\n")
             for i, m in enumerate(matches):
                 if m != -1:
                     f.write(f"{i} {int(m)}\n")
