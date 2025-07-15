@@ -111,7 +111,7 @@ class GlobalDescriptorExtractor:
 
 class AdaptivePairSelector:
     """이미지 쌍 적응적 선택"""
-    def __init__(self, similarity_threshold=0.3, max_pairs_per_image=10):  # 20에서 10으로 줄임
+    def __init__(self, similarity_threshold=0.2, max_pairs_per_image=15):  # 더 관대하게
         self.similarity_threshold = similarity_threshold
         self.max_pairs_per_image = max_pairs_per_image
     
@@ -157,8 +157,19 @@ class AdaptivePairSelector:
             for i in range(n_images - 1):
                 pairs.append((i, i + 1))
         
+        # 추가: 인접한 이미지들도 쌍으로 추가 (더 나은 연결성)
+        print("  🔗 Adding adjacent pairs for better connectivity...")
+        for i in range(n_images - 2):
+            pairs.append((i, i + 2))  # 2칸 간격
+        
         # 중복 제거
         pairs = list(set(pairs))
+        
+        # 최대 쌍 수 제한 (너무 많으면 reconstruction이 느려짐)
+        max_total_pairs = min(len(pairs), n_images * 20)  # 이미지당 최대 20쌍
+        if len(pairs) > max_total_pairs:
+            print(f"  ⚠️  Limiting pairs from {len(pairs)} to {max_total_pairs}")
+            pairs = pairs[:max_total_pairs]
         
         print(f"  ✅ Selected {len(pairs)} pairs ({len(pairs)/(n_images*(n_images-1)/2)*100:.1f}% of all possible)")
         return pairs
@@ -656,9 +667,10 @@ class ImprovedHlocPipeline:
             
             print(f"  📷 Loaded {len(cameras)} cameras, {len(images)} images, {len(points3d)} 3D points")
             
-            # 데이터가 없으면 fallback 생성
-            if not cameras or not images:
-                print("  🆘 No COLMAP data - creating synthetic cameras...")
+            # 데이터가 없거나 너무 적으면 fallback 생성
+            if not cameras or not images or len(points3d) < 10:
+                print(f"  🆘 Insufficient COLMAP data - creating synthetic cameras...")
+                print(f"     (cameras: {len(cameras)}, images: {len(images)}, points: {len(points3d)})")
                 return self._create_synthetic_scene_info(image_paths, train_test_ratio)
             
             # Train/Test 분할
@@ -766,10 +778,10 @@ class ImprovedHlocPipeline:
                     
                 height, width = img.shape[:2]
                 
-                # 원형 배치 + 약간의 노이즈
+                # 간단한 원형 배치 + 약간의 노이즈
                 angle = 2 * np.pi * i / n_images
-                radius = 2.0 + np.random.normal(0, 0.2)
-                height_offset = np.random.normal(0, 0.3)
+                radius = 3.0 + np.random.normal(0, 0.3)  # 더 큰 반지름
+                height_offset = np.random.normal(0, 0.5)  # 더 큰 높이 변화
                 
                 camera_position = np.array([
                     radius * np.cos(angle),
@@ -810,10 +822,16 @@ class ImprovedHlocPipeline:
                 print(f"      ⚠️  Skipping {img_path}: {e}")
                 continue
         
-        # 기본 포인트 클라우드
-        n_points = 1000
-        xyz = np.random.randn(n_points, 3) * 0.5
-        rgb = np.random.rand(n_points, 3)
+        # 기본 포인트 클라우드 생성 (원점 주변 랜덤 포인트)
+        n_points = 2000  # 더 많은 포인트
+        # 다양한 형태의 포인트 생성
+        xyz = np.random.randn(n_points, 3) * 1.0  # 더 큰 범위
+        # 일부 포인트는 더 집중적으로 배치
+        center_points = np.random.randn(n_points // 2, 3) * 0.3
+        xyz[:n_points // 2] = center_points
+        
+        # 더 현실적인 색상 생성
+        rgb = np.random.rand(n_points, 3) * 0.8 + 0.2  # 0.2-1.0 범위
         
         point_cloud = BasicPointCloud(
             points=xyz,
@@ -1015,7 +1033,7 @@ def _create_fallback_scene_info(image_dir: Path):
         train_cameras = []
         test_cameras = []
         
-        # 간단한 원형 배치 카메라 생성
+        # 간단한 원형 배치 + 약간의 노이즈
         n_images = min(len(image_paths), 50)  # 최대 50장으로 제한
         for i, img_path in enumerate(image_paths[:n_images]):
             try:
@@ -1077,9 +1095,15 @@ def _create_fallback_scene_info(image_dir: Path):
             return None
         
         # 기본 포인트 클라우드 생성 (원점 주변 랜덤 포인트)
-        n_points = 1000
-        xyz = np.random.randn(n_points, 3) * 0.5
-        rgb = np.random.rand(n_points, 3)
+        n_points = 2000  # 더 많은 포인트
+        # 다양한 형태의 포인트 생성
+        xyz = np.random.randn(n_points, 3) * 1.0  # 더 큰 범위
+        # 일부 포인트는 더 집중적으로 배치
+        center_points = np.random.randn(n_points // 2, 3) * 0.3
+        xyz[:n_points // 2] = center_points
+        
+        # 더 현실적인 색상 생성
+        rgb = np.random.rand(n_points, 3) * 0.8 + 0.2  # 0.2-1.0 범위
         
         point_cloud = BasicPointCloud(
             points=xyz,
