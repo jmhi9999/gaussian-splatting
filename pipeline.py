@@ -100,8 +100,8 @@ def write_colmap_files(features_path, matches_path, desc_dir, matches_txt_path, 
         with open(desc_file, 'w') as f:
             f.write(f"{kps.shape[0]} 128\n")
             for r in range(kps.shape[0]):
-                # scale=1.0, orientation=-1.0으로 저장
-                f.write(f"{kps[r,0]} {kps[r,1]} 1.0 -1.0\n")
+                # scale=1.0, orientation=0.0으로 저장 (COLMAP SIFT txt 포맷)
+                f.write(f"{kps[r,0]} {kps[r,1]} 1.0 0.0\n")
     # 2. 쌍별 matches.txt 생성
     with open(matches_txt_path, 'w') as f:
         for (im1, im2), matches in matches_dict.items():
