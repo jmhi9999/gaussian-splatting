@@ -7,10 +7,12 @@ from SuperGluePretrainedNetwork.models.superpoint import SuperPoint
 from SuperGluePretrainedNetwork.models.superglue import SuperGlue
 
 def extract_superpoint_features(image_dir, output_path, config=None):
-    print("Step 1: SuperPoint feature extraction (direct)")
+    print("Step 1: SuperPoint feature extraction (direct, GPU 지원)")
+    import torch
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     if config is None:
         config = {}
-    model = SuperPoint(config)
+    model = SuperPoint(config).to(device)
     model.eval()
     all_keypoints = {}
     all_descriptors = {}
@@ -20,9 +22,9 @@ def extract_superpoint_features(image_dir, output_path, config=None):
         img_path = os.path.join(image_dir, img_name)
         img = Image.open(img_path).convert('L')
         img_tensor = torch.from_numpy(np.array(img)).float()[None, None] / 255.0
+        img_tensor = img_tensor.to(device)
         with torch.no_grad():
             result = model({'image': img_tensor})
-        # keypoints: (N, 2), descriptors: (256, N), scores: (N,)
         all_keypoints[img_name] = result['keypoints'][0].cpu().numpy()
         all_descriptors[img_name] = result['descriptors'][0].cpu().numpy()
         all_scores[img_name] = result['scores'][0].cpu().numpy()
@@ -41,10 +43,12 @@ def generate_image_pairs(image_list, partial_gap=10):
     return pairs
 
 def match_superglue(features_path, image_dir, output_path, superglue_config=None, partial_gap=10):
-    print("Step 2: SuperGlue feature matching (direct)")
+    print("Step 2: SuperGlue feature matching (direct, GPU 지원)")
+    import torch
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     if superglue_config is None:
         superglue_config = {}
-    model = SuperGlue(superglue_config)
+    model = SuperGlue(superglue_config).to(device)
     model.eval()
     data = np.load(features_path, allow_pickle=True)
     keypoints = data['keypoints'].item()
@@ -54,15 +58,15 @@ def match_superglue(features_path, image_dir, output_path, superglue_config=None
     pairs = generate_image_pairs(image_list, partial_gap=partial_gap)
     matches_dict = {}
     for img0, img1 in pairs:
-        kpts0 = torch.from_numpy(keypoints[img0])[None]
-        kpts1 = torch.from_numpy(keypoints[img1])[None]
-        desc0 = torch.from_numpy(descriptors[img0])[None]
-        desc1 = torch.from_numpy(descriptors[img1])[None]
-        scores0 = torch.from_numpy(scores[img0])[None]
-        scores1 = torch.from_numpy(scores[img1])[None]
+        kpts0 = torch.from_numpy(keypoints[img0])[None].to(device)
+        kpts1 = torch.from_numpy(keypoints[img1])[None].to(device)
+        desc0 = torch.from_numpy(descriptors[img0])[None].to(device)
+        desc1 = torch.from_numpy(descriptors[img1])[None].to(device)
+        scores0 = torch.from_numpy(scores[img0])[None].to(device)
+        scores1 = torch.from_numpy(scores[img1])[None].to(device)
         # 더미 이미지 텐서 (정규화용, 실제 매칭에는 영향 없음)
-        img0_tensor = torch.zeros((1, 1, 240, 320))
-        img1_tensor = torch.zeros((1, 1, 240, 320))
+        img0_tensor = torch.zeros((1, 1, 240, 320), device=device)
+        img1_tensor = torch.zeros((1, 1, 240, 320), device=device)
         with torch.no_grad():
             result = model({
                 'keypoints0': kpts0,
