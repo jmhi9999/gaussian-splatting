@@ -36,15 +36,14 @@ def extract_superpoint_features(image_dir, output_path, config=None):
     np.savez(output_path, keypoints=all_keypoints, descriptors=all_descriptors, scores=all_scores)
     print(f"SuperPoint features saved to {output_path}")
 
-def generate_image_pairs(image_list, partial_gap=5):
+def generate_image_pairs(image_list, max_skip=3):
     pairs = []
-    # Sequential pairs
-    for i in range(len(image_list) - 1):
-        pairs.append((image_list[i], image_list[i+1]))
-    # Partial exhaustive: every partial_gap-th image와 모든 이미지 쌍
-    for i in range(0, len(image_list), partial_gap):
-        for j in range(i+1, len(image_list)):
-            pairs.append((image_list[i], image_list[j]))
+    n = len(image_list)
+    for i in range(n):
+        for skip in range(1, max_skip+1):
+            j = i + skip
+            if j < n:
+                pairs.append((image_list[i], image_list[j]))
     return pairs
 
 def match_superglue(features_path, image_dir, output_path, superglue_config=None, partial_gap=5):
@@ -63,7 +62,7 @@ def match_superglue(features_path, image_dir, output_path, superglue_config=None
     descriptors = data['descriptors'].item()
     scores = data['scores'].item()
     image_list = sorted(keypoints.keys())
-    pairs = generate_image_pairs(image_list, partial_gap=partial_gap)
+    pairs = generate_image_pairs(image_list, max_skip=3)
     matches_dict = {}
     for img0, img1 in pairs:
         kpts0 = torch.from_numpy(keypoints[img0])[None].to(device)
