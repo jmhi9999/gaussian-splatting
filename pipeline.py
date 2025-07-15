@@ -91,18 +91,16 @@ def match_superglue(features_path, image_dir, output_path, superglue_config=None
     np.savez(output_path, matches=matches_dict)
     print(f"SuperGlue matches saved to {output_path}")
 
-def export_superglue2colmap_format(features_path, matches_path, npz_dir, colmap_desc_dir, matches_txt_path, image_dir):
+def export_superglue2colmap_format(features_path, matches_path, colmap_desc_dir, matches_txt_path, image_dir):
     """
     features_path: superpoint_features.npz
     matches_path: superglue_matches.npz
-    npz_dir: 쌍별 npz 저장 폴더 (desc/)
     colmap_desc_dir: COLMAP keypoint txt 저장 폴더 (colmap_desc/)
     matches_txt_path: COLMAP matches.txt 저장 경로
     image_dir: 실제 이미지가 있는 폴더 경로
     """
     import numpy as np
     import os
-    os.makedirs(npz_dir, exist_ok=True)
     os.makedirs(colmap_desc_dir, exist_ok=True)
     features = np.load(features_path, allow_pickle=True)
     matches_data = np.load(matches_path, allow_pickle=True)
@@ -112,18 +110,7 @@ def export_superglue2colmap_format(features_path, matches_path, npz_dir, colmap_
     # 실제 이미지 파일명 리스트 (정확한 대소문자, 확장자 포함)
     image_list = sorted([f for f in os.listdir(image_dir) if f.lower().endswith((".jpg", ".png", ".jpeg"))])
 
-    # 1. 각 쌍별 npz 파일 생성 (기존과 동일)
-    for (im1, im2), matches in matches_dict.items():
-        im1_base = os.path.splitext(im1)[0]
-        im2_base = os.path.splitext(im2)[0]
-        np.savez(
-            os.path.join(npz_dir, f"{im1_base}_{im2_base}.npz"),
-            keypoints0=keypoints[im1],
-            keypoints1=keypoints[im2],
-            matches=matches
-        )
-
-    # 2. 각 이미지별 COLMAP keypoint txt 생성 (실제 이미지명 기준)
+    # 1. 각 이미지별 COLMAP keypoint txt 생성 (실제 이미지명 기준)
     for img_name in image_list:
         kps = keypoints.get(img_name)
         if kps is None:
@@ -133,7 +120,7 @@ def export_superglue2colmap_format(features_path, matches_path, npz_dir, colmap_
             for r in range(kps.shape[0]):
                 f.write(f"{kps[r,0]} {kps[r,1]} 0.00 0.00\n")
 
-    # 3. 전체 쌍에 대해 matches.txt 생성 (쌍별로 실제 이미지명 사용)
+    # 2. 전체 쌍에 대해 matches.txt 생성 (쌍별로 실제 이미지명 사용)
     with open(matches_txt_path, 'w') as f:
         for (im1, im2), matches in matches_dict.items():
             f.write(f"{im1} {im2}\n")
@@ -261,7 +248,6 @@ if __name__ == "__main__":
     export_superglue2colmap_format(
         features_path="ImageInputs/superpoint_features.npz",
         matches_path="ImageInputs/superglue_matches.npz",
-        npz_dir="ImageInputs/desc",
         colmap_desc_dir="ImageInputs/colmap_desc",
         matches_txt_path="ImageInputs/superglue_matches.txt",
         image_dir="ImageInputs/images"
