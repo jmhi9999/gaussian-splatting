@@ -95,13 +95,14 @@ def match_superglue(features_path, image_dir, output_path, superglue_config=None
     np.savez(output_path, matches=matches_dict)
     print(f"SuperGlue matches saved to {output_path}")
 
-def export_superglue2colmap_format(features_path, matches_path, colmap_desc_dir, matches_txt_path, image_dir):
+def export_superglue2colmap_format(features_path, matches_path, colmap_desc_dir, matches_txt_path, image_dir, min_matches_per_pair=15):
     """
     features_path: superpoint_features.npz
     matches_path: superglue_matches.npz
     colmap_desc_dir: COLMAP keypoint txt 저장 폴더 (colmap_desc/)
     matches_txt_path: COLMAP matches.txt 저장 경로
     image_dir: 실제 이미지가 있는 폴더 경로
+    min_matches_per_pair: matches.txt에 기록할 최소 매칭 수
     """
     import numpy as np
     import os
@@ -128,8 +129,8 @@ def export_superglue2colmap_format(features_path, matches_path, colmap_desc_dir,
     with open(matches_txt_path, 'w') as f:
         for (im1, im2), matches in matches_dict.items():
             valid_matches = [(i, int(m)) for i, m in enumerate(matches) if m != -1]
-            if len(valid_matches) < 3:
-                continue  # 매칭 3개 미만 쌍은 기록하지 않음
+            if len(valid_matches) < min_matches_per_pair:
+                continue  # 매칭 min_matches_per_pair개 미만 쌍은 기록하지 않음
             f.write(f"{im1} {im2}\n")
             for i, m in valid_matches:
                 f.write(f"{i} {m}\n")
@@ -217,7 +218,9 @@ def run_colmap_mapper(database_path, image_path, output_path):
         "colmap", "mapper",
         "--database_path", database_path,
         "--image_path", image_path,
-        "--output_path", output_path
+        "--output_path", output_path,
+        "--Mapper.init_min_num_inliers", "8",
+        "--log_to_stderr", "1"
     ], check=True)
 
 def run_train_py():
@@ -253,7 +256,7 @@ if __name__ == "__main__":
         'max_keypoints': 4096
     }
     superglue_config = {'match_threshold': 0.05}
-    min_matches_per_pair = 10  # 원하는 값으로 조정
+    min_matches_per_pair = 15  # 원하는 값으로 조정
     extract_superpoint_features("ImageInputs/images", "ImageInputs/superpoint_features.npz", config=superpoint_config)
     match_superglue("ImageInputs/superpoint_features.npz", "ImageInputs/images", "ImageInputs/superglue_matches.npz", superglue_config=superglue_config)
     export_superglue2colmap_format(
@@ -261,7 +264,8 @@ if __name__ == "__main__":
         matches_path="ImageInputs/superglue_matches.npz",
         colmap_desc_dir="ImageInputs/colmap_desc",
         matches_txt_path="ImageInputs/superglue_matches.txt",
-        image_dir="ImageInputs/images"
+        image_dir="ImageInputs/images",
+        min_matches_per_pair=min_matches_per_pair
     )
     validate_data(
         "ImageInputs/superpoint_features.npz",
