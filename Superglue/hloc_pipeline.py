@@ -288,7 +288,7 @@ def run_hloc_reconstruction(image_dir: Path, output_dir: Path, max_images: int =
             sys.executable, '-m', 'hloc.extract_features',
             '--image_dir', str(image_dir),
             '--export_dir', str(output_dir),
-            '--conf', 'superpoint_aachen'
+            '--conf', 'superpoint_inloc'
         ]
         
         result = subprocess.run(extract_cmd, capture_output=True, text=True, timeout=600)

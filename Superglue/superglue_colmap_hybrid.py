@@ -13,7 +13,7 @@ import random
 
 class SuperGlueCOLMAPHybrid:
     def __init__(self, 
-                 superglue_config: str = "outdoor",
+                 superglue_config: str = "indoor",
                  colmap_exe: str = "colmap",
                  device: str = "cuda"):
         
@@ -25,20 +25,20 @@ class SuperGlueCOLMAPHybrid:
             'outdoor': {
                 'weights': 'outdoor',
                 'sinkhorn_iterations': 20,
-                'match_threshold': 0.2,  # 0.1 → 0.2 (더 엄격한 임계값)
+                'match_threshold': 0.2,
             },
             'indoor': {
                 'weights': 'indoor', 
                 'sinkhorn_iterations': 20,
-                'match_threshold': 0.2,  # 0.1 → 0.2 (더 엄격한 임계값)
+                'match_threshold': 0.1, 
             }
         }[superglue_config]
         
         # SuperPoint 설정 - 매우 관대한 설정 (더 많은 키포인트)
         self.superpoint_config = {
-            'nms_radius': 1,              # 2 → 1 (더 밀집된 특징점)
-            'keypoint_threshold': 0.0005,  # 0.001 → 0.0005 (더 많은 특징점)
-            'max_keypoints': 16384,       # 8192 → 16384 (훨씬 더 많은 특징점)
+            'nms_radius': 2,              # 2 → 1 (더 밀집된 특징점)
+            'keypoint_threshold': 0.001,  # 0.001 → 0.0005 (더 많은 특징점)
+            'max_keypoints': 8192,       # 8192 → 16384 (훨씬 더 많은 특징점)
             'remove_borders': 1           # 2 → 1 (경계에서 더 가까이)
         }
         
@@ -482,93 +482,6 @@ class SuperGlueCOLMAPHybrid:
             print(f"        ❌ SuperPoint 오류: {e}")
             return None, None
 
-    def _remove_duplicate_keypoints(self, keypoints, descriptors, scores, distance_threshold=8.0):
-        """중복 특징점 제거"""
-        if len(keypoints) == 0:
-            return keypoints, descriptors, scores
-        
-        # 거리 기반 중복 제거
-        from scipy.spatial.distance import pdist, squareform
-        
-        # 모든 쌍의 거리 계산
-        distances = squareform(pdist(keypoints))
-        
-        # 대각선을 무한대로 설정 (자기 자신과의 거리)
-        np.fill_diagonal(distances, np.inf)
-        
-        # 중복 제거할 인덱스 찾기
-        to_remove = set()
-        
-        for i in range(len(keypoints)):
-            if i in to_remove:
-                continue
-            
-            # i와 가까운 점들 찾기
-            close_indices = np.where(distances[i] < distance_threshold)[0]
-            
-            for j in close_indices:
-                if j > i and j not in to_remove:
-                    # 더 높은 점수를 가진 점을 유지
-                    if scores[i] >= scores[j]:
-                        to_remove.add(j)
-                    else:
-                        to_remove.add(i)
-                        break
-        
-        # 중복 제거
-        keep_indices = [i for i in range(len(keypoints)) if i not in to_remove]
-        
-        if len(keep_indices) == 0:
-            return np.array([]), np.array([]), np.array([])
-        
-        return (keypoints[keep_indices], 
-                descriptors[keep_indices], 
-                scores[keep_indices])
-
-    def _filter_quality_keypoints(self, keypoints, descriptors, scores, min_score=0.01, min_distance=16.0):
-        """품질이 낮은 특징점 필터링"""
-        if len(keypoints) == 0:
-            return keypoints, descriptors, scores
-        
-        # 점수 기반 필터링
-        score_mask = scores >= min_score
-        
-        # 거리 기반 필터링 (너무 가까운 점들 제거)
-        from scipy.spatial.distance import pdist, squareform
-        
-        if len(keypoints) > 1:
-            distances = squareform(pdist(keypoints))
-            np.fill_diagonal(distances, np.inf)
-            
-            # 너무 가까운 점들 제거
-            close_pairs = np.where(distances < min_distance)
-            if len(close_pairs[0]) > 0:
-                # 더 낮은 점수를 가진 점들을 제거
-                to_remove = set()
-                for i, j in zip(close_pairs[0], close_pairs[1]):
-                    if i < j:  # 중복 방지
-                        if scores[i] < scores[j]:
-                            to_remove.add(i)
-                        else:
-                            to_remove.add(j)
-                
-                # 거리 필터링 마스크
-                distance_mask = np.ones(len(keypoints), dtype=bool)
-                distance_mask[list(to_remove)] = False
-            else:
-                distance_mask = np.ones(len(keypoints), dtype=bool)
-        else:
-            distance_mask = np.ones(len(keypoints), dtype=bool)
-        
-        # 최종 마스크
-        final_mask = score_mask & distance_mask
-        
-        if not np.any(final_mask):
-            return np.array([]), np.array([]), np.array([])
-        
-        return (keypoints[final_mask], 
-                descriptors[final_mask], 
-                scores[final_mask])
 
     def _convert_descriptors_to_sift_format(self, descriptors):
         """SuperPoint descriptor를 COLMAP SIFT 형식으로 완전 변환 - 개선된 차원 축소"""
@@ -801,110 +714,6 @@ class SuperGlueCOLMAPHybrid:
             print(f"        ❌ SuperGlue 매칭 오류: {e}")
             return None
 
-    def _run_superpoint_only_matching(self, image_paths, database_path):
-        """SuperPoint만 사용한 매칭 - 하이브리드 쌍 선택"""
-        print("  🔥 SuperPoint-only 하이브리드 매칭 중...")
-        
-        try:
-            conn = sqlite3.connect(str(database_path))
-            cursor = conn.cursor()
-            
-            # 기존 matches 정리
-            cursor.execute("DELETE FROM matches")
-            cursor.execute("DELETE FROM two_view_geometries")
-            
-            # 이미지 ID 매핑 생성
-            image_id_map = {}
-            cursor.execute("SELECT image_id, name FROM images ORDER BY image_id")
-            for image_id, name in cursor.fetchall():
-                try:
-                    idx = int(name.split('_')[1].split('.')[0])
-                    image_id_map[idx] = image_id
-                except:
-                    continue
-            
-            # 하이브리드 쌍 생성
-            matching_pairs = self._generate_matching_pairs(image_paths)
-            print(f"    {len(image_paths)}장 이미지에서 {len(matching_pairs)}개 하이브리드 쌍 매칭 수행 (sequential+random+partial exhaustive)...")
-            
-            successful_matches = 0
-            total_pairs = 0
-            for i, j in matching_pairs:
-                total_pairs += 1
-                print(f"        🔍 SuperPoint-only 매칭: {image_paths[i].name} ↔ {image_paths[j].name}")
-                matches = self._match_single_pair_superpoint_only(image_paths[i], image_paths[j])
-                if matches is not None and len(matches) >= 10:
-                    if i in image_id_map and j in image_id_map:
-                        pair_id = image_id_map[i] * 2147483647 + image_id_map[j]
-                        cursor.execute(
-                            "INSERT INTO matches (pair_id, rows, cols, data) VALUES (?, ?, ?, ?)",
-                            (pair_id, len(matches), 2, matches.tobytes())
-                        )
-                        cursor.execute(
-                            "INSERT INTO two_view_geometries (pair_id, rows, cols, data, config) VALUES (?, ?, ?, ?, ?)",
-                            (pair_id, len(matches), 2, matches.tobytes(), 2)
-                        )
-                        print(f"        ✅ {len(matches)}개 매칭 저장")
-                        successful_matches += 1
-                    else:
-                        print(f"        ❌ 이미지 ID 매핑 실패")
-                else:
-                    print(f"        ❌ 매칭 실패 또는 부족")
-            
-            conn.commit()
-            conn.close()
-            
-            print(f"    📊 SuperPoint-only 매칭 결과: {successful_matches}/{total_pairs} 성공")
-            
-            if successful_matches == 0:
-                print("    ⚠️  SuperPoint-only 매칭 실패, COLMAP 매칭으로 fallback...")
-                self._run_colmap_matching_fast(database_path)
-                return True  # COLMAP 매칭은 성공으로 간주
-            else:
-                print("    ✅ SuperPoint-only 하이브리드 매칭 완료!")
-                return True
-                
-        except Exception as e:
-            print(f"    ❌ SuperPoint-only 매칭 오류: {e}")
-            print("    🔄 COLMAP 매칭으로 fallback...")
-            self._run_colmap_matching_fast(database_path)
-            return True  # COLMAP 매칭은 성공으로 간주
-
-    def _match_single_pair_superpoint_only(self, image_path1, image_path2):
-        """SuperPoint만 사용한 두 이미지 간 매칭"""
-        try:
-            print(f"        🔍 SuperPoint-only 매칭: {image_path1.name} ↔ {image_path2.name}")
-            
-            # 이미지 로드 및 전처리
-            img1 = self._load_and_preprocess_image(image_path1)
-            img2 = self._load_and_preprocess_image(image_path2)
-            
-            if img1 is None or img2 is None:
-                print(f"        ❌ 이미지 로드 실패")
-                return None
-            
-            # SuperPoint 특징점 추출
-            pred1 = self._extract_superpoint_features_for_matching(img1)
-            pred2 = self._extract_superpoint_features_for_matching(img2)
-            
-            if pred1 is None or pred2 is None:
-                print(f"        ❌ SuperPoint 특징점 추출 실패")
-                return None
-            
-            # SuperPoint descriptor 매칭
-            matches = self._fallback_descriptor_matching(pred1, pred2)
-            
-            if matches is not None and len(matches) > 0:
-                
-                return matches
-            else:
-                print(f"        ❌ SuperPoint-only 매칭 실패")
-                return None
-                
-        except Exception as e:
-            print(f"        ❌ SuperPoint-only 매칭 오류: {e}")
-            return None
-
     def _generate_matching_pairs(self, image_paths, seq_window=3, random_per_image=3, exhaustive_percent=0.05, seed=42):
         import random
         random.seed(seed)
@@ -1046,14 +855,6 @@ class SuperGlueCOLMAPHybrid:
             print(f"\n❌ 파이프라인 실패: {e}")
             import traceback
             traceback.print_exc()
-            print("🔄 기본 SceneInfo 생성 시도...")
-            try:
-                fallback_scene = self._create_default_scene_info(image_paths, output_path)
-                if fallback_scene is not None:
-                    print("✅ 기본 SceneInfo 생성 성공 (fallback)")
-                    return fallback_scene
-            except Exception as fallback_error:
-                print(f"❌ 기본 SceneInfo 생성도 실패: {fallback_error}")
             return None
 
     def _run_colmap_matching_fast(self, database_path):
@@ -1080,7 +881,6 @@ class SuperGlueCOLMAPHybrid:
             print(f"  ✗ COLMAP exhaustive 매칭 오류: {e}")
 
     def _run_colmap_mapper_fast(self, database_path, image_path, output_path):
-        """Ultra-permissive COLMAP 매퍼 (최대 포인트 클라우드)"""
         print("  ⚡ Ultra-permissive COLMAP 매퍼 (최대 포인트 클라우드)...")
         base_cmd = [
             self.colmap_exe, "mapper",
@@ -1451,160 +1251,6 @@ class SuperGlueCOLMAPHybrid:
             print("    🔄 COLMAP 매칭으로 fallback...")
             self._run_colmap_matching_fast(database_path)
             return True
-
-    def _create_default_scene_info(self, image_paths, output_path):
-        """기본 SceneInfo 생성 - 개선된 버전"""
-        print("    🎯 기본 SceneInfo 생성 (개선된 버전)...")
-        
-        try:
-            from utils.graphics_utils import BasicPointCloud
-            from scene.dataset_readers import CameraInfo, SceneInfo
-            
-            # 첫 번째 이미지로 기본 파라미터 설정
-            sample_img = cv2.imread(str(image_paths[0]))
-            if sample_img is None:
-                height, width = 480, 640
-            else:
-                height, width = sample_img.shape[:2]
-            
-            # 카메라 정보 생성 - 더 많은 카메라 생성
-            train_cameras = []
-            test_cameras = []
-            
-            # 더 나은 카메라 배치 생성
-            n_images = len(image_paths)
-            
-            # 원형 배치 + 약간의 랜덤성 추가
-            for i in range(n_images):
-                # 이미지 실제 크기 확인
-                try:
-                    img = cv2.imread(str(image_paths[i]))
-                    if img is not None:
-                        h, w = img.shape[:2]
-                    else:
-                        h, w = height, width
-                except:
-                    h, w = height, width
-                
-                # 카메라 내부 파라미터
-                focal_length = max(w, h) * 1.2
-                fov_x = 2 * np.arctan(w / (2 * focal_length))
-                fov_y = 2 * np.arctan(h / (2 * focal_length))
-                
-                # 개선된 카메라 외부 파라미터 (더 나은 배치)
-                angle = 2 * np.pi * i / n_images
-                radius = 3.0 + 0.5 * np.sin(i * 0.7)  # 약간의 변형
-                height_offset = 0.5 * np.cos(i * 0.5)  # 높이 변화
-                
-                # 회전 행렬 (카메라가 중심을 바라보도록)
-                R = np.array([
-                    [np.cos(angle + np.pi/2), 0, np.sin(angle + np.pi/2)],
-                    [0, 1, 0],
-                    [-np.sin(angle + np.pi/2), 0, np.cos(angle + np.pi/2)]
-                ], dtype=np.float32)
-                
-                # 이동 벡터
-                T = np.array([
-                    radius * np.cos(angle),
-                    height_offset,
-                    radius * np.sin(angle)
-                ], dtype=np.float32)
-                
-                # ✅ CameraInfo 생성
-                cam_info = CameraInfo(
-                    uid=i,
-                    R=R,
-                    T=T,
-                    FovY=fov_y,
-                    FovX=fov_x,
-                    depth_params=None,
-                    image_path=str(image_paths[i]),
-                    image_name=image_paths[i].name,
-                    depth_path="",
-                    width=w,
-                    height=h,
-                    is_test=(i % 5 == 0)  # 5개마다 1개씩 테스트 (더 많은 테스트 카메라)
-                )
-                
-                if cam_info.is_test:
-                    test_cameras.append(cam_info)
-                else:
-                    train_cameras.append(cam_info)
-            
-            print(f"      생성된 카메라: train={len(train_cameras)}, test={len(test_cameras)}")
-            
-            # 개선된 포인트 클라우드 생성
-            n_points = 5000  # 더 많은 포인트
-            xyz = np.random.randn(n_points, 3).astype(np.float32) * 2.0  # 더 넓은 분포
-            rgb = np.random.rand(n_points, 3).astype(np.float32)
-            normals = np.random.randn(n_points, 3).astype(np.float32)
-            normals = normals / (np.linalg.norm(normals, axis=1, keepdims=True) + 1e-8)
-            
-            # 중앙에 더 밀집된 포인트 추가
-            center_points = np.random.randn(n_points//2, 3).astype(np.float32) * 0.5
-            center_rgb = np.random.rand(n_points//2, 3).astype(np.float32)
-            center_normals = np.random.randn(n_points//2, 3).astype(np.float32)
-            center_normals = center_normals / (np.linalg.norm(center_normals, axis=1, keepdims=True) + 1e-8)
-            
-            # 결합
-            xyz = np.vstack([xyz, center_points])
-            rgb = np.vstack([rgb, center_rgb])
-            normals = np.vstack([normals, center_normals])
-            
-            point_cloud = BasicPointCloud(
-                points=xyz,
-                colors=rgb,
-                normals=normals
-            )
-            
-            # NeRF 정규화 계산
-            cam_centers = []
-            for cam in train_cameras:
-                # 카메라 중심 = -R^T * T
-                cam_center = -np.dot(cam.R.T, cam.T)
-                cam_centers.append(cam_center)
-            
-            if cam_centers:
-                cam_centers = np.array(cam_centers)
-                center = np.mean(cam_centers, axis=0)
-                distances = np.linalg.norm(cam_centers - center, axis=1)
-                radius = np.max(distances) * 1.2  # 약간 더 큰 반지름
-            else:
-                center = np.zeros(3)
-                radius = 5.0
-            
-            nerf_normalization = {
-                "translate": -center,
-                "radius": radius
-            }
-            
-            # PLY 파일 저장
-            ply_path = output_path / "points3D.ply"
-            self._save_basic_ply(ply_path, xyz, rgb)
-            
-            # SceneInfo 생성
-            scene_info = SceneInfo(
-                point_cloud=point_cloud,
-                train_cameras=train_cameras,
-                test_cameras=test_cameras,
-                nerf_normalization=nerf_normalization,
-                ply_path=str(ply_path),
-                is_nerf_synthetic=False
-            )
-            
-            print(f"      ✅ 개선된 SceneInfo 생성 완료!")
-            print(f"         Train cameras: {len(train_cameras)}")
-            print(f"         Test cameras: {len(test_cameras)}")
-            print(f"         Point cloud: {len(xyz)} points")
-            print(f"         Scene radius: {radius:.3f}")
-            
-            return scene_info
-            
-        except Exception as e:
-            print(f"      ❌ 기본 SceneInfo 생성 실패: {e}")
-            import traceback
-            traceback.print_exc()
-            return None
     
     def _save_basic_ply(self, ply_path, xyz, rgb):
         """기본 PLY 파일 저장"""
@@ -1637,7 +1283,6 @@ class SuperGlueCOLMAPHybrid:
             print(f"      PLY 저장 실패: {e}")
 
     def _run_colmap_mapper_ultra_permissive(self, database_path, image_path, output_path):
-        """Ultra-permissive COLMAP 매퍼 (최대 포인트 클라우드) - 중복 정의 방지 위해 fast와 동일하게 유지"""
         return self._run_colmap_mapper_fast(database_path, image_path, output_path)
 
     def _convert_to_3dgs_format(self, output_path, all_paths, train_indices, test_indices):
