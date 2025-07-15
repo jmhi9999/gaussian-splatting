@@ -5,6 +5,8 @@ import numpy as np
 from PIL import Image
 from SuperGluePretrainedNetwork.models.superpoint import SuperPoint
 from SuperGluePretrainedNetwork.models.superglue import SuperGlue
+import random
+import matplotlib.pyplot as plt
 
 def extract_superpoint_features(image_dir, output_path, config=None):
     print("Step 1: SuperPoint feature extraction (direct, GPU 지원)")
@@ -114,6 +116,78 @@ def write_colmap_files(features_path, matches_path, desc_dir, matches_txt_path, 
             f.write("\n\n")
     print(f"COLMAP keypoints saved to {desc_dir}, matches saved to {matches_txt_path}")
 
+def validate_data(features_path, matches_path, image_dir, desc_dir, num_visualize=3):
+    print("\n[Validation] Checking data consistency and match quality...")
+    features = np.load(features_path, allow_pickle=True)
+    matches_data = np.load(matches_path, allow_pickle=True)
+    keypoints = features['keypoints'].item()
+    descriptors = features['descriptors'].item()
+    scores = features['scores'].item()
+    matches_dict = matches_data['matches'].item()
+    image_list = sorted([f for f in os.listdir(image_dir) if f.lower().endswith((".jpg", ".png", ".jpeg"))])
+    image_list_clean = [img.strip().lower() for img in image_list]
+    keypoints_imgs = set([k.strip().lower() for k in keypoints.keys()])
+    desc_imgs = set([os.path.splitext(f)[0] for f in os.listdir(desc_dir) if f.endswith('.txt')])
+    matches_imgs = set()
+    for k in matches_dict.keys():
+        matches_imgs.add(k[0].strip().lower())
+        matches_imgs.add(k[1].strip().lower())
+    # 1. 이미지 이름 일치 체크
+    print(f"- Images in folder: {len(image_list_clean)}")
+    print(f"- Images in keypoints: {len(keypoints_imgs)}")
+    print(f"- Images in desc_dir: {len(desc_imgs)}")
+    print(f"- Images in matches: {len(matches_imgs)}")
+    missing_in_kp = set(image_list_clean) - keypoints_imgs
+    missing_in_desc = set(image_list_clean) - desc_imgs
+    missing_in_matches = set(image_list_clean) - matches_imgs
+    if missing_in_kp:
+        print(f"[WARNING] Images missing in keypoints: {missing_in_kp}")
+    if missing_in_desc:
+        print(f"[WARNING] Images missing in desc_dir: {missing_in_desc}")
+    if missing_in_matches:
+        print(f"[WARNING] Images missing in matches: {missing_in_matches}")
+    # 2. keypoint/matches 개수
+    print(f"- Total keypoints files: {len(keypoints)}")
+    print(f"- Total matches pairs: {len(matches_dict)}")
+    # 3. 매칭 통계
+    match_counts = [np.sum(np.array(m) != -1) for m in matches_dict.values()]
+    if match_counts:
+        print(f"- Match count per pair: min={np.min(match_counts)}, max={np.max(match_counts)}, mean={np.mean(match_counts):.1f}")
+    else:
+        print("[WARNING] No matches found!")
+    # 4. 랜덤 매칭 시각화
+    if num_visualize > 0 and len(matches_dict) > 0:
+        pairs = list(matches_dict.keys())
+        for i in range(min(num_visualize, len(pairs))):
+            pair = random.choice(pairs)
+            img0, img1 = pair
+            img0_clean = img0.strip().lower()
+            img1_clean = img1.strip().lower()
+            img0_path = os.path.join(image_dir, img0)
+            img1_path = os.path.join(image_dir, img1)
+            if not (os.path.exists(img0_path) and os.path.exists(img1_path)):
+                continue
+            kpts0 = keypoints[img0]
+            kpts1 = keypoints[img1]
+            matches = matches_dict[pair]
+            img0_pil = Image.open(img0_path).convert('RGB')
+            img1_pil = Image.open(img1_path).convert('RGB')
+            # Draw matches
+            fig, ax = plt.subplots(1,2,figsize=(10,5))
+            ax[0].imshow(img0_pil)
+            ax[0].scatter(kpts0[:,0], kpts0[:,1], s=2, c='r')
+            ax[0].set_title(img0)
+            ax[1].imshow(img1_pil)
+            ax[1].scatter(kpts1[:,0], kpts1[:,1], s=2, c='b')
+            ax[1].set_title(img1)
+            plt.suptitle(f"Sample match: {img0} <-> {img1} (matches: {np.sum(np.array(matches)!=-1)})")
+            plt.tight_layout()
+            out_path = f"validation_match_{i}_{img0_clean}_{img1_clean}.png"
+            plt.savefig(out_path)
+            plt.close()
+            print(f"  - Saved match visualization: {out_path}")
+    print("[Validation] Done.\n")
+
 def run_colmap_mapper(database_path, image_path, output_path):
     print("Step 4: COLMAP sparse reconstruction (mapper)")
     os.makedirs(output_path, exist_ok=True)
@@ -157,6 +231,14 @@ if __name__ == "__main__":
         "ImageInputs/colmap_desc",
         "ImageInputs/superglue_matches.txt",
         img_format='.jpg'
+    )
+    # 데이터 유효성 검증
+    validate_data(
+        "ImageInputs/superpoint_features.npz",
+        "ImageInputs/superglue_matches.npz",
+        "ImageInputs/images",
+        "ImageInputs/colmap_desc",
+        num_visualize=3
     )
     run_colmap_feature_importer("ImageInputs/database.db", "ImageInputs/images", "ImageInputs/colmap_desc")
     run_colmap_matches_importer("ImageInputs/database.db", "ImageInputs/superglue_matches.txt")
