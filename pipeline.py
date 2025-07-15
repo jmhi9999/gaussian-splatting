@@ -7,6 +7,8 @@ from SuperGluePretrainedNetwork.models.superpoint import SuperPoint
 from SuperGluePretrainedNetwork.models.superglue import SuperGlue
 import random
 import matplotlib.pyplot as plt
+from matplotlib.patches import ConnectionPatch
+
 
 def extract_superpoint_features(image_dir, output_path, config=None):
     print("Step 1: SuperPoint feature extraction (direct, GPU 지원)")
@@ -89,14 +91,14 @@ def match_superglue(features_path, image_dir, output_path, superglue_config=None
     np.savez(output_path, matches=matches_dict)
     print(f"SuperGlue matches saved to {output_path}")
 
-def export_superglue2colmap_format(features_path, matches_path, npz_dir, colmap_desc_dir, matches_txt_path, img_format=".JPG"):
+def export_superglue2colmap_format(features_path, matches_path, npz_dir, colmap_desc_dir, matches_txt_path, image_dir):
     """
     features_path: superpoint_features.npz
     matches_path: superglue_matches.npz
     npz_dir: 쌍별 npz 저장 폴더 (desc/)
     colmap_desc_dir: COLMAP keypoint txt 저장 폴더 (colmap_desc/)
     matches_txt_path: COLMAP matches.txt 저장 경로
-    img_format: 이미지 확장자 (대문자)
+    image_dir: 실제 이미지가 있는 폴더 경로
     """
     import numpy as np
     import os
@@ -107,7 +109,10 @@ def export_superglue2colmap_format(features_path, matches_path, npz_dir, colmap_
     keypoints = features['keypoints'].item()
     matches_dict = matches_data['matches'].item()
 
-    # 1. 각 쌍별 npz 파일 생성
+    # 실제 이미지 파일명 리스트 (정확한 대소문자, 확장자 포함)
+    image_list = sorted([f for f in os.listdir(image_dir) if f.lower().endswith((".jpg", ".png", ".jpeg"))])
+
+    # 1. 각 쌍별 npz 파일 생성 (기존과 동일)
     for (im1, im2), matches in matches_dict.items():
         im1_base = os.path.splitext(im1)[0]
         im2_base = os.path.splitext(im2)[0]
@@ -118,20 +123,20 @@ def export_superglue2colmap_format(features_path, matches_path, npz_dir, colmap_
             matches=matches
         )
 
-    # 2. 각 이미지별 COLMAP keypoint txt 생성
-    for img_name, kps in keypoints.items():
-        img_base = os.path.splitext(img_name)[0]
-        with open(os.path.join(colmap_desc_dir, f"{img_base}{img_format}.txt"), 'w') as f:
+    # 2. 각 이미지별 COLMAP keypoint txt 생성 (실제 이미지명 기준)
+    for img_name in image_list:
+        kps = keypoints.get(img_name)
+        if kps is None:
+            continue
+        with open(os.path.join(colmap_desc_dir, f"{img_name}.txt"), 'w') as f:
             f.write(f"{kps.shape[0]} 128\n")
             for r in range(kps.shape[0]):
                 f.write(f"{kps[r,0]} {kps[r,1]} 0.00 0.00\n")
 
-    # 3. 전체 쌍에 대해 matches.txt 생성
+    # 3. 전체 쌍에 대해 matches.txt 생성 (쌍별로 실제 이미지명 사용)
     with open(matches_txt_path, 'w') as f:
         for (im1, im2), matches in matches_dict.items():
-            im1_base = os.path.splitext(im1)[0]
-            im2_base = os.path.splitext(im2)[0]
-            f.write(f"{im1_base}{img_format} {im2_base}{img_format}\n")
+            f.write(f"{im1} {im2}\n")
             for i, m in enumerate(matches):
                 if m != -1:
                     f.write(f"{i} {int(m)}\n")
@@ -201,8 +206,8 @@ def validate_data(features_path, matches_path, image_dir, desc_dir, num_visualiz
             for idx0, idx1 in [(i, int(m)) for i, m in enumerate(matches) if m != -1]:
                 x0, y0 = kpts0[idx0]
                 x1, y1 = kpts1[idx1]
-                con = plt.ConnectionPatch(xyA=(x1, y1), xyB=(x0, y0), coordsA="data", coordsB="data",
-                                         axesA=axes[1], axesB=axes[0], color="lime", linewidth=1, alpha=0.7)
+                con = ConnectionPatch(xyA=(x1, y1), xyB=(x0, y0), coordsA="data", coordsB="data",
+                                     axesA=axes[1], axesB=axes[0], color="lime", linewidth=1, alpha=0.7)
                 axes[1].add_artist(con)
             plt.suptitle(f"Sample match: {img0} <-> {img1} (matches: {np.sum(np.array(matches)!=-1)})")
             plt.tight_layout()
@@ -259,7 +264,7 @@ if __name__ == "__main__":
         npz_dir="ImageInputs/desc",
         colmap_desc_dir="ImageInputs/colmap_desc",
         matches_txt_path="ImageInputs/superglue_matches.txt",
-        img_format=".JPG"
+        image_dir="ImageInputs/images"
     )
     validate_data(
         "ImageInputs/superpoint_features.npz",
