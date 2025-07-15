@@ -111,7 +111,7 @@ class GlobalDescriptorExtractor:
 
 class AdaptivePairSelector:
     """이미지 쌍 적응적 선택"""
-    def __init__(self, similarity_threshold=0.3, max_pairs_per_image=20):
+    def __init__(self, similarity_threshold=0.3, max_pairs_per_image=10):  # 20에서 10으로 줄임
         self.similarity_threshold = similarity_threshold
         self.max_pairs_per_image = max_pairs_per_image
     
@@ -220,13 +220,31 @@ class QualityVerifier:
     def verify_reconstruction(sfm_dir: Path) -> bool:
         """SfM reconstruction 품질 검증"""
         try:
-            model_dir = sfm_dir / "0"
+            print(f"  🔍 Checking reconstruction in: {sfm_dir}")
             
-            print(f"  🔍 Checking reconstruction in: {model_dir}")
+            # 여러 가능한 모델 디렉토리 확인 (HLoc 구조에 맞게)
+            possible_model_dirs = [
+                sfm_dir / "models" / "1",  # 가장 좋은 결과
+                sfm_dir / "models" / "0",  # 첫 번째 시도
+                sfm_dir / "models" / "2",  # 추가 시도
+                sfm_dir,  # 직접 sfm_dir에 있을 수도 있음
+            ]
             
-            # 디렉토리 존재 확인
-            if not model_dir.exists():
-                print(f"  ❌ Model directory does not exist: {model_dir}")
+            model_dir = None
+            for possible_dir in possible_model_dirs:
+                if possible_dir.exists():
+                    model_dir = possible_dir
+                    print(f"  ✅ Found model directory: {model_dir}")
+                    break
+            
+            if model_dir is None:
+                print(f"  ❌ No model directory found in: {sfm_dir}")
+                print(f"  📂 Contents of sfm_dir:")
+                if sfm_dir.exists():
+                    for item in sfm_dir.iterdir():
+                        print(f"    - {item.name} ({'dir' if item.is_dir() else 'file'})")
+                else:
+                    print(f"    - sfm_dir does not exist")
                 return False
             
             # 필수 파일 존재 확인
@@ -497,9 +515,7 @@ class ImprovedHlocPipeline:
             '--pairs', str(pairs_path),
             '--features', str(output_dir / f'{features_name}.h5'),
             '--matches', str(output_dir / matches_name),
-            '--camera_mode', 'SINGLE',
-            '--min_num_matches', '5',  # 더 관대하게
-            '--min_num_inliers', '5'   # 더 관대하게
+            '--camera_mode', 'SINGLE'
         ]
         
         try:
@@ -579,9 +595,7 @@ class ImprovedHlocPipeline:
             '--pairs', str(fallback_pairs_path),
             '--features', str(output_dir / f'{features_name}.h5'),
             '--matches', str(output_dir / matches_name),
-            '--camera_mode', 'SINGLE',
-            '--min_num_matches', '3',  # 매우 관대하게
-            '--min_num_inliers', '3'   # 매우 관대하게
+            '--camera_mode', 'SINGLE'
         ]
         
         try:
@@ -610,7 +624,25 @@ class ImprovedHlocPipeline:
         print("🔄 Converting to 3DGS format...")
         
         try:
-            model_dir = sfm_dir / "0"
+            # 여러 가능한 모델 디렉토리 확인 (HLoc 구조에 맞게)
+            possible_model_dirs = [
+                sfm_dir / "models" / "1",  # 가장 좋은 결과
+                sfm_dir / "models" / "0",  # 첫 번째 시도
+                sfm_dir / "models" / "2",  # 추가 시도
+                sfm_dir,  # 직접 sfm_dir에 있을 수도 있음
+            ]
+            
+            model_dir = None
+            for possible_dir in possible_model_dirs:
+                if possible_dir.exists():
+                    model_dir = possible_dir
+                    print(f"  ✅ Found model directory: {model_dir}")
+                    break
+            
+            if model_dir is None:
+                print(f"  ❌ No model directory found in: {sfm_dir}")
+                print("  🆘 Creating synthetic scene...")
+                return self._create_synthetic_scene_info(image_paths, train_test_ratio)
             
             # COLMAP 데이터 로드 (안전한 방식)
             try:
