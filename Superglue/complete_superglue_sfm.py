@@ -18,6 +18,7 @@ import gc
 # import psutil  # 제거 - 의존성 문제 해결
 from scipy.spatial.distance import cdist
 import concurrent.futures
+import networkx as nx
 
 # SuperGlue 관련 imports
 from models.matching import Matching
