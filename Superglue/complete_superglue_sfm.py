@@ -21,13 +21,18 @@ import concurrent.futures
 import networkx as nx
 
 # CLIP 관련 imports (선택적)
+CLIP_AVAILABLE = False
 try:
     import clip
     from PIL import Image as PILImage
+    # CLIP 모델 로드 테스트 (선택적)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model, preprocess = clip.load("ViT-B/32", device=device)
     CLIP_AVAILABLE = True
-except ImportError:
+    print("✓ CLIP available and tested")
+except (ImportError, Exception) as e:
     CLIP_AVAILABLE = False
-    print("⚠️  CLIP not available. AdaptiveMatcher will use fallback descriptors.")
+    print(f"⚠️  CLIP not available: {e}. AdaptiveMatcher will use fallback descriptors.")
 
 # SuperGlue 관련 imports
 from models.matching import Matching
@@ -854,6 +859,7 @@ class AdaptiveMatcher:
         self.clip_available = CLIP_AVAILABLE
         if self.clip_available:
             try:
+                # 전역에서 이미 로드된 모델 사용
                 self.model, self.preprocess = clip.load("ViT-B/32", device=self.device)
                 print("✓ CLIP model loaded for adaptive matching")
             except Exception as e:
@@ -874,6 +880,10 @@ class AdaptiveMatcher:
     def _compute_clip_descriptors(self, image_paths):
         """CLIP을 사용한 전역 descriptor 계산"""
         global_descs = {}
+        
+        if not self.clip_available:
+            print("    CLIP not available, falling back to image statistics")
+            return self._compute_fallback_descriptors(image_paths)
         
         for i, path in enumerate(image_paths):
             try:
