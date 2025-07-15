@@ -25,12 +25,12 @@ class SuperGlueCOLMAPHybrid:
             'outdoor': {
                 'weights': 'outdoor',
                 'sinkhorn_iterations': 20,
-                'match_threshold': 0.2,
+                'match_threshold': 0.05,  # 완화
             },
             'indoor': {
                 'weights': 'indoor', 
                 'sinkhorn_iterations': 20,
-                'match_threshold': 0.1, 
+                'match_threshold': 0.05,  # 완화
             }
         }[superglue_config]
         
@@ -714,7 +714,7 @@ class SuperGlueCOLMAPHybrid:
             print(f"        ❌ SuperGlue 매칭 오류: {e}")
             return None
 
-    def _generate_matching_pairs(self, image_paths, seq_window=3, random_per_image=3, exhaustive_percent=0.05, seed=42):
+    def _generate_matching_pairs(self, image_paths, seq_window=3, random_per_image=3, exhaustive_percent=0.2, seed=42):
         import random
         random.seed(seed)
         n = len(image_paths)
@@ -1196,8 +1196,9 @@ class SuperGlueCOLMAPHybrid:
             cursor.execute("DELETE FROM two_view_geometries")
             successful_matches = 0
             total_pairs = 0
-            matching_pairs = self._generate_matching_pairs(train_paths)
-            print(f"    {len(train_paths)}장 train 이미지에서 {len(matching_pairs)}개 쌍 매칭 수행 (sequential+random+partial exhaustive)...")
+            # 전체(all_paths)에서 쌍 생성, exhaustive_percent 증가
+            matching_pairs = self._generate_matching_pairs(all_paths, seq_window=5, random_per_image=10, exhaustive_percent=0.2)
+            print(f"    {len(all_paths)}장 전체 이미지에서 {len(matching_pairs)}개 쌍 매칭 수행 (sequential+random+partial exhaustive)...")
             # 이미지 ID 매핑 생성 (all_paths 기준)
             image_id_map = {}
             cursor.execute("SELECT image_id, name FROM images ORDER BY image_id")
@@ -1208,15 +1209,15 @@ class SuperGlueCOLMAPHybrid:
                         image_id_map[idx] = image_id
                 except:
                     continue
-            # train set 내 쌍만 매칭
+            # 전체 쌍 매칭
             for i, j in matching_pairs:
                 total_pairs += 1
                 print(f"      매칭 {i}-{j}...")
-                matches = self._match_single_pair(train_paths[i], train_paths[j])
+                matches = self._match_single_pair(all_paths[i], all_paths[j])
                 if matches is not None and len(matches) >= 10:
-                    if i < len(train_paths) and j < len(train_paths):
-                        idx_i = all_paths.index(train_paths[i])
-                        idx_j = all_paths.index(train_paths[j])
+                    if i < len(all_paths) and j < len(all_paths):
+                        idx_i = i
+                        idx_j = j
                         if idx_i in image_id_map and idx_j in image_id_map:
                             pair_id = image_id_map[idx_i] * 2147483647 + image_id_map[idx_j]
                             cursor.execute(
@@ -1234,7 +1235,9 @@ class SuperGlueCOLMAPHybrid:
                     else:
                         print(f"        ❌ 인덱스 범위 오류")
                 else:
-                    print(f"        ❌ 매칭 실패 또는 부족")
+                    print(f"        ❌ 매칭 실패 또는 부족, COLMAP matcher fallback...")
+                    # COLMAP matcher fallback 바로 실행
+                    self._run_colmap_matching_fast(database_path)
             conn.commit()
             conn.close()
             print(f"    📊 매칭 결과: {successful_matches}/{total_pairs} 성공")
