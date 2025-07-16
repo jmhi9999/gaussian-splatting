@@ -36,16 +36,16 @@ def extract_superpoint_features(image_dir, output_path, config=None):
     np.savez(output_path, keypoints=all_keypoints, descriptors=all_descriptors, scores=all_scores)
     print(f"SuperPoint features saved to {output_path}")
 
-def generate_image_pairs(image_list, max_skip=8, random_pairs=2000):
+def generate_image_pairs(image_list, max_skip=5, random_pairs=1000):  # max_skip: 8 -> 5, random_pairs: 2000 -> 1000
     pairs = []
     n = len(image_list)
-    # Sequential + skip
+    # Sequential + skip (더 가까운 쌍 위주)
     for i in range(n):
         for skip in range(1, max_skip+1):
             j = i + skip
             if j < n:
                 pairs.append((image_list[i], image_list[j]))
-    # 랜덤 일부 쌍 추가 (long-range)
+    # 랜덤 일부 쌍 추가 (long-range, 더 적게)
     all_possible = [(image_list[i], image_list[j]) for i in range(n) for j in range(i+max_skip+1, n)]
     if len(all_possible) > 0 and random_pairs > 0:
         pairs += random.sample(all_possible, min(random_pairs, len(all_possible)))
@@ -219,7 +219,10 @@ def run_colmap_mapper(database_path, image_path, output_path):
         "--database_path", database_path,
         "--image_path", image_path,
         "--output_path", output_path,
-        "--Mapper.init_min_num_inliers", "8",
+        "--Mapper.init_min_num_inliers", "5",  # 8 -> 5
+        "--Mapper.init_min_track_length", "3",  # 추가
+        "--Mapper.init_max_error", "4.0",  # 추가: 더 관대한 에러 임계값
+        "--Mapper.init_min_tri_angle", "1.5",  # 추가: 더 낮은 삼각측량 각도
         "--log_to_stderr", "1"
     ], check=True)
 
@@ -245,18 +248,25 @@ def run_colmap_matches_importer(database_path, matches_path):
         "--database_path", database_path,
         "--match_list_path", matches_path,
         "--match_type", "raw",
-        "--SiftMatching.guided_matching", "1"
+        "--SiftMatching.guided_matching", "1",
+        "--SiftMatching.max_ratio", "0.8",
+        "--SiftMatching.max_distance", "0.7",
+        "--SiftMatching.max_num_matches", "8192"
     ], check=True)
 
 if __name__ == "__main__":
     # 파라미터 쉽게 조정
     superpoint_config = {
-        'nms_radius': 3,
-        'keypoint_threshold': 0.002,
-        'max_keypoints': 4096
+        'nms_radius': 4,  # 3 -> 4: 더 넓은 NMS
+        'keypoint_threshold': 0.001,  # 0.002 -> 0.001: 더 많은 keypoints
+        'max_keypoints': 8192  # 4096 -> 8192: 더 많은 keypoints
     }
-    superglue_config = {'match_threshold': 0.05}
-    min_matches_per_pair = 15  # 원하는 값으로 조정
+    superglue_config = {
+        'match_threshold': 0.02,  # 0.05 -> 0.02: 더 엄격한 매칭
+        'max_keypoints': 8192,  # 추가: 최대 keypoints 수
+        'keypoint_threshold': 0.001  # 추가: keypoint 임계값
+    }
+    min_matches_per_pair = 20  # 15 -> 20: 더 엄격한 필터링
     extract_superpoint_features("ImageInputs/images", "ImageInputs/superpoint_features.npz", config=superpoint_config)
     match_superglue("ImageInputs/superpoint_features.npz", "ImageInputs/images", "ImageInputs/superglue_matches.npz", superglue_config=superglue_config)
     export_superglue2colmap_format(
@@ -277,4 +287,4 @@ if __name__ == "__main__":
     run_colmap_feature_importer("ImageInputs/database.db", "ImageInputs/images", "ImageInputs/colmap_desc")
     run_colmap_matches_importer("ImageInputs/database.db", "ImageInputs/superglue_matches.txt")
     run_colmap_mapper("ImageInputs/database.db", "ImageInputs/images", "ImageInputs/sparse")
-    #run_train_py() 
+    run_train_py()
