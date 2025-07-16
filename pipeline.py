@@ -220,9 +220,6 @@ def run_colmap_mapper(database_path, image_path, output_path):
         "--image_path", image_path,
         "--output_path", output_path,
         "--Mapper.init_min_num_inliers", "5",  # 8 -> 5
-        "--Mapper.init_min_track_length", "3",  # 추가
-        "--Mapper.init_max_error", "4.0",  # 추가: 더 관대한 에러 임계값
-        "--Mapper.init_min_tri_angle", "1.5",  # 추가: 더 낮은 삼각측량 각도
         "--log_to_stderr", "1"
     ], check=True)
 
@@ -257,8 +254,8 @@ def run_colmap_matches_importer(database_path, matches_path):
 if __name__ == "__main__":
     # 파라미터 쉽게 조정
     superpoint_config = {
-        'nms_radius': 4,  # 3 -> 4: 더 넓은 NMS
-        'keypoint_threshold': 0.001,  # 0.002 -> 0.001: 더 많은 keypoints
+        'nms_radius': 8,  # 3 -> 4: 더 넓은 NMS
+        'keypoint_threshold': 0.002,  # 0.002 -> 0.001: 더 많은 keypoints
         'max_keypoints': 8192  # 4096 -> 8192: 더 많은 keypoints
     }
     superglue_config = {

@@ -4,6 +4,7 @@
 
 from pathlib import Path
 from hloc import extract_features, match_features, pairs_from_exhaustive, reconstruction
+import pycolmap
 
 def step1_extract_features(images, outputs, feature_conf_name):
     feature_conf = extract_features.confs[feature_conf_name]
@@ -38,13 +39,13 @@ def step4_matching(outputs, matcher_conf_name, features_name, pairs_path, featur
 def step5_reconstruction(outputs, images, pairs_path, features_path, matches_path):
     print("[hloc] Running COLMAP sparse mapping...")
     reconstruction.main(
-        output=outputs / 'sfm',
+        sfm_dir=outputs / 'sfm',
         image_dir=images,
         pairs=pairs_path,
         features=features_path,
         matches=matches_path,
-        database_path=outputs / 'database.db',
         skip_geometric_verification=False,
+        image_options={'camera_model': 'PINHOLE'},
     )
     print(f"[hloc] Done! Results in {outputs / 'sfm'}")
 
@@ -92,5 +93,4 @@ def run_hloc_pipeline(
         step5_reconstruction(outputs, images, pairs_path, features_path, matches_path)
 
 if __name__ == "__main__":
-    # 예시: 5번 스텝(재구성)만 실행하고 싶으면 start_step=5로 변경
-    run_hloc_pipeline(start_step=1) 
+    run_hloc_pipeline(start_step=5) 
