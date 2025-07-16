@@ -1,9 +1,9 @@
 # hloc_pipeline.py
-# 이 파일은 SuperPoint + SuperGlue + COLMAP sparse mapping을 hloc 기반으로 한 번에 수행하는 간단한 파이프라인입니다.
-# hloc 설치 필요: pip install git+https://github.com/cvg/Hierarchical-Localization.git
+# hloc 1.5 (PyPI) 버전에 맞는 파이프라인
+# hloc 설치 필요: pip install hloc
 
 from pathlib import Path
-from hloc import extract_features, match_features, reconstruction
+from hloc import extract_features, match_features, pairs_from_exhaustive, reconstruction
 
 def run_hloc_pipeline(
     image_dir="ImageInputs/images",
@@ -20,20 +20,32 @@ def run_hloc_pipeline(
     print(f"[hloc] Extracting features with {feature_conf_name}...")
     extract_features.main(feature_conf, images, outputs)
     features_name = feature_conf['output']  # 예: 'feats-superpoint-n4096-r1024'
+    features_path = outputs / f"{features_name}.h5"
 
-    # 2. 매칭 (features 이름을 명시적으로 지정)
+    # 2. 쌍 목록 생성 (exhaustive: 모든 쌍)
+    pairs_path = outputs / "pairs.txt"
+    print("[hloc] Generating exhaustive pairs...")
+    pairs_from_exhaustive.main(images, pairs_path)
+
+    # 3. 매칭
     matcher_conf = match_features.confs[matcher_conf_name]
     matches_name = f"matches-{matcher_conf_name}_{features_name}"
+    matches_path = outputs / f"{matches_name}.h5"
     print(f"[hloc] Matching features with {matcher_conf_name}...")
-    match_features.main(matcher_conf, outputs, outputs, features=features_name, matches=matches_name)
+    match_features.main(
+        matcher_conf,
+        pairs=pairs_path,
+        features=features_path,
+        matches=matches_path
+    )
 
-    # 3. COLMAP sparse mapping (정확한 파일명 사용)
+    # 4. COLMAP sparse mapping
     print("[hloc] Running COLMAP sparse mapping...")
     reconstruction.main(
         images=images,
         image_list=None,  # 모든 이미지 사용
-        features=outputs / f'{features_name}.h5',
-        matches=outputs / f'{matches_name}.h5',
+        features=features_path,
+        matches=matches_path,
         sfm_dir=outputs / 'sfm',
         database_path=outputs / 'database.db',
         skip_geometric_verification=False,
