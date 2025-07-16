@@ -22,12 +22,15 @@ def run_hloc_pipeline(
     features_name = feature_conf['output']  # 예: 'feats-superpoint-n4096-r1024'
     features_path = outputs / f"{features_name}.h5"
 
-    # 2. 쌍 목록 생성 (exhaustive: 모든 쌍)
+    # 2. 이미지 파일명 리스트 생성
+    file_names = [img.name for img in sorted(images.iterdir()) if img.suffix.lower() in [".jpg", ".jpeg", ".png"]]
+
+    # 3. 쌍 목록 생성 (파일명 리스트를 넘김)
     pairs_path = outputs / "pairs.txt"
     print("[hloc] Generating exhaustive pairs...")
-    pairs_from_exhaustive.main(images, pairs_path)
+    pairs_from_exhaustive.main(pairs_path, image_list=file_names)
 
-    # 3. 매칭
+    # 4. 매칭
     matcher_conf = match_features.confs[matcher_conf_name]
     matches_name = f"matches-{matcher_conf_name}_{features_name}"
     matches_path = outputs / f"{matches_name}.h5"
@@ -39,7 +42,7 @@ def run_hloc_pipeline(
         matches=matches_path
     )
 
-    # 4. COLMAP sparse mapping
+    # 5. COLMAP sparse mapping
     print("[hloc] Running COLMAP sparse mapping...")
     reconstruction.main(
         images=images,
