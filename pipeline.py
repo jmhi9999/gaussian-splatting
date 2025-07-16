@@ -36,19 +36,54 @@ def extract_superpoint_features(image_dir, output_path, config=None):
     np.savez(output_path, keypoints=all_keypoints, descriptors=all_descriptors, scores=all_scores)
     print(f"SuperPoint features saved to {output_path}")
 
-def generate_image_pairs(image_list, max_skip=5, random_pairs=1000):  # max_skip: 8 -> 5, random_pairs: 2000 -> 1000
+def generate_image_pairs_with_retrieval(image_list, image_dir, top_k=10, max_skip=5):
+    """
+    HLOC 방식: Global retrieval로 overlap이 확실한 쌍만 선택
+    """
+    print("Step 1.5: Global retrieval for overlap detection")
+    
+    # 간단한 global descriptor (평균 RGB 값 사용)
+    global_descriptors = {}
+    for img_name in image_list:
+        img_path = os.path.join(image_dir, img_name)
+        img = Image.open(img_path).convert('RGB')
+        img_array = np.array(img)
+        # 간단한 global descriptor: 평균 RGB + 표준편차
+        mean_rgb = np.mean(img_array, axis=(0, 1))
+        std_rgb = np.std(img_array, axis=(0, 1))
+        global_descriptors[img_name] = np.concatenate([mean_rgb, std_rgb])
+    
+    # 유사도 계산 및 top-k 쌍 선택
     pairs = []
     n = len(image_list)
-    # Sequential + skip (더 가까운 쌍 위주)
+    
+    for i, img1 in enumerate(image_list):
+        similarities = []
+        for j, img2 in enumerate(image_list):
+            if i != j:
+                # 코사인 유사도 계산
+                desc1 = global_descriptors[img1]
+                desc2 = global_descriptors[img2]
+                similarity = np.dot(desc1, desc2) / (np.linalg.norm(desc1) * np.linalg.norm(desc2))
+                similarities.append((similarity, img2))
+        
+        # 유사도 높은 순으로 정렬
+        similarities.sort(reverse=True)
+        
+        # Top-k 쌍 선택
+        for _, img2 in similarities[:top_k]:
+            pairs.append((img1, img2))
+    
+    # Sequential 쌍도 추가 (가까운 이미지들)
     for i in range(n):
         for skip in range(1, max_skip+1):
             j = i + skip
             if j < n:
-                pairs.append((image_list[i], image_list[j]))
-    # 랜덤 일부 쌍 추가 (long-range, 더 적게)
-    all_possible = [(image_list[i], image_list[j]) for i in range(n) for j in range(i+max_skip+1, n)]
-    if len(all_possible) > 0 and random_pairs > 0:
-        pairs += random.sample(all_possible, min(random_pairs, len(all_possible)))
+                pair = (image_list[i], image_list[j])
+                if pair not in pairs and (pair[1], pair[0]) not in pairs:
+                    pairs.append(pair)
+    
+    print(f"Generated {len(pairs)} pairs with global retrieval")
     return pairs
 
 def match_superglue(features_path, image_dir, output_path, superglue_config=None, partial_gap=5):
@@ -67,7 +102,7 @@ def match_superglue(features_path, image_dir, output_path, superglue_config=None
     descriptors = data['descriptors'].item()
     scores = data['scores'].item()
     image_list = sorted(keypoints.keys())
-    pairs = generate_image_pairs(image_list, max_skip=8, random_pairs=2000)
+    pairs = generate_image_pairs_with_retrieval(image_list, image_dir, top_k=10, max_skip=8)
     matches_dict = {}
     for img0, img1 in pairs:
         kpts0 = torch.from_numpy(keypoints[img0])[None].to(device)
@@ -211,18 +246,35 @@ def validate_data(features_path, matches_path, image_dir, desc_dir, num_visualiz
             print(f"  - Saved match visualization: {out_path}")
     print("[Validation] Done.\n")
 
+def run_colmap_matches_importer(database_path, matches_path):
+    print("Step 3-2: COLMAP matches_importer (HLOC style)")
+    subprocess.run([
+        "colmap", "matches_importer",
+        "--database_path", database_path,
+        "--match_list_path", matches_path,
+        "--match_type", "raw",
+        "--SiftMatching.guided_matching", "1",
+        "--SiftMatching.max_ratio", "0.9",  # 더 관대한 ratio
+        "--SiftMatching.max_distance", "0.8",  # 더 관대한 거리
+        "--SiftMatching.max_num_matches", "8192",
+        "--SiftMatching.cross_check", "1",  # Cross check 활성화
+        "--SiftMatching.max_epipolar_error", "4.0"  # 더 관대한 epipolar error
+    ], check=True)
+
 def run_colmap_mapper(database_path, image_path, output_path):
-    print("Step 4: COLMAP sparse reconstruction (mapper)")
+    print("Step 4: COLMAP sparse reconstruction (HLOC style)")
     os.makedirs(output_path, exist_ok=True)
     subprocess.run([
         "colmap", "mapper",
         "--database_path", database_path,
         "--image_path", image_path,
         "--output_path", output_path,
-        "--Mapper.init_min_num_inliers", "5",  # 8 -> 5
-        "--Mapper.init_min_track_length", "3",  # 추가
-        "--Mapper.init_max_error", "4.0",  # 추가: 더 관대한 에러 임계값
-        "--Mapper.init_min_tri_angle", "1.5",  # 추가: 더 낮은 삼각측량 각도
+        "--Mapper.init_min_num_inliers", "3",  # 더 관대한 초기화
+        "--Mapper.init_min_track_length", "2",  # 더 낮은 track length
+        "--Mapper.init_max_error", "6.0",  # 더 관대한 에러 임계값
+        "--Mapper.init_min_tri_angle", "1.0",  # 더 낮은 삼각측량 각도
+        "--Mapper.init_max_reg_track_length", "10",  # 더 낮은 track length
+        "--Mapper.init_min_num_matches", "10",  # 더 낮은 매칭 수
         "--log_to_stderr", "1"
     ], check=True)
 
@@ -241,32 +293,21 @@ def run_colmap_feature_importer(database_path, image_path, desc_path):
         "--import_path", desc_path
     ], check=True)
 
-def run_colmap_matches_importer(database_path, matches_path):
-    print("Step 3-2: COLMAP matches_importer")
-    subprocess.run([
-        "colmap", "matches_importer",
-        "--database_path", database_path,
-        "--match_list_path", matches_path,
-        "--match_type", "raw",
-        "--SiftMatching.guided_matching", "1",
-        "--SiftMatching.max_ratio", "0.8",
-        "--SiftMatching.max_distance", "0.7",
-        "--SiftMatching.max_num_matches", "8192"
-    ], check=True)
-
 if __name__ == "__main__":
-    # 파라미터 쉽게 조정
+    # 파라미터 쉽게 조정 (HLOC 스타일)
     superpoint_config = {
-        'nms_radius': 4,  # 3 -> 4: 더 넓은 NMS
-        'keypoint_threshold': 0.001,  # 0.002 -> 0.001: 더 많은 keypoints
-        'max_keypoints': 8192  # 4096 -> 8192: 더 많은 keypoints
+        'nms_radius': 4,
+        'keypoint_threshold': 0.001,
+        'max_keypoints': 8192
     }
     superglue_config = {
-        'match_threshold': 0.02,  # 0.05 -> 0.02: 더 엄격한 매칭
-        'max_keypoints': 8192,  # 추가: 최대 keypoints 수
-        'keypoint_threshold': 0.001  # 추가: keypoint 임계값
+        'match_threshold': 0.01,  # 더 엄격한 임계값 (HLOC 스타일)
+        'max_keypoints': 8192,
+        'keypoint_threshold': 0.001,
+        'sinkhorn_iterations': 20,  # 더 많은 반복
+        'force_num_keypoints': False  # 강제 keypoint 수 제한 해제
     }
-    min_matches_per_pair = 20  # 15 -> 20: 더 엄격한 필터링
+    min_matches_per_pair = 15  # HLOC 스타일로 조정
     extract_superpoint_features("ImageInputs/images", "ImageInputs/superpoint_features.npz", config=superpoint_config)
     match_superglue("ImageInputs/superpoint_features.npz", "ImageInputs/images", "ImageInputs/superglue_matches.npz", superglue_config=superglue_config)
     export_superglue2colmap_format(
