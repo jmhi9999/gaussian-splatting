@@ -52,8 +52,8 @@ def step5_reconstruction(outputs, images, pairs_path, features_path, matches_pat
 def run_hloc_pipeline(
     image_dir="ImageInputs/images",
     output_dir="ImageInputs/hloc_outputs",
-    feature_conf_name="superpoint_aachen",
-    matcher_conf_name="superglue",
+    feature_conf_name="superpoint_max",
+    matcher_conf_name="superpoint+lightglue",
     start_step=1
 ):
     images = Path(image_dir)
@@ -93,4 +93,4 @@ def run_hloc_pipeline(
         step5_reconstruction(outputs, images, pairs_path, features_path, matches_path)
 
 if __name__ == "__main__":
-    run_hloc_pipeline(start_step=5) 
+    run_hloc_pipeline(start_step=1) 
