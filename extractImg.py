@@ -26,7 +26,7 @@ def extract_frames(video_path, num_frames, output_folder):
             break
         
         if current_frame % interval == 0:
-            frame_filename = os.path.join(output_folder, f"{extracted_frames:04d}.jpg")
+            frame_filename = os.path.join(output_folder, f"{extracted_frames+320:04d}.jpg")
             cv2.imwrite(frame_filename, frame)
             print(f"Saved frame {extracted_frames} at {frame_filename}")
             extracted_frames += 1
