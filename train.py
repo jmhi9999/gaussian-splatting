@@ -68,17 +68,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     ema_loss_for_log = 0.0
     ema_Ll1depth_for_log = 0.0
 
-    # Early stopping variables
-    best_test_psnr = 0.0
-    best_iteration = 0
-    patience = 1  # Number of evaluations to wait before early stopping (5 → 2, 더 빠른 중단)
-    patience_counter = 0
-    early_stop_threshold = 0.1  # PSNR decrease threshold (0.3 → 0.1, 더 민감하게)
-    min_improvement = 0.05  # Minimum improvement to reset patience (0.1 → 0.05, 더 작은 개선도 허용)
-    
-    # Learning rate scheduling for regularization
-    reg_weight_scheduler = get_expon_lr_func(0.1, 0.01, max_steps=opt.iterations)  # Decreasing regularization weight
-
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
     for iteration in range(first_iter, opt.iterations + 1):
@@ -152,11 +141,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         loss.backward()
 
-        # Gradient clipping for stability
-        if opt.gradient_clip > 0:
-            torch.nn.utils.clip_grad_norm_(gaussians.optimizer.param_groups[0]['params'], opt.gradient_clip)
-            torch.nn.utils.clip_grad_norm_(gaussians.exposure_optimizer.param_groups[0]['params'], opt.gradient_clip)
-
         iter_end.record()
 
         with torch.no_grad():
@@ -171,52 +155,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 progress_bar.close()
 
             # Log and save
-            current_test_psnr = training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background, 1., SPARSE_ADAM_AVAILABLE, None, dataset.train_test_exp), dataset.train_test_exp)
-            
-            # Early stopping logic
-            if current_test_psnr is not None:
-                if current_test_psnr > best_test_psnr + min_improvement:
-                    best_test_psnr = current_test_psnr
-                    best_iteration = iteration
-                    patience_counter = 0
-                    print(f"\n[ITER {iteration}] 🎯 New best test PSNR: {best_test_psnr:.2f}")
-                elif current_test_psnr < best_test_psnr - early_stop_threshold:
-                    patience_counter += 1
-                    print(f"\n[ITER {iteration}] ⚠️  Test PSNR decreased: {current_test_psnr:.2f} (best: {best_test_psnr:.2f}, patience: {patience_counter}/{patience})")
-                    
-                    if patience_counter >= patience:
-                        print(f"\n[ITER {iteration}] 🛑 Early stopping triggered! Best PSNR was {best_test_psnr:.2f} at iteration {best_iteration}")
-                        print(f"Restoring best model from iteration {best_iteration}...")
-                        # Load best checkpoint if available
-                        best_checkpoint_path = scene.model_path + "/chkpnt" + str(best_iteration) + ".pth"
-                        if os.path.exists(best_checkpoint_path):
-                            (model_params, _) = torch.load(best_checkpoint_path)
-                            gaussians.restore(model_params, opt)
-                            print(f"✅ Best model restored from iteration {best_iteration}")
-                        else:
-                            print(f"⚠️  Best checkpoint not found at {best_checkpoint_path}")
-                        break
-                else:
-                    # Small improvement or no significant change
-                    if current_test_psnr > best_test_psnr:
-                        best_test_psnr = current_test_psnr
-                        best_iteration = iteration
-                    else:
-                        # Even small decrease increases patience counter
-                        patience_counter += 1
-                        if patience_counter >= patience:
-                            print(f"\n[ITER {iteration}] 🛑 Early stopping triggered! No improvement for {patience} evaluations.")
-                            print(f"Best PSNR was {best_test_psnr:.2f} at iteration {best_iteration}")
-                            # Load best checkpoint if available
-                            best_checkpoint_path = scene.model_path + "/chkpnt" + str(best_iteration) + ".pth"
-                            if os.path.exists(best_checkpoint_path):
-                                (model_params, _) = torch.load(best_checkpoint_path)
-                                gaussians.restore(model_params, opt)
-                                print(f"✅ Best model restored from iteration {best_iteration}")
-                            else:
-                                print(f"⚠️  Best checkpoint not found at {best_checkpoint_path}")
-                            break
-            
+            training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background, 1., SPARSE_ADAM_AVAILABLE, None, dataset.train_test_exp), dataset.train_test_exp)
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
@@ -264,6 +203,13 @@ def prepare_output_and_logger(args):
     with open(os.path.join(args.model_path, "cfg_args"), 'w') as cfg_log_f:
         cfg_log_f.write(str(Namespace(**vars(args))))
 
+    # Create Tensorboard writer
+    tb_writer = None
+    if TENSORBOARD_FOUND:
+        tb_writer = SummaryWriter(args.model_path)
+    else:
+        print("Tensorboard not available: not logging progress")
+    return tb_writer
 
 def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, train_test_exp):
     if tb_writer:
@@ -272,11 +218,10 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
         tb_writer.add_scalar('iter_time', elapsed, iteration)
 
     # Report test and samples of training set
-    current_test_psnr = None
     if iteration in testing_iterations:
         torch.cuda.empty_cache()
         validation_configs = ({'name': 'test', 'cameras' : scene.getTestCameras()}, 
-                              {'name': 'train', 'cameras' : [scene.getTrainCameras()[idx % len(scene.getTrainCameras())] for idx in range(0, len(scene.getTrainCameras()), max(1, len(scene.getTrainCameras()) // 10))]})
+                              {'name': 'train', 'cameras' : [scene.getTrainCameras()[idx % len(scene.getTrainCameras())] for idx in range(5, 30, 5)]})
 
         for config in validation_configs:
             if config['cameras'] and len(config['cameras']) > 0:
@@ -300,17 +245,11 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
                 if tb_writer:
                     tb_writer.add_scalar(config['name'] + '/loss_viewpoint - l1_loss', l1_test, iteration)
                     tb_writer.add_scalar(config['name'] + '/loss_viewpoint - psnr', psnr_test, iteration)
-                
-                # Store test PSNR for early stopping
-                if config['name'] == 'test':
-                    current_test_psnr = psnr_test
 
         if tb_writer:
             tb_writer.add_histogram("scene/opacity_histogram", scene.gaussians.get_opacity, iteration)
             tb_writer.add_scalar('total_points', scene.gaussians.get_xyz.shape[0], iteration)
         torch.cuda.empty_cache()
-    
-    return current_test_psnr
 
 if __name__ == "__main__":
     # Set up command line argument parser
@@ -322,52 +261,23 @@ if __name__ == "__main__":
     parser.add_argument('--port', type=int, default=6009)
     parser.add_argument('--debug_from', type=int, default=-1)
     parser.add_argument('--detect_anomaly', action='store_true', default=False)
-    parser.add_argument("--test_iterations", nargs="+", type=int, default=[7_000, 15_000, 20_0000, 30_000])
-    parser.add_argument("--save_iterations", nargs="+", type=int, default=[7_000, 15_000, 20_000, 30_000])
+    parser.add_argument("--test_iterations", nargs="+", type=int, default=[7_000, 15_000, 30_000])
+    parser.add_argument("--save_iterations", nargs="+", type=int, default=[7_000, 15_000, 30_000])
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument('--disable_viewer', action='store_true', default=False)
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
     parser.add_argument("--start_checkpoint", type=str, default = None)
-    
-    
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
     
     print("Optimizing " + args.model_path)
-    
-    if args.scene_type == "SuperGlue":
-        print(f"Using SuperGlue SfM with {args.superglue_config} configuration")
-        print(f"Processing max {args.max_images} images")
 
     # Initialize system state (RNG)
     safe_state(args.quiet)
 
     # Start GUI server, configure and run training
     if not args.disable_viewer:
-        # 포트 충돌 해결을 위한 자동 포트 찾기
-        import socket
-        def find_free_port(start_port=6009, max_attempts=10):
-            for port in range(start_port, start_port + max_attempts):
-                try:
-                    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                        s.bind((args.ip, port))
-                        return port
-                except OSError:
-                    continue
-            return None
-        
-        # 사용 가능한 포트 찾기
-        free_port = find_free_port(args.port)
-        if free_port is None:
-            print(f"Warning: Could not find free port starting from {args.port}")
-            print("Disabling network GUI")
-            args.disable_viewer = True
-        else:
-            if free_port != args.port:
-                print(f"Port {args.port} is in use, using port {free_port} instead")
-            args.port = free_port
-            network_gui.init(args.ip, args.port)
-    
+        network_gui.init(args.ip, args.port)
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
     training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from)
 

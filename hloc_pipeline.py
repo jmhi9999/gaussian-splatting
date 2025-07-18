@@ -4,7 +4,6 @@
 
 from pathlib import Path
 from hloc import extract_features, match_features, pairs_from_exhaustive, reconstruction
-import pycolmap
 
 def step1_extract_features(images, outputs, feature_conf_name):
     feature_conf = extract_features.confs[feature_conf_name]
@@ -52,7 +51,7 @@ def step5_reconstruction(outputs, images, pairs_path, features_path, matches_pat
 def run_hloc_pipeline(
     image_dir="ImageInputs/images",
     output_dir="ImageInputs/hloc_outputs",
-    feature_conf_name="superpoint_inloc",
+    feature_conf_name="superpoint_aachen",
     matcher_conf_name="superpoint+lightglue",
     start_step=1
 ):
