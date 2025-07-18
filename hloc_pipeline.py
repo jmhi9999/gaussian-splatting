@@ -52,7 +52,7 @@ def step5_reconstruction(outputs, images, pairs_path, features_path, matches_pat
 def run_hloc_pipeline(
     image_dir="ImageInputs/images",
     output_dir="ImageInputs/hloc_outputs",
-    feature_conf_name="superpoint_max",
+    feature_conf_name="superpoint_inloc",
     matcher_conf_name="superpoint+lightglue",
     start_step=1
 ):
