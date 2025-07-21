@@ -55,10 +55,10 @@ class ModelParams(ParamGroup):
         self._white_background = False
         self.train_test_exp = False
         self.data_device = "cuda"
-        self.scene_type = "SuperGlue"  # "Colmap", "Blender", "SuperGlue", "SuperGlueCOLMAPHybrid", "Hloc"
-        self.superglue_config = "indoor"  # "indoor" or "outdoor"
-        self.max_images = 100  # SuperGlue용 최대 이미지 수
-        self.colmap_exe = "colmap"  # COLMAP 실행 파일 경로
+        self.scene_type = "Colmap"  
+        self.superglue_config = "indoor"  
+        self.max_images = 100  
+        self.colmap_exe = "colmap"  
         self.eval = False
         super().__init__(parser, "Loading Parameters", sentinel)
 
