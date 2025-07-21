@@ -55,10 +55,6 @@ class ModelParams(ParamGroup):
         self._white_background = False
         self.train_test_exp = False
         self.data_device = "cuda"
-        self.scene_type = "Colmap"  
-        self.superglue_config = "indoor"  
-        self.max_images = 100  
-        self.colmap_exe = "colmap"  
         self.eval = False
         super().__init__(parser, "Loading Parameters", sentinel)
 
@@ -78,38 +74,29 @@ class PipelineParams(ParamGroup):
 class OptimizationParams(ParamGroup):
     def __init__(self, parser):
         self.iterations = 30_000
-        self.position_lr_init = 0.00004  # Further reduced from 0.00008
-        self.position_lr_final = 0.0000004  # Further reduced from 0.0000008
+        self.position_lr_init = 0.00016
+        self.position_lr_final = 0.0000016
         self.position_lr_delay_mult = 0.01
         self.position_lr_max_steps = 30_000
-        self.feature_lr = 0.000625  # Further reduced from 0.00125
-        self.opacity_lr = 0.00625  # Further reduced from 0.0125
-        self.scaling_lr = 0.00125  # Further reduced from 0.0025
-        self.rotation_lr = 0.00025  # Further reduced from 0.0005
-        self.exposure_lr_init = 0.0025  # Further reduced from 0.005
-        self.exposure_lr_final = 0.00025  # Further reduced from 0.0005
+        self.feature_lr = 0.0025
+        self.opacity_lr = 0.025
+        self.scaling_lr = 0.005
+        self.rotation_lr = 0.001
+        self.exposure_lr_init = 0.01
+        self.exposure_lr_final = 0.001
         self.exposure_lr_delay_steps = 0
         self.exposure_lr_delay_mult = 0.0
         self.percent_dense = 0.01
         self.lambda_dssim = 0.2
-        self.densification_interval = 200  # 100 → 200 (더 적은 densification)
-        self.opacity_reset_interval = 5000  # 3000 → 5000 (더 적은 opacity reset)
-        self.densify_from_iter = 1000  # 500 → 1000 (더 늦은 densification 시작)
-        self.densify_until_iter = 12_000  # 15_000 → 12_000 (더 일찍 densification 중단)
-        self.densify_grad_threshold = 0.0004  # 0.0002 → 0.0004 (더 엄격한 densification 조건)
+        self.densification_interval = 100
+        self.opacity_reset_interval = 3000
+        self.densify_from_iter = 500
+        self.densify_until_iter = 15_000
+        self.densify_grad_threshold = 0.0002
         self.depth_l1_weight_init = 1.0
         self.depth_l1_weight_final = 0.01
         self.random_background = False
         self.optimizer_type = "default"
-        
-        # Anti-overfitting parameters
-        self.weight_decay = 0.001  # Weight decay for regularization (0.0 → 0.001)
-        self.dropout_rate = 0.0  # Dropout rate (if applicable)
-        self.gradient_clip = 0.5  # Gradient clipping threshold (1.0 → 0.5, 더 강한 클리핑)
-        self.early_stopping = True  # Enable early stopping
-        self.early_stop_patience = 2  # Patience for early stopping (3 → 2, 더 빠른 중단)
-        self.early_stop_threshold = 0.1  # PSNR decrease threshold for early stopping (0.5 → 0.1, 더 민감하게)
-        
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):

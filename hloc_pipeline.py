@@ -86,17 +86,17 @@ def run_hloc_pipeline(config=None):
 
     # Step 3: Generate pairs
     pairs_path = outputs / "pairs.txt"
-    if start_step == 3:
+    if start_step <= 3:
         pairs_path = step3_generate_pairs(outputs, file_names)
 
     # Step 4: Matching
     matches_name = f"matches-{matcher_conf_name}_{features_name}"
     matches_path = outputs / f"{matches_name}.h5"
-    if start_step == 4:
+    if start_step <= 4:
         matches_path = step4_matching(outputs, matcher_conf_name, features_name, pairs_path, features_path)
 
     # Step 5: Reconstruction
-    if start_step == 5:
+    if start_step <= 5:
         step5_reconstruction(outputs, images, pairs_path, features_path, matches_path)
 
 if __name__ == "__main__":
