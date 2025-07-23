@@ -17,6 +17,7 @@ from arguments import ModelParams, PipelineParams, OptimizationParams
 from sys import getsizeof
 import lpips
 
+
 try:
     from torch.utils.tensorboard import SummaryWriter
     TENSORBOARD_FOUND = True
